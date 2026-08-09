@@ -1,0 +1,21 @@
+# Core data pipeline
+nflreadpy>=0.1.5          # maintained successor to nfl_data_py
+polars>=1.0.0             # nflreadpy returns Polars frames
+pandas>=2.0.0
+pyarrow>=14.0.0           # required for .to_parquet() AND Polars .to_pandas()
+numpy>=1.24.0
+requests>=2.31.0
+
+# Notebook environment
+jupyter>=1.0.0
+ipykernel>=6.25.0
+
+# Later phases (uncomment as you get to them):
+# scikit-learn>=1.3.0        # Phase 3: role clustering
+# xgboost>=2.0.0             # Phase 6: projection model
+# lightgbm>=4.0.0            # Phase 6: alternative to xgboost
+# optuna>=3.4.0              # Phase 6: hyperparameter tuning
+# shap>=0.43.0               # Phase 6: model explainability
+# mlflow>=2.8.0              # Phase 6: experiment tracking
+# matplotlib>=3.7.0          # EDA plots
+# seaborn>=0.13.0            # EDA plots
