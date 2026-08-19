@@ -2,9 +2,10 @@
 
 This document captures the "why" behind the FanTeasy Stats project so a new conversation can pick up seamlessly. Read this first before starting any new work.
 
-> **Last updated:** August 2026, during local environment setup for Phase 1.
-> See **Verification status** near the end before trusting anything in the
-> notebook-pipeline sections — some of it is decided-but-not-yet-run.
+> **Last updated:** August 2026. Phase 1 (ingestion) and Phase 2a (custom
+> scoring) are complete and verified against live data. Phase 2b onward is
+> still design sketch — see **Verification status** near the end before
+> treating any pipeline claim as settled.
 
 ---
 
@@ -48,7 +49,7 @@ These are non-negotiable — they've shaped every decision we've made:
 - **Hosted on GitHub Pages** at `https://rohanbhavsar-git.github.io/fanteasystats`
 - **APIs used**: Sleeper public API (stats, projections, players, injuries, drafts, brackets, transactions), ESPN hidden JSON endpoints (NFL scoreboard, game summaries), Open-Meteo (weather, no auth)
 
-### Python notebook (Phase 1 scaffolded, not yet run end-to-end)
+### Python notebook (Phases 1 and 2a complete and verified)
 - **`nflreadpy`** — the maintained Python client for nflverse data. Returns
   **Polars** DataFrames; `src/ingest.py` converts to pandas at the boundary so
   everything downstream stays pandas-native.
@@ -66,7 +67,7 @@ These are non-negotiable — they've shaped every decision we've made:
 ### Local development environment
 - **Python 3.12.9** (deliberately *not* 3.14 — the ML stack lags new releases, and
   local should match CI)
-- **`.venv`** in the project root, gitignored
+- **`.venv`** inside the project folder (beside `src/`, `notebooks/`, `requirements.txt`), gitignored. It was originally created one level up, which broke on a folder rename and caused `requirements.txt` to resolve from the wrong place — keep it in the project folder.
 - **VS Code** with the Microsoft Python + Jupyter extensions, plus Claude Code
 - The Phase 8 GitHub Actions workflow still pins `3.11` and needs bumping to `3.12`
 
@@ -159,7 +160,23 @@ These are non-negotiable — they've shaped every decision we've made:
 - `/players/nfl` — player registry with injury data
 
 ### Custom scoring engine
-Because the league has custom scoring (6-pt pass TDs, TE-premium PPR, yardage bonuses, etc.), Sleeper's pre-aggregated `pts_ppr` / `pts_half_ppr` / `pts_std` fields don't reflect the actual points. There's a dedicated **`computeCustomScore(statsObj, scoringSettings, position)`** helper near the top of the script that multiplies every raw stat field by its matching `scoring_settings` weight. **`resolvePts()`** wraps that with a fallback chain. Every fantasy total on the dashboard flows through `resolvePts()` — search that name to see every usage.
+Because the league has custom scoring, Sleeper's pre-aggregated `pts_ppr` / `pts_half_ppr` / `pts_std` fields don't reflect the actual points.
+
+**The actual rules** (confirmed from the live `scoring_settings`, 121 keys — an earlier version of this doc guessed at these and was wrong):
+
+| Rule | Value |
+|---|---|
+| Passing yards | 0.04 (1 pt / 25 yds) |
+| Passing TD | **4** (not 6) |
+| Interception | −2 |
+| Pick-six thrown | −1 |
+| Rush + receiving yards | 0.1 |
+| Rush + receiving TD | 6 |
+| Reception | 0.5 — flat, **no TE premium** |
+| Any 2-pt conversion | 2 |
+| Fumble / fumble lost | −1 each, and they **stack** (lost fumble = −2) |
+
+**Every yardage and threshold bonus is 0.0.** No 300-yard passing bonus, no 100-yard rushing bonus, no distance-based TD bonuses. Team defense scoring is unusually detailed (tiered `pts_allow_*` and `yds_allow_*` ladders, `def_3_and_out` +0.25, `def_4_and_stop` +0.5). There's a dedicated **`computeCustomScore(statsObj, scoringSettings, position)`** helper near the top of the script that multiplies every raw stat field by its matching `scoring_settings` weight. **`resolvePts()`** wraps that with a fallback chain. Every fantasy total on the dashboard flows through `resolvePts()` — search that name to see every usage.
 
 ### ESPN
 - `site.web.api.espn.com` scoreboard for NFL sidebar
@@ -177,14 +194,19 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| 1 | Data ingestion — `src/ingest.py` + `01_data_ingestion.ipynb` | **Scaffolded + migrated to `nflreadpy`** — not yet run end-to-end |
-| 2 | Feature engineering — per-player aggregates from pbp | Not started |
+| 1 | Data ingestion — `src/ingest.py` + `01_data_ingestion.ipynb` | **Done** — runs clean, all sources cached to `data/raw/` |
+| 2a | Custom scoring — `src/features.py` + `02_custom_scoring.ipynb` | **Done** — 100% validated against Sleeper's actual results |
+| 2b | Usage + efficiency features from pbp | Next up |
 | 3 | Role classification — rule-based Pocket Passer / 3-Down Back / Slot / etc. | Not started |
 | 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
 | 6 | Projection model — XGBoost/LightGBM regression with time-series CV | Not started |
 | 7 | JSON export — assemble `player_advanced_stats.json` | Not started |
 | 8 | GitHub Actions weekly automation | Not started |
+
+Notebooks are kept single-purpose: `01_data_ingestion.ipynb` does ingestion only,
+`02_custom_scoring.ipynb` does scoring only. Exploration and debugging belong in a
+separate scratch notebook — mixing them in meant 01 stopped running top to bottom.
 
 The dashboard already has integration hooks waiting. Search `state.advancedStats` and `p.myProj` and `// Hook for your custom model` in `index.html` to see exactly where each output will slot in.
 
@@ -204,6 +226,16 @@ Things that took real conversation to arrive at — a new Claude should NOT re-l
 - **Migrated off `nfl_data_py` before writing any dependent code.** nflverse deprecated it; building a portfolio project on a package whose own README says to stop using it is a bad look in a code review. `src/ingest.py` keeps identical function names and signatures so notebooks didn't have to change — including `get_ngs_data(stat_type, seasons)`, which preserves the old argument order even though `nflreadpy.load_nextgen_stats()` takes `(seasons, stat_type)`. The wrapper absorbs the flip.
 - **ID columns are normalized to strings in `get_id_crosswalk()`.** The player-ID table arrives with `sleeper_id` as float64 (nulls force the upcast), which turns Sleeper's `"4984"` into `4984.0`. Sleeper's own IDs are strings, so every join silently returns zero rows. `_normalize_id_column()` strips the trailing `.0`. **Every Phase 2+ join depends on this** — if a merge comes back empty, check dtypes first.
 - **Sleeper fetch failures raise instead of returning empty.** A silent empty projections frame reads as "this week isn't published yet" when the real cause is a wrong URL or a stale league ID. Loud failure is the honest default here.
+- **The custom scorer was built by diffing against Sleeper's own results**, not by reading the settings dict. `validate_against_sleeper()` pulls `/league/{id}/matchups/{week}`, which returns the per-player points Sleeper actually awarded — ground truth, since Sleeper ran the league. Seven non-standard rules turned up this way that are documented nowhere:
+  1. `fum` counts `fumbles_total`, **not** the sum of rushing/receiving/sack fumbles — there are fumble categories (aborted snaps, muffed returns) outside those three.
+  2. `fum` and `fum_lost` **stack**: a lost fumble is −2, a self-recovered one −1.
+  3. `fum_rec` (+1) does **not** apply to offensive players. 19 of 19 rostered players with a recovery reconcile without it.
+  4. `fgm_yds_over_30` is **per kick**, not on aggregate distance. Computing it as `total_distance − 30 × made` lets short field goals eat into long ones' credit.
+  5. Blocked PATs count as misses (`pat_blocked` adds to `xpmiss`).
+  6. `fgmiss` (−1) only applies to misses **under 50 yards**. Established empirically: 4/4 kickers whose only miss was short reconciled exactly; 0/12 with a 50+ miss did.
+  7. `pass_int_td` needs play-by-play, and requires `td_team == defteam`. Without that condition, a defender fumbling an interception return into his own end zone scores as a pick-six when it's the opposite.
+- **K and DST are deliberately out of scope for the projection model.** Kicker output depends on how often the offense stalls in FG range, which is close to noise week to week; DST would need a team-defense model layered on an offense model. The scorer handles both correctly, but the dashboard keeps showing Sleeper's projections for K/DST, labeled as Sleeper's. This keeps Phase 6 finishable.
+- **`fantasy_points_ppr` is not a valid target.** It's full PPR. The model trains on `custom_points` from `compute_custom_score()`, and any comparison against Sleeper's projections must use the same.
 - **Legal/financial advice pattern for LLM discussion**: When Rohan asked about "modern methods gaining traction," the answer was tiered (Strongly Suggest / Industry-Standard Tooling / Frontier) with an **explicit warning against shoehorning LLMs into a tabular regression project**. Follow the pattern — don't just list every trendy technique. Match tool to problem.
 
 ---
@@ -217,17 +249,22 @@ assumptions as facts.
 |---|---|
 | `nfl_data_py` is deprecated in favor of `nflreadpy` | **Verified** — nflverse's own announcement |
 | `nflreadpy` function names + signatures used in `src/ingest.py` | **Verified** against the published API reference |
-| Local env: Python 3.12.9, `.venv` kernel resolves, `src/` importable | **Verified** in VS Code |
-| Package install completed | **Not verified** — last check showed `nflreadpy`, `polars`, `pyarrow` still missing |
-| Notebook runs end-to-end | **Not verified** — never executed |
-| Sleeper league ID is current | **Resolved** — 2026 league is `1389706592789733376`, chained from 2025 via `previous_league_id`. Sleeper mints a new ID every season for all league types, so this needs updating each August. |
-| ID crosswalk actually joins nflverse ↔ Sleeper | **Not verified** — notebook cell 29 asserts on this |
-| pandas 3.x compatibility | **Not verified** — `ingest.py` written against 2.x conventions; local env has 3.0.5 |
+| Local env: Python 3.12.9, `.venv` kernel resolves, `src/` importable | **Verified** |
+| Package install completed | **Verified** — nflreadpy 0.1.5, polars 1.43.2, pandas 3.0.5, pyarrow 25.0.0 |
+| `01_data_ingestion.ipynb` runs end-to-end | **Verified** — 98,263 pbp rows, weekly stats, snaps, NGS, schedule all cached |
+| Sleeper league ID is current | **Verified** — 2026 is `1389706592789733376`, chained from 2025 via `previous_league_id`. Sleeper mints a new ID each season for **all** league types, not just dynasty. Needs updating each August. |
+| ID crosswalk joins nflverse ↔ Sleeper | **Verified** — Sleeper `'4984'` → gsis `'00-0034857'`, both strings, 37 weekly rows returned |
+| Custom scorer reproduces league scoring | **Verified** — 100% exact, 0 mismatches across 739 rostered player-weeks (2025 wks 5/8/10/12/15), every position including K |
+| pandas 3.x compatibility | **Verified in practice** — full pipeline runs on pandas 3.0.5 / numpy 2.5.1 |
+| `pfr_player_id` → `gsis_id` join (needed for snap share) | **Not verified** — the one crosswalk hop never exercised. Most likely place for the next surprise; test it before building features on it. |
+| Season/week boundary handling | **Partly verified** — requesting a season nflverse hasn't published (e.g. 2026 in the offseason) 404s with a raw traceback rather than a readable message |
 
 ## What's outstanding
 
-- **Finish the Phase 1 local run** — install packages, run the notebook top to bottom, resolve the two open questions above (league season, crosswalk join)
+- **Phase 2b** — usage and efficiency features from pbp (target share, air-yards share, red-zone touches, aDOT, snap share). Start with snap share to shake out the `pfr_player_id` join early.
 - Bump the Phase 8 CI workflow from Python 3.11 to 3.12
+- Update `DEFAULT_LEAGUE_ID` in `src/ingest.py` each August when Sleeper rolls the league over
+- Consider a season guard in `ingest.py` so requesting an unpublished season fails with a readable message instead of a 404 traceback
 - Push the latest `index.html` changes to GitHub Pages (all recent work is local)
 - **Activity feed panel** sizing vs matchups panel — layout issue, minor
 - **NFL sidebar** currently shows preseason week labels; should default to last completed regular-season week
@@ -273,7 +310,7 @@ Rough map — line numbers drift as edits happen so use grep:
 
 If you're a new Claude picking this up, expect Rohan to say something like:
 
-> "Continuing my FanTeasy Stats project. Attached is the current `index.html`, the notebook outline, and the project context doc. Ready to work on Phase 2 of the notebook."
+> "Continuing my FanTeasy Stats project. Attached is the current `index.html`, the notebook outline, and the project context doc. Ready to work on Phase 2b of the notebook."
 
 Read this doc, skim `NOTEBOOK_OUTLINE.md` for the current phase, and confirm you understand the project before proposing changes. Don't ask questions this doc already answers.
 
