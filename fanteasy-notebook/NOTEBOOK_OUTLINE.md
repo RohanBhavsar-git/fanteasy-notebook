@@ -3,9 +3,14 @@
 A rubric for building the data pipeline that feeds the dashboard's "advanced analytics" panels. The deliverable is a single JSON file (`player_advanced_stats.json`) that the dashboard fetches on load.
 
 > **Updated August 2026.** The nflverse client changed from `nfl_data_py` (deprecated)
-> to `nflreadpy`. Phase 1 code below reflects that. Phases 2-8 are still design
-> sketches written before anything ran — treat their snippets as intent, not
+> to `nflreadpy`. Phases 1 and 2a are complete and verified. Phases 2b-8 are still
+> design sketches written before anything ran — treat their snippets as intent, not
 > tested code, and check `PROJECT_CONTEXT.md`'s Verification status table.
+>
+> **`PHASE_2B_6_SPEC.md` (repo root) supersedes the Phase 2 and Phase 6 sections
+> below.** It carries the point-in-time correctness rules, the expected-fantasy-points
+> work, and a new **Phase 6.5 — Monte Carlo simulation** (matchup win probability,
+> playoff odds, floor/ceiling ranges). Read it before starting either phase.
 
 ## Goal
 

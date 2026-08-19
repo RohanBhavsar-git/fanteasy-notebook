@@ -201,6 +201,7 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 | 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
 | 6 | Projection model — XGBoost/LightGBM regression with time-series CV | Not started |
+| 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Not started |
 | 7 | JSON export — assemble `player_advanced_stats.json` | Not started |
 | 8 | GitHub Actions weekly automation | Not started |
 
@@ -235,6 +236,8 @@ Things that took real conversation to arrive at — a new Claude should NOT re-l
   6. `fgmiss` (−1) only applies to misses **under 50 yards**. Established empirically: 4/4 kickers whose only miss was short reconciled exactly; 0/12 with a 50+ miss did.
   7. `pass_int_td` needs play-by-play, and requires `td_team == defteam`. Without that condition, a defender fumbling an interception return into his own end zone scores as a pick-six when it's the opposite.
 - **K and DST are deliberately out of scope for the projection model.** Kicker output depends on how often the offense stalls in FG range, which is close to noise week to week; DST would need a team-defense model layered on an offense model. The scorer handles both correctly, but the dashboard keeps showing Sleeper's projections for K/DST, labeled as Sleeper's. This keeps Phase 6 finishable.
+- **Monte Carlo simulation is in scope; Markov chains are not.** Simulation (playing the week out thousands of times with randomness, then counting outcomes) answers questions no platform surfaces: matchup win probability, playoff odds, and "who is most likely to exceed 25 points" for start/sit calls. Markov chains were considered and rejected — weekly fantasy output isn't Markovian (next week depends on opponent, health, and game script, not on last week's "state"), and the one place they do fit football is drive-level modeling, where nflverse's existing EPA columns are already better than anything we'd rebuild.
+- **The simulator must handle correlation between teammates.** Sampling each starter independently makes simulated totals cluster too tightly, producing overconfident win probabilities (showing 85% when the truth is 65%). Approach: draw the game environment first from the Vegas total, then draw each player's share within it. Any probability shown on the dashboard needs a calibration plot behind it — a confidently wrong simulator is worse than none, because it looks authoritative.
 - **`fantasy_points_ppr` is not a valid target.** It's full PPR. The model trains on `custom_points` from `compute_custom_score()`, and any comparison against Sleeper's projections must use the same.
 - **Legal/financial advice pattern for LLM discussion**: When Rohan asked about "modern methods gaining traction," the answer was tiered (Strongly Suggest / Industry-Standard Tooling / Frontier) with an **explicit warning against shoehorning LLMs into a tabular regression project**. Follow the pattern — don't just list every trendy technique. Match tool to problem.
 
@@ -256,11 +259,12 @@ assumptions as facts.
 | ID crosswalk joins nflverse ↔ Sleeper | **Verified** — Sleeper `'4984'` → gsis `'00-0034857'`, both strings, 37 weekly rows returned |
 | Custom scorer reproduces league scoring | **Verified** — 100% exact, 0 mismatches across 739 rostered player-weeks (2025 wks 5/8/10/12/15), every position including K |
 | pandas 3.x compatibility | **Verified in practice** — full pipeline runs on pandas 3.0.5 / numpy 2.5.1 |
-| `pfr_player_id` → `gsis_id` join (needed for snap share) | **Verified** — 99.67% match for QB/RB/WR/TE (14,281/14,328 snap-count rows, 2024-2025). The 0.33% miss is fringe/practice-squad players absent from the crosswalk entirely, not a format bug. O-line (T/G/C/OL) and long-snapper (LS) match at 0-18% — `load_ff_playerids()` carries almost no offensive linemen (53 OT, 6 C, 1 T, no `G` category in 12,470 rows) since it's sourced from fantasy-platform rosters and o-linemen are never fantasy-relevant. Out of scope for the projection model regardless (skill positions only), so this doesn't block Phase 2b. |
+| `pfr_player_id` → `gsis_id` join (needed for snap share) | **Not verified** — the one crosswalk hop never exercised. Most likely place for the next surprise; test it before building features on it. |
 | Season/week boundary handling | **Partly verified** — requesting a season nflverse hasn't published (e.g. 2026 in the offseason) 404s with a raw traceback rather than a readable message |
 
 ## What's outstanding
 
+- **`PHASE_2B_6_SPEC.md`** at the repo root is the working spec for Phases 2b, 6, and 6.5. Fold it into this doc and `NOTEBOOK_OUTLINE.md` once those phases are complete.
 - **Phase 2b** — usage and efficiency features from pbp (target share, air-yards share, red-zone touches, aDOT, snap share). Start with snap share to shake out the `pfr_player_id` join early.
 - Bump the Phase 8 CI workflow from Python 3.11 to 3.12
 - Update `DEFAULT_LEAGUE_ID` in `src/ingest.py` each August when Sleeper rolls the league over
