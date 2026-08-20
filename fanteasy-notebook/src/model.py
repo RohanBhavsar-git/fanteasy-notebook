@@ -57,6 +57,7 @@ import logging
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import shap
 from scipy.stats import spearmanr
 
 from src.usage import CONTEXT_OUTPUT_COLUMNS, ROLLING_OUTPUT_COLUMNS
@@ -215,18 +216,11 @@ def walk_forward_predict(
     """
     pos_df = df[df["position"] == position].sort_values(["season", "week"]).reset_index(drop=True)
     folds = chronological_folds(pos_df, warmup_weeks)
-
-    # LightGBM's sklearn wrapper only accepts int/float/bool columns as-is;
-    # string columns (roof, surface) need pandas 'category' dtype for its
-    # native categorical handling. Cast once on the full frame, before
-    # splitting into folds, so train and test always share the same
-    # category set -- casting per-fold separately would let a category
-    # present only in a later fold's test set silently vanish from an
-    # earlier fold's training categories.
-    pos_df = pos_df.copy()
-    for col in feature_cols:
-        if pos_df[col].dtype == object or pd.api.types.is_string_dtype(pos_df[col]):
-            pos_df[col] = pos_df[col].astype("category")
+    # Cast once on the full frame, before splitting into folds, so train
+    # and test always share the same category set -- casting per-fold
+    # separately would let a category present only in a later fold's test
+    # set silently vanish from an earlier fold's training categories.
+    pos_df = _cast_categoricals(pos_df, feature_cols)
 
     params = {"objective": "regression", "verbosity": -1, "random_state": 42}
     if lgb_params:
@@ -254,6 +248,133 @@ def walk_forward_predict(
     if not preds:
         return pd.DataFrame(columns=id_cols + [target_col, "pred_model_a"])
     return pd.concat(preds, ignore_index=True)
+
+
+def _cast_categoricals(pos_df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    """LightGBM's sklearn wrapper only accepts int/float/bool columns as-is;
+    string columns (roof, surface) need pandas 'category' dtype for its
+    native categorical handling."""
+    pos_df = pos_df.copy()
+    for col in feature_cols:
+        if pos_df[col].dtype == object or pd.api.types.is_string_dtype(pos_df[col]):
+            pos_df[col] = pos_df[col].astype("category")
+    return pos_df
+
+
+def _rank_features_by_shap(
+    X: pd.DataFrame, y: pd.Series, feature_cols: list[str], lgb_params: dict
+) -> pd.Series:
+    """Train one model on (X, y) and return feature_cols ranked by mean
+    |SHAP value|, descending, computed on the SAME data the model trained
+    on (X) -- not on any held-out fold. This is the selector step of
+    walk_forward_predict_selected: a ranking derived only from information
+    available going into that fold's training window."""
+    model = lgb.LGBMRegressor(**lgb_params)
+    model.fit(X[feature_cols], y)
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X[feature_cols])
+    mean_abs_shap = pd.Series(np.abs(shap_values).mean(axis=0), index=feature_cols)
+    return mean_abs_shap.sort_values(ascending=False)
+
+
+def walk_forward_predict_selected(
+    df: pd.DataFrame,
+    position: str,
+    all_feature_cols: list[str],
+    n_features: int,
+    target_col: str = "custom_points",
+    warmup_weeks: int = 4,
+    lgb_params: dict | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Walk-forward prediction with feature selection derived FRESH inside
+    each fold, from that fold's training data only -- fixes the look-ahead
+    bias in a single dataset-wide SHAP ranking (an early fold's "top N"
+    would otherwise be chosen partly using information from weeks that
+    fold couldn't have seen yet).
+
+    Per fold: (1) train a selector model on all_feature_cols using that
+    fold's training rows, (2) rank by mean |SHAP| on those SAME training
+    rows, (3) keep the top n_features, (4) train a SECOND, fresh model
+    using ONLY those n_features on the same training rows, (5) predict the
+    test week with that second model. Two fits per fold, not one --
+    correctness over speed, and it's still fast at this data size.
+
+    Returns:
+        (preds, selections) --
+        preds: same shape as walk_forward_predict's return.
+        selections: long frame of (season, week, feature, shap_rank) for
+        every fold -- the raw material for picking one final, stable
+        feature list (e.g. by average rank across folds) if this feature
+        count turns out to win the ablation.
+    """
+    pos_df = df[df["position"] == position].sort_values(["season", "week"]).reset_index(drop=True)
+    folds = chronological_folds(pos_df, warmup_weeks)
+    pos_df = _cast_categoricals(pos_df, all_feature_cols)
+
+    params = {"objective": "regression", "verbosity": -1, "random_state": 42}
+    if lgb_params:
+        params.update(lgb_params)
+
+    id_cols = [c for c in ["player_id", "player_display_name", "season", "week"] if c in pos_df.columns]
+
+    preds = []
+    selections = []
+    for season, week in folds:
+        train_mask = (pos_df["season"] < season) | ((pos_df["season"] == season) & (pos_df["week"] < week))
+        test_mask = (pos_df["season"] == season) & (pos_df["week"] == week)
+        train = pos_df.loc[train_mask]
+        test = pos_df.loc[test_mask]
+        if len(train) < MIN_TRAIN_ROWS or test.empty:
+            continue
+
+        ranking = _rank_features_by_shap(train, train[target_col], all_feature_cols, params)
+        selected = ranking.index[:n_features].tolist()
+        selections.append(pd.DataFrame({
+            "season": season, "week": week,
+            "feature": ranking.index[:n_features],
+            "shap_rank": range(1, len(selected) + 1),
+        }))
+
+        model = lgb.LGBMRegressor(**params)
+        model.fit(train[selected], train[target_col])
+        pred = model.predict(test[selected])
+
+        result = test[id_cols + [target_col]].copy()
+        result["pred_model_a"] = pred
+        preds.append(result)
+
+    preds_df = (
+        pd.concat(preds, ignore_index=True) if preds
+        else pd.DataFrame(columns=id_cols + [target_col, "pred_model_a"])
+    )
+    selections_df = (
+        pd.concat(selections, ignore_index=True) if selections
+        else pd.DataFrame(columns=["season", "week", "feature", "shap_rank"])
+    )
+    return preds_df, selections_df
+
+
+def stable_feature_ranking(selections: pd.DataFrame, all_feature_cols: list[str]) -> pd.Series:
+    """
+    Aggregate walk_forward_predict_selected's per-fold rankings into ONE
+    final ranking, for picking a fixed feature list to hard-code -- average
+    rank across every fold, treating a feature that never made a fold's
+    top-N as ranked last (len(all_feature_cols)) in that fold rather than
+    leaving it out of the average entirely. Lower is better.
+
+    Deliberately uses ALL folds' worth of information (unlike the
+    per-fold-selected ablation runs, which each fold sees only its own
+    training data) -- once feature count is decided, choosing the final,
+    permanent feature LIST is a one-time setup decision, not part of the
+    walk-forward accuracy evaluation, so it's fine and standard practice
+    to use everything available for it.
+    """
+    worst_rank = len(all_feature_cols)
+    pivot = selections.pivot_table(index="feature", columns=["season", "week"], values="shap_rank")
+    pivot = pivot.reindex(all_feature_cols)
+    avg_rank = pivot.fillna(worst_rank).mean(axis=1)
+    return avg_rank.sort_values()
 
 
 # ==========================================================================

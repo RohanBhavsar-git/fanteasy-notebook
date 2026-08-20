@@ -1099,9 +1099,9 @@ def add_xfp_features(
 # ==========================================================================
 # FAMILY 6 — ROLLING AGGREGATES (step 4)
 # ==========================================================================
-# Every continuous feature from Families 1-5 (volume/share, snap share,
-# situational, game context, xFP), rolled into three point-in-time-safe
-# trailing summaries:
+# Every continuous PLAYER feature from Families 1-4 and xFP (volume/share,
+# snap share, efficiency, situational, xFP -- NOT Family 5's game context,
+# see below), rolled into three point-in-time-safe trailing summaries:
 #   <feat>_ewm3  -- exponentially weighted mean, ~3-week half-life
 #   <feat>_vol   -- season-to-date expanding STANDARD DEVIATION (volatility)
 #   <feat>_s2d   -- season-to-date expanding MEAN
@@ -1116,41 +1116,45 @@ def add_xfp_features(
 # 6.5's floor/ceiling work) under the honest name _vol, and added _s2d
 # as the expanding mean this section always should have had alongside it.
 #
-# Categorical/boolean context columns (is_home, roof, surface) are
-# excluded -- there's no meaningful "3-week average" of a stadium surface.
-_NON_CONTINUOUS_CONTEXT_COLUMNS = {"is_home", "roof", "surface"}
-
+# Family 5 (game context) is excluded from rolling treatment entirely --
+# not just the categorical/boolean columns (is_home, roof, surface, where
+# "no meaningful 3-week average of a stadium surface" was always obvious),
+# but the continuous ones too (days_rest, spread, game_total,
+# team_implied_total, temp, wind). These describe THIS WEEK'S game, not
+# the player -- a trailing average of wind speed isn't a meaningful
+# quantity, and rolling them was a mistake in the original spec, not a
+# deliberate design choice. Confirmed harmful in practice, not just
+# theoretically wrong: SHAP diagnostics on the Phase 6 model (see
+# PROJECT_CONTEXT.md) showed context columns and their rolled variants
+# occupying up to 8 of the top 20 features by importance at some
+# positions -- weight the model was spending on noise instead of the
+# opportunity signals that actually predict points. Current-week context
+# values are still used directly as model features (Family 5's own
+# add_context_features output, untouched) -- only the derived
+# _ewm3/_vol/_s2d/prev_season_ variants are gone.
 ROLLING_SOURCE_COLUMNS = (
     list(VOLUME_OUTPUT_COLUMNS)
     + list(SNAP_OUTPUT_COLUMNS)
     + list(EFFICIENCY_OUTPUT_COLUMNS)
     + list(SITUATIONAL_OUTPUT_COLUMNS)
-    + [c for c in CONTEXT_OUTPUT_COLUMNS if c not in _NON_CONTINUOUS_CONTEXT_COLUMNS]
     + list(XFP_OUTPUT_COLUMNS)
 )
 
 EWM_HALFLIFE = 3
 
-# "Core" continuous features for the prior-season baseline -- ROLLING_SOURCE_COLUMNS
-# minus two groups that don't describe a PLAYER's own persistent role:
-#   - team-level counts (team_rz_targets, team_rz_carries,
-#     team_inside_5_carries, team_two_minute_targets) -- these describe
-#     the player's TEAM that week, not the player; a player's own
-#     "prior-season average of their team's red-zone trips" isn't a
-#     player attribute.
-#   - game-context columns (days_rest, spread, game_total,
-#     team_implied_total, temp, wind) -- these describe THIS season's
-#     schedule/circumstances, not something carried over from last year.
-# What's left is volume, share, snap, efficiency, situational-share, and
-# xFP columns -- the opportunity/role/skill signals a manager would
-# actually want going into week 1, before any of this season's games have
-# set the in-season rolling windows. Efficiency (adot, catch_rate,
-# yards_per_target, yards_per_carry, cpoe, epa_per_dropback,
-# avg_separation, avg_cushion, time_to_throw) is included in full --
-# unlike team-level counts or game context, these ARE player attributes.
+# "Core" continuous features for the prior-season baseline -- everything in
+# ROLLING_SOURCE_COLUMNS except team-level counts (team_rz_targets,
+# team_rz_carries, team_inside_5_carries, team_two_minute_targets), which
+# describe the player's TEAM that week, not the player -- a player's own
+# "prior-season average of their team's red-zone trips" isn't a player
+# attribute. (Game-context columns don't need a separate exclusion here
+# any more -- they're not in ROLLING_SOURCE_COLUMNS to begin with.) What's
+# left is volume, share, snap, efficiency, and situational-share/xFP
+# columns -- the opportunity/role/skill signals a manager would actually
+# want going into week 1, before any of this season's games have set the
+# in-season rolling windows.
 _PREV_SEASON_EXCLUDED_COLUMNS = {
     "team_rz_targets", "team_rz_carries", "team_inside_5_carries", "team_two_minute_targets",
-    "days_rest", "spread", "game_total", "team_implied_total", "temp", "wind",
 }
 PREV_SEASON_SOURCE_COLUMNS = [
     c for c in ROLLING_SOURCE_COLUMNS if c not in _PREV_SEASON_EXCLUDED_COLUMNS
@@ -1167,9 +1171,11 @@ ROLLING_OUTPUT_COLUMNS = (
 
 def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add trailing summaries of every continuous feature from Families 1-5,
-    plus games_played, snap_share_delta_3wk (deferred from step 1), and
-    prior-season baselines for a core subset of those features.
+    Add trailing summaries of every continuous PLAYER feature from Families
+    1-4 and xFP (Family 5's game context is deliberately excluded -- see
+    ROLLING_SOURCE_COLUMNS's comment), plus games_played,
+    snap_share_delta_3wk (deferred from step 1), and prior-season
+    baselines for a core subset of those features.
 
     Point-in-time mechanics (ewm3/vol/s2d): df is sorted by
     ['player_id', 'season', 'week'] and grouped by ('player_id',
