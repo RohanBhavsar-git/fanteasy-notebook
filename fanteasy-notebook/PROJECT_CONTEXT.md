@@ -3,9 +3,12 @@
 This document captures the "why" behind the FanTeasy Stats project so a new conversation can pick up seamlessly. Read this first before starting any new work.
 
 > **Last updated:** August 2026. Phase 1 (ingestion) and Phase 2a (custom
-> scoring) are complete and verified against live data. Phase 2b onward is
-> still design sketch — see **Verification status** near the end before
-> treating any pipeline claim as settled.
+> scoring) are complete and verified against live data. Phase 2b steps 1-4
+> (volume/snap/situational/context features, xFP, rolling aggregates) are
+> also complete and verified — see **Phase 2b progress** below. Steps 5-10
+> (exercising notebook, Phase 6 model, Phase 6.5 simulation) are still design
+> sketch — see **Verification status** near the end before treating any
+> pipeline claim as settled.
 
 ---
 
@@ -196,7 +199,7 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 |---|---|---|
 | 1 | Data ingestion — `src/ingest.py` + `01_data_ingestion.ipynb` | **Done** — runs clean, all sources cached to `data/raw/` |
 | 2a | Custom scoring — `src/features.py` + `02_custom_scoring.ipynb` | **Done** — 100% validated against Sleeper's actual results |
-| 2b | Usage + efficiency features from pbp | Next up |
+| 2b | Usage + efficiency features from pbp | Steps 1-4 of 10 **done** (`src/usage.py`) — see **Phase 2b progress** below. Steps 5-10 remain. |
 | 3 | Role classification — rule-based Pocket Passer / 3-Down Back / Slot / etc. | Not started |
 | 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
@@ -210,6 +213,32 @@ Notebooks are kept single-purpose: `01_data_ingestion.ipynb` does ingestion only
 separate scratch notebook — mixing them in meant 01 stopped running top to bottom.
 
 The dashboard already has integration hooks waiting. Search `state.advancedStats` and `p.myProj` and `// Hook for your custom model` in `index.html` to see exactly where each output will slot in.
+
+---
+
+## Phase 2b progress (steps 1-4 of 10, complete)
+
+`src/usage.py` runs six idempotent functions in sequence over `weekly_scored.parquet` (QB/RB/WR/TE, REG only), each dropping and recomputing its own output columns:
+
+- `add_volume_features(df, pbp)` — target/air-yards/carry share, WOPR, touches, QB dropback/scramble split
+- `add_snap_features(df, snaps, crosswalk)` — `offense_snaps`/`offense_pct` via the `pfr_player_id` crosswalk
+- `add_situational_features(df, pbp)` — red-zone/goal-line volume, third-down and two-minute target share
+- `add_context_features(df, schedule)` — `is_home`, spread, implied team total, weather
+- `add_xfp_features(df, pbp, scoring_settings)` — expected fantasy points from a bucketed opportunity-value rate table
+- `add_rolling_features(df)` — `_ewm3`/`_s2d`/`_vol` trailing summaries of every continuous feature above, plus `games_played`, `snap_share_delta_3wk`, and `prev_season_*` baselines
+
+**Leakage-test approach.** `tests/test_no_leakage.py` (34 tests) pairs two patterns per family:
+- **Black-box future-truncation** — build the table twice, once with weeks after a boundary removed from the source data, and assert weeks at/before the boundary are unchanged. Catches a feature looking forward.
+- **White-box perturbation tests** — for xFP's rate table and the rolling aggregates, future-truncation alone can't prove a feature excludes its OWN week, because removing week N's row also destroys real same-week information the feature legitimately needs (a player's actual opportunities that week; week N's own value that week N+1 needs to see). Instead these tests perturb one real value to an extreme outlier and confirm the SAME week's derived feature is unaffected while the NEXT week's is. Step 4 (rolling aggregates) got the most coverage of any step for exactly this reason — it's where a shift(1) mistake would do the most damage.
+
+**Definitions settled that aren't obvious from the spec alone:**
+- `target_share`/`carry_share`/`touch_share` denominators are team **targets** (pass attempts with a recorded receiver), not "team pass attempts" as the spec literally says — that reading doesn't sum to 1.0 per team-week, contradicting the phase's own acceptance criterion.
+- This pbp snapshot's `pass_attempt` flag fires on sack rows too — doesn't match the official "attempts" stat alone; verified against a real box score before trusting any pass-attempt-shaped denominator.
+- QB kneels are excluded from `designed_rush_attempts` and from xFP's carry population — they set `rush_attempt=1` in this pbp version but aren't a called play in any fantasy-relevant sense.
+- `_s2d` (season-to-date expanding mean) and `_vol` (expanding standard deviation) are two separate columns — an earlier pass conflated them under `_std`, describing it in the spec as "expanding mean," which turned out to be a naming error, not a units typo.
+- `prev_season_*` holds last season's full-season average for a core subset of role/opportunity features and does **not** reset at the season boundary the way in-season rolling features do — an entire prior season can't leak forward.
+
+Steps 5-10 remain: `03_usage_features.ipynb` exercising the full table, then Phase 6 (projection model, model A/B, quantile floor/ceiling) and Phase 6.5 (Monte Carlo simulation).
 
 ---
 
