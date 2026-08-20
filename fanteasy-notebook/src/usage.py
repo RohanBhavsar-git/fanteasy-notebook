@@ -359,6 +359,19 @@ def add_snap_features(
 
     cw = crosswalk.dropna(subset=["pfr_id"]).drop_duplicates(subset=["pfr_id"])
     snaps_reg = snaps[snaps["game_type"] == "REG"]
+
+    # A player can appear on TWO teams' snap logs in the same week from a
+    # genuine mid-week waiver claim (verified on the 2018-2025 range: Jalen
+    # Davis, pfr_player_id DaviJa06, appears for both ARI and MIA in 2019
+    # Wk16 -- one real player, not a crosswalk error). Deduplicate on the
+    # PFR side, before the crosswalk join, keeping the team he played more
+    # snaps for that week -- this has to happen before the collision check
+    # below, which exists to catch a DIFFERENT problem (two DISTINCT
+    # players mapped to the same gsis_id) and should stay strict for that.
+    snaps_reg = snaps_reg.sort_values("offense_snaps", ascending=False).drop_duplicates(
+        subset=["pfr_player_id", "season", "week"], keep="first"
+    )
+
     mapped = snaps_reg.merge(
         cw[["pfr_id", "gsis_id"]],
         left_on="pfr_player_id", right_on="pfr_id", how="inner",
@@ -368,8 +381,10 @@ def add_snap_features(
     if dupes.any():
         raise ValueError(
             f"{dupes.sum()} snap rows collide on (gsis_id, season, week) after "
-            "the pfr_player_id -> gsis_id join -- two PFR players mapped to the "
-            "same gsis_id. Investigate before trusting snap_share."
+            "the pfr_player_id -> gsis_id join -- two DIFFERENT PFR players "
+            "mapped to the same gsis_id (the multi-team-in-one-week case is "
+            "already deduplicated above, so this is a real crosswalk problem). "
+            "Investigate before trusting snap_share."
         )
 
     snap_cols = (
