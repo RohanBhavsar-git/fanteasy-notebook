@@ -32,10 +32,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.ingest import (  # noqa: E402
-    get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league, get_snap_counts,
+    get_id_crosswalk, get_ngs_data, get_pbp, get_schedule, get_sleeper_league, get_snap_counts,
 )
 from src.usage import (  # noqa: E402
     CONTEXT_OUTPUT_COLUMNS,
+    EFFICIENCY_OUTPUT_COLUMNS,
     FANTASY_POSITIONS,
     ROLLING_OUTPUT_COLUMNS,
     SITUATIONAL_OUTPUT_COLUMNS,
@@ -43,6 +44,7 @@ from src.usage import (  # noqa: E402
     VOLUME_OUTPUT_COLUMNS,
     XFP_OUTPUT_COLUMNS,
     add_context_features,
+    add_efficiency_features,
     add_rolling_features,
     add_situational_features,
     add_snap_features,
@@ -88,11 +90,24 @@ def scoring_settings() -> dict:
 
 
 @pytest.fixture(scope="module")
-def featured_df(weekly_scored, pbp, snaps, crosswalk, schedule, scoring_settings) -> pd.DataFrame:
-    """weekly_scored with Families 1-3 (steps 1-3) already applied -- the
+def ngs_receiving() -> pd.DataFrame:
+    return get_ngs_data("receiving", [2024, 2025])
+
+
+@pytest.fixture(scope="module")
+def ngs_passing() -> pd.DataFrame:
+    return get_ngs_data("passing", [2024, 2025])
+
+
+@pytest.fixture(scope="module")
+def featured_df(
+    weekly_scored, pbp, snaps, crosswalk, schedule, scoring_settings, ngs_receiving, ngs_passing
+) -> pd.DataFrame:
+    """weekly_scored with every non-rolling family already applied -- the
     input add_rolling_features expects."""
     df = add_volume_features(weekly_scored, pbp)
     df = add_snap_features(df, snaps, crosswalk)
+    df = add_efficiency_features(df, pbp, ngs_receiving, ngs_passing)
     df = add_situational_features(df, pbp)
     df = add_context_features(df, schedule)
     df = add_xfp_features(df, pbp, scoring_settings)
@@ -103,6 +118,13 @@ def _truncate_after(df: pd.DataFrame, season: int, boundary_week: int) -> pd.Dat
     """Drop rows for `season` beyond `boundary_week`; other seasons untouched."""
     drop_mask = (df["season"] == season) & (df["week"] > boundary_week)
     return df[~drop_mask]
+
+
+@pytest.fixture(scope="module")
+def base_with_volume(weekly_scored, pbp) -> pd.DataFrame:
+    """weekly_scored + add_volume_features -- add_efficiency_features needs
+    air_yards and dropbacks from Family 1 as input."""
+    return add_volume_features(weekly_scored, pbp)
 
 
 @pytest.mark.parametrize("season,boundary_week", BOUNDARIES)
@@ -145,6 +167,31 @@ def test_volume_features_idempotent(weekly_scored, pbp):
 def test_snap_features_idempotent(weekly_scored, snaps, crosswalk):
     once = add_snap_features(weekly_scored, snaps, crosswalk)
     twice = add_snap_features(once, snaps, crosswalk)
+    pd.testing.assert_frame_equal(once, twice)
+
+
+@pytest.mark.parametrize("season,boundary_week", BOUNDARIES)
+def test_efficiency_features_no_future_leakage(
+    base_with_volume, pbp, ngs_receiving, ngs_passing, season, boundary_week
+):
+    pbp_truncated = _truncate_after(pbp, season, boundary_week)
+    ngs_r_truncated = _truncate_after(ngs_receiving, season, boundary_week)
+    ngs_p_truncated = _truncate_after(ngs_passing, season, boundary_week)
+
+    full = add_efficiency_features(base_with_volume, pbp, ngs_receiving, ngs_passing)
+    truncated = add_efficiency_features(base_with_volume, pbp_truncated, ngs_r_truncated, ngs_p_truncated)
+
+    mask = (full["season"] == season) & (full["week"] <= boundary_week)
+    cols = ["player_id", "season", "week"] + EFFICIENCY_OUTPUT_COLUMNS
+    left = full.loc[mask, cols].reset_index(drop=True)
+    right = truncated.loc[mask, cols].reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(left, right)
+
+
+def test_efficiency_features_idempotent(base_with_volume, pbp, ngs_receiving, ngs_passing):
+    once = add_efficiency_features(base_with_volume, pbp, ngs_receiving, ngs_passing)
+    twice = add_efficiency_features(once, pbp, ngs_receiving, ngs_passing)
     pd.testing.assert_frame_equal(once, twice)
 
 

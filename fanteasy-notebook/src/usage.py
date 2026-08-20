@@ -1,8 +1,10 @@
 """
 FanTeasy Stats — Usage and efficiency features (Phase 2b)
 
-Steps 1-2 of PHASE_2B_6_SPEC.md's Order of Work: volume/share, snap-share,
-situational, and game-context feature families. Keep this separate from
+Steps 1-4 of PHASE_2B_6_SPEC.md's Order of Work, plus Family 3 (efficiency --
+built out of chronological order, added when steps 1-2 turned out to have
+skipped it): volume/share, snap-share, efficiency, situational, game-context,
+xFP, and rolling-aggregate feature families. Keep this separate from
 features.py, which owns scoring.
 
 Design note on denominators:
@@ -87,20 +89,34 @@ Design note on xFP's rate table (add_xfp_features):
 
 Design note on the season boundary in rolling aggregates (add_rolling_features):
     See that function's own docstring for the full reasoning. Short
-    version: ewm3/std/games_played group by (player_id, season) together,
-    so they reset at every season boundary -- deliberately the OPPOSITE
-    of xFP's rate table, because these describe a player's OWN trend
-    (which really does reset with a new team/role/coordinator) while
-    xFP's rate table estimates a league-wide constant (which doesn't).
+    version: ewm3/vol/s2d/games_played group by (player_id, season)
+    together, so they reset at every season boundary -- deliberately the
+    OPPOSITE of xFP's rate table, because these describe a player's OWN
+    trend (which really does reset with a new team/role/coordinator)
+    while xFP's rate table estimates a league-wide constant (which
+    doesn't).
+
+Design note on the 2pt-attempt fix in _team_week_totals (Family 1):
+    Found via a full audit of every team-week's target_share remainder
+    (not just the worst case): weekly_scored's own official targets/
+    carries columns -- the numerator for every Family 1 share -- already
+    exclude two-point-conversion plays, but _team_week_totals's team-level
+    denominators didn't, silently deflating every share on any team-week
+    with a 2pt attempt (160/1088 team-weeks were affected before the fix).
+    Family 4's situational totals still include 2pt attempts too, but
+    numerator and denominator agree there (both built from pbp, neither
+    from weekly_scored's official columns), so it's a minor definitional
+    inconsistency versus Family 1/xFP, not a bug -- noted, not yet fixed.
 
 Usage:
     from src.usage import (
-        add_volume_features, add_snap_features,
+        add_volume_features, add_snap_features, add_efficiency_features,
         add_situational_features, add_context_features,
         add_xfp_features, add_rolling_features,
     )
     df = add_volume_features(weekly_scored, pbp)
     df = add_snap_features(df, snaps, crosswalk)
+    df = add_efficiency_features(df, pbp, ngs_receiving, ngs_passing)
     df = add_situational_features(df, pbp)
     df = add_context_features(df, schedule)
     df = add_xfp_features(df, pbp, scoring_settings)
@@ -142,8 +158,20 @@ def _team_week_totals(pbp: pd.DataFrame) -> pd.DataFrame:
     Built from the full pbp regardless of position, so shares computed
     against these totals are correct even for teams whose stray targets
     went to a FB or a trick-play passer.
+
+    Excludes two_point_attempt == 1 plays. Found via the full team-week
+    target_share audit (every targeted play's remainder should equal
+    exactly its out-of-scope-position targets; 160/1088 team-weeks didn't
+    reconcile before this fix): weekly_scored's own official `targets`
+    and `carries` columns -- the NUMERATOR for every share in this
+    module -- already exclude 2-point conversion plays (verified: a
+    receiver with 13 raw pbp targets including one 2pt try showed
+    `targets == 12` in weekly_scored; a rusher with 17 raw carries
+    including one 2pt try showed `carries == 16`). Before this fix, the
+    DENOMINATOR here counted 2pt plays that the numerator never counted,
+    silently deflating every share on any team-week with a 2pt attempt.
     """
-    reg = pbp[pbp["season_type"] == "REG"]
+    reg = pbp[(pbp["season_type"] == "REG") & (pbp["two_point_attempt"] == 0)]
 
     targeted = reg[(reg["pass_attempt"] == 1) & reg["receiver_player_id"].notna()]
     team_targets = (
@@ -344,6 +372,167 @@ def add_snap_features(
     )
 
     return out.merge(snap_cols, on=["player_id", "season", "week"], how="left")
+
+
+# ==========================================================================
+# FAMILY 3 — EFFICIENCY
+# ==========================================================================
+# Skipped in steps 1-2 (an omission, not a scope decision) -- built now,
+# out of chronological order but in the spec's own family order (3, before
+# situational/context).
+EFFICIENCY_OUTPUT_COLUMNS = [
+    "adot", "yac_per_reception", "catch_rate", "yards_per_target", "yards_per_carry",
+    "cpoe", "epa_per_dropback",
+    "avg_separation", "avg_cushion", "time_to_throw",
+]
+
+
+def _qb_efficiency_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per (gsis player_id, season, week): total qb_epa on dropback plays
+    (epa_per_dropback's numerator -- the caller divides by df's own
+    `dropbacks` column from add_volume_features, rather than recomputing
+    a second, potentially-drifting dropback count here) and mean cpoe on
+    true pass attempts (a rate already, no further division needed).
+
+    Attribution mirrors _qb_dropback_features: passer_player_id, falling
+    back to rusher_player_id on scramble rows where it's null.
+    """
+    reg = pbp[pbp["season_type"] == "REG"].copy()
+    reg["qb_id"] = reg["passer_player_id"].where(
+        reg["passer_player_id"].notna(), reg["rusher_player_id"]
+    )
+
+    dropback_rows = reg[(reg["qb_dropback"] == 1) & reg["qb_id"].notna()]
+    epa_sum = (
+        dropback_rows.groupby(["qb_id", "season", "week"])["qb_epa"]
+        .sum()
+        .reset_index(name="qb_epa_sum")
+    )
+
+    cpoe_rows = reg[
+        (reg["pass_attempt"] == 1) & reg["passer_player_id"].notna() & reg["cpoe"].notna()
+    ]
+    cpoe_avg = (
+        cpoe_rows.groupby(["passer_player_id", "season", "week"])["cpoe"]
+        .mean()
+        .reset_index()
+        .rename(columns={"passer_player_id": "qb_id"})
+    )
+
+    out = epa_sum.merge(cpoe_avg, on=["qb_id", "season", "week"], how="outer")
+    return out.rename(columns={"qb_id": "player_id"})
+
+
+def _ngs_receiving_lookup(ngs_receiving: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per (gsis player_id, season, week): avg_separation, avg_cushion.
+    Excludes week == 0 (nflverse's season-aggregate row, not a real week)
+    and non-REG rows. NGS receiving only covers WR/TE -- verified directly
+    (player_position has exactly two values, {'TE', 'WR'}) -- so RB rows
+    get null here from the join never matching, not from a bug.
+    """
+    reg = ngs_receiving[
+        (ngs_receiving["season_type"] == "REG") & (ngs_receiving["week"] > 0)
+    ]
+    return reg[["player_gsis_id", "season", "week", "avg_separation", "avg_cushion"]].rename(
+        columns={"player_gsis_id": "player_id"}
+    )
+
+
+def _ngs_passing_lookup(ngs_passing: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per (gsis player_id, season, week): time_to_throw. Excludes week == 0
+    and non-REG rows, same as _ngs_receiving_lookup. NGS passing only
+    covers QB (verified: player_position == {'QB'} exactly), so this
+    never needs an explicit position mask.
+    """
+    reg = ngs_passing[
+        (ngs_passing["season_type"] == "REG") & (ngs_passing["week"] > 0)
+    ]
+    return reg[["player_gsis_id", "season", "week", "avg_time_to_throw"]].rename(
+        columns={"player_gsis_id": "player_id", "avg_time_to_throw": "time_to_throw"}
+    )
+
+
+def add_efficiency_features(
+    df: pd.DataFrame, pbp: pd.DataFrame, ngs_receiving: pd.DataFrame, ngs_passing: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Add per-opportunity efficiency: adot, yac_per_reception, catch_rate,
+    yards_per_target, yards_per_carry (all from weekly_scored's own
+    official receiving/rushing columns, already present in df -- no need
+    to re-derive them from pbp), cpoe and epa_per_dropback for QBs (from
+    pbp), and avg_separation/avg_cushion/time_to_throw from NGS.
+
+    Ratio null semantics: every ratio's denominator (targets, receptions,
+    carries, dropbacks) is a count column ALREADY in df from an earlier
+    step -- callers needing to distinguish "0 opportunities" from "some
+    opportunities, ratio genuinely undefined" (there's no such case here;
+    see below) can check that column directly, so no companion team_*-
+    style count column is added. Every numerator here is derived from the
+    exact same opportunities as its denominator (e.g. receiving_yards
+    only accumulates from real receptions), so a 0 denominator always
+    pairs with a 0 numerator -- plain division gives 0/0 = null, never a
+    spurious 0 or inf.
+
+    cpoe/epa_per_dropback are null for every non-QB row (masked
+    explicitly, same pattern as Family 1's dropbacks/scramble_rate) --
+    not because the ratio is undefined, but because the concept doesn't
+    apply to a non-passer.
+
+    NGS coverage: 2016+ only (irrelevant for this project's 2024-2025
+    scope, but noted for whenever SEASONS extends further back) and
+    sparse even within that range -- avg_separation/avg_cushion cover
+    WR/TE only (RB is entirely absent from NGS receiving, verified), and
+    a real gap in null rates should be expected and is reported, not
+    silently backfilled.
+
+    Idempotent: existing output columns are dropped before recomputing.
+
+    Args:
+        df: player-week frame with player_id, position, season, week,
+            targets, receptions, receiving_yards, receiving_yards_after_catch,
+            carries, rushing_yards, dropbacks (i.e. df after
+            add_volume_features has already run -- dropbacks is required).
+        pbp: play-by-play frame from get_pbp().
+        ngs_receiving: from get_ngs_data('receiving', seasons).
+        ngs_passing: from get_ngs_data('passing', seasons).
+
+    Returns:
+        Copy of df with EFFICIENCY_OUTPUT_COLUMNS added.
+    """
+    required = [
+        "player_id", "position", "season", "week", "targets", "receptions",
+        "receiving_yards", "receiving_yards_after_catch", "carries",
+        "rushing_yards", "dropbacks",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"add_efficiency_features: df is missing columns {missing}")
+
+    out = df.drop(columns=[c for c in EFFICIENCY_OUTPUT_COLUMNS if c in df.columns])
+
+    out["adot"] = out["air_yards"] / out["targets"]
+    out["yac_per_reception"] = out["receiving_yards_after_catch"] / out["receptions"]
+    out["catch_rate"] = out["receptions"] / out["targets"]
+    out["yards_per_target"] = out["receiving_yards"] / out["targets"]
+    out["yards_per_carry"] = out["rushing_yards"] / out["carries"]
+
+    qb_feats = _qb_efficiency_from_pbp(pbp)
+    out = out.merge(qb_feats, on=["player_id", "season", "week"], how="left")
+    out["epa_per_dropback"] = out["qb_epa_sum"] / out["dropbacks"]
+    out = out.drop(columns=["qb_epa_sum"])
+    out.loc[out["position"] != "QB", ["cpoe", "epa_per_dropback"]] = pd.NA
+
+    out = out.merge(
+        _ngs_receiving_lookup(ngs_receiving), on=["player_id", "season", "week"], how="left"
+    )
+    out = out.merge(
+        _ngs_passing_lookup(ngs_passing), on=["player_id", "season", "week"], how="left"
+    )
+
+    return out
 
 
 # ==========================================================================
@@ -914,6 +1103,7 @@ _NON_CONTINUOUS_CONTEXT_COLUMNS = {"is_home", "roof", "surface"}
 ROLLING_SOURCE_COLUMNS = (
     list(VOLUME_OUTPUT_COLUMNS)
     + list(SNAP_OUTPUT_COLUMNS)
+    + list(EFFICIENCY_OUTPUT_COLUMNS)
     + list(SITUATIONAL_OUTPUT_COLUMNS)
     + [c for c in CONTEXT_OUTPUT_COLUMNS if c not in _NON_CONTINUOUS_CONTEXT_COLUMNS]
     + list(XFP_OUTPUT_COLUMNS)
@@ -931,10 +1121,13 @@ EWM_HALFLIFE = 3
 #   - game-context columns (days_rest, spread, game_total,
 #     team_implied_total, temp, wind) -- these describe THIS season's
 #     schedule/circumstances, not something carried over from last year.
-# What's left is volume, share, snap, situational-share, and xFP columns
-# -- the opportunity/role signals a manager would actually want going
-# into week 1, before any of this season's games have set the in-season
-# rolling windows.
+# What's left is volume, share, snap, efficiency, situational-share, and
+# xFP columns -- the opportunity/role/skill signals a manager would
+# actually want going into week 1, before any of this season's games have
+# set the in-season rolling windows. Efficiency (adot, catch_rate,
+# yards_per_target, yards_per_carry, cpoe, epa_per_dropback,
+# avg_separation, avg_cushion, time_to_throw) is included in full --
+# unlike team-level counts or game context, these ARE player attributes.
 _PREV_SEASON_EXCLUDED_COLUMNS = {
     "team_rz_targets", "team_rz_carries", "team_inside_5_carries", "team_two_minute_targets",
     "days_rest", "spread", "game_total", "team_implied_total", "temp", "wind",
