@@ -96,17 +96,23 @@ Design note on the season boundary in rolling aggregates (add_rolling_features):
     while xFP's rate table estimates a league-wide constant (which
     doesn't).
 
-Design note on the 2pt-attempt fix in _team_week_totals (Family 1):
-    Found via a full audit of every team-week's target_share remainder
-    (not just the worst case): weekly_scored's own official targets/
-    carries columns -- the numerator for every Family 1 share -- already
-    exclude two-point-conversion plays, but _team_week_totals's team-level
-    denominators didn't, silently deflating every share on any team-week
-    with a 2pt attempt (160/1088 team-weeks were affected before the fix).
-    Family 4's situational totals still include 2pt attempts too, but
-    numerator and denominator agree there (both built from pbp, neither
-    from weekly_scored's official columns), so it's a minor definitional
-    inconsistency versus Family 1/xFP, not a bug -- noted, not yet fixed.
+Design note on excluding two_point_attempt == 1 from every pbp-built
+team-week denominator (Family 1 and Family 4):
+    Found in Family 1 via a full audit of every team-week's target_share
+    remainder (not just the worst case): weekly_scored's own official
+    targets/carries columns -- the numerator for every Family 1 share --
+    already exclude two-point-conversion plays, but _team_week_totals's
+    team-level denominators didn't, silently deflating every share on any
+    team-week with a 2pt attempt (160/1088 team-weeks were affected
+    before the fix). Family 4's situational totals had the same 2pt plays
+    included on BOTH numerator and denominator (both built from pbp,
+    neither from weekly_scored's official columns), so it was never a
+    live numerator/denominator mismatch bug there -- but it was accidental
+    consistency, not a deliberate choice, and editing just one side later
+    (as Family 1's numerator vs. denominator drifted) would have silently
+    reintroduced exactly this bug. Fixed in both places on the same
+    principle: every pbp-built team-week denominator in this module
+    excludes two_point_attempt == 1, full stop.
 
 Usage:
     from src.usage import (
@@ -564,8 +570,18 @@ def _situational_team_totals(pbp: pd.DataFrame) -> pd.DataFrame:
     situational share below. Built from the full pbp, not just
     QB/RB/WR/TE targets, for the same reason as _team_week_totals -- a
     red-zone target to a FB still has to count toward the team total.
+
+    Excludes two_point_attempt == 1, matching _team_week_totals and
+    xFP's play frames. This family's numerator and denominator were both
+    already built from pbp directly (neither reused weekly_scored's
+    official columns the way Family 1's numerator did), so including 2pt
+    plays consistently on both sides was never a numerator/denominator
+    mismatch -- but it was accidental consistency, not a deliberate
+    choice, and the exact bug fixed in Family 1 would reappear the moment
+    only one side of this pair got edited. One convention, applied
+    everywhere a team-week denominator is built from pbp.
     """
-    reg = pbp[pbp["season_type"] == "REG"]
+    reg = pbp[(pbp["season_type"] == "REG") & (pbp["two_point_attempt"] == 0)]
     targeted = reg[(reg["pass_attempt"] == 1) & reg["receiver_player_id"].notna()]
     rushes = reg[reg["rush_attempt"] == 1]
 
@@ -600,8 +616,12 @@ def _situational_player_counts(pbp: pd.DataFrame) -> pd.DataFrame:
     Absence from this frame means zero of every event type here, not
     unknown -- add_situational_features fills 0 for any QB/RB/WR/TE row,
     since weekly_scored only carries rows for players who appeared.
+
+    Excludes two_point_attempt == 1 -- see _situational_team_totals for
+    why. Must stay in sync with that function's exclusion; both changed
+    together here.
     """
-    reg = pbp[pbp["season_type"] == "REG"]
+    reg = pbp[(pbp["season_type"] == "REG") & (pbp["two_point_attempt"] == 0)]
     targeted = reg[(reg["pass_attempt"] == 1) & reg["receiver_player_id"].notna()]
     caught = targeted[targeted["complete_pass"] == 1]
     rushes = reg[(reg["rush_attempt"] == 1) & reg["rusher_player_id"].notna()]

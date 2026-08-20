@@ -16,10 +16,13 @@ pytest>=8.0.0
 # EDA plots (Phase 2b step 5 validation)
 matplotlib>=3.7.0
 
+# Phase 6: projection model
+lightgbm>=4.0.0            # primary model, per PHASE_2B_6_SPEC.md
+scikit-learn>=1.3.0        # lgb.LGBMRegressor's sklearn wrapper requires this directly
+scipy>=1.11.0               # spearmanr for rank-correlation metrics
+
 # Later phases (uncomment as you get to them):
-# scikit-learn>=1.3.0        # Phase 3: role clustering
-# xgboost>=2.0.0             # Phase 6: projection model
-# lightgbm>=4.0.0            # Phase 6: alternative to xgboost
+# xgboost>=2.0.0             # Phase 6: cross-check against lightgbm
 # optuna>=3.4.0              # Phase 6: hyperparameter tuning
 # shap>=0.43.0               # Phase 6: model explainability
 # mlflow>=2.8.0              # Phase 6: experiment tracking
