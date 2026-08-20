@@ -85,17 +85,26 @@ Design note on xFP's rate table (add_xfp_features):
     opportunities, not passing -- QB fp_over_expected is not a
     meaningful luck signal under this design.
 
+Design note on the season boundary in rolling aggregates (add_rolling_features):
+    See that function's own docstring for the full reasoning. Short
+    version: ewm3/std/games_played group by (player_id, season) together,
+    so they reset at every season boundary -- deliberately the OPPOSITE
+    of xFP's rate table, because these describe a player's OWN trend
+    (which really does reset with a new team/role/coordinator) while
+    xFP's rate table estimates a league-wide constant (which doesn't).
+
 Usage:
     from src.usage import (
         add_volume_features, add_snap_features,
         add_situational_features, add_context_features,
-        add_xfp_features,
+        add_xfp_features, add_rolling_features,
     )
     df = add_volume_features(weekly_scored, pbp)
     df = add_snap_features(df, snaps, crosswalk)
     df = add_situational_features(df, pbp)
     df = add_context_features(df, schedule)
     df = add_xfp_features(df, pbp, scoring_settings)
+    df = add_rolling_features(df)
 """
 
 from __future__ import annotations
@@ -874,5 +883,247 @@ def add_xfp_features(
     # outright rather than let a QB row masquerade as a real estimate --
     # this must never reach a dashboard panel as if it meant something.
     out.loc[out["position"] == "QB", ["xfp", "fp_over_expected"]] = pd.NA
+
+    return out
+
+
+# ==========================================================================
+# FAMILY 6 — ROLLING AGGREGATES (step 4)
+# ==========================================================================
+# Every continuous feature from Families 1-5 (volume/share, snap share,
+# situational, game context, xFP), rolled into three point-in-time-safe
+# trailing summaries:
+#   <feat>_ewm3  -- exponentially weighted mean, ~3-week half-life
+#   <feat>_vol   -- season-to-date expanding STANDARD DEVIATION (volatility)
+#   <feat>_s2d   -- season-to-date expanding MEAN
+#
+# _vol/_s2d naming history: the first version of this module built one
+# column named "_std" for the expanding standard deviation, reasoning
+# that PHASE_2B_6_SPEC.md's prose ("expanding mean (stability)") must
+# have been a typo, since a mean doesn't measure stability. Corrected:
+# it was a naming error, not a typo -- "season-to-date" was intended, and
+# BOTH the mean and the standard deviation are wanted, as two separate
+# columns. Kept the already-built standard deviation (useful for Phase
+# 6.5's floor/ceiling work) under the honest name _vol, and added _s2d
+# as the expanding mean this section always should have had alongside it.
+#
+# Categorical/boolean context columns (is_home, roof, surface) are
+# excluded -- there's no meaningful "3-week average" of a stadium surface.
+_NON_CONTINUOUS_CONTEXT_COLUMNS = {"is_home", "roof", "surface"}
+
+ROLLING_SOURCE_COLUMNS = (
+    list(VOLUME_OUTPUT_COLUMNS)
+    + list(SNAP_OUTPUT_COLUMNS)
+    + list(SITUATIONAL_OUTPUT_COLUMNS)
+    + [c for c in CONTEXT_OUTPUT_COLUMNS if c not in _NON_CONTINUOUS_CONTEXT_COLUMNS]
+    + list(XFP_OUTPUT_COLUMNS)
+)
+
+EWM_HALFLIFE = 3
+
+# "Core" continuous features for the prior-season baseline -- ROLLING_SOURCE_COLUMNS
+# minus two groups that don't describe a PLAYER's own persistent role:
+#   - team-level counts (team_rz_targets, team_rz_carries,
+#     team_inside_5_carries, team_two_minute_targets) -- these describe
+#     the player's TEAM that week, not the player; a player's own
+#     "prior-season average of their team's red-zone trips" isn't a
+#     player attribute.
+#   - game-context columns (days_rest, spread, game_total,
+#     team_implied_total, temp, wind) -- these describe THIS season's
+#     schedule/circumstances, not something carried over from last year.
+# What's left is volume, share, snap, situational-share, and xFP columns
+# -- the opportunity/role signals a manager would actually want going
+# into week 1, before any of this season's games have set the in-season
+# rolling windows.
+_PREV_SEASON_EXCLUDED_COLUMNS = {
+    "team_rz_targets", "team_rz_carries", "team_inside_5_carries", "team_two_minute_targets",
+    "days_rest", "spread", "game_total", "team_implied_total", "temp", "wind",
+}
+PREV_SEASON_SOURCE_COLUMNS = [
+    c for c in ROLLING_SOURCE_COLUMNS if c not in _PREV_SEASON_EXCLUDED_COLUMNS
+]
+
+ROLLING_OUTPUT_COLUMNS = (
+    [f"{c}_ewm3" for c in ROLLING_SOURCE_COLUMNS]
+    + [f"{c}_vol" for c in ROLLING_SOURCE_COLUMNS]
+    + [f"{c}_s2d" for c in ROLLING_SOURCE_COLUMNS]
+    + ["games_played", "snap_share_delta_3wk"]
+    + [f"prev_season_{c}" for c in PREV_SEASON_SOURCE_COLUMNS]
+)
+
+
+def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add trailing summaries of every continuous feature from Families 1-5,
+    plus games_played, snap_share_delta_3wk (deferred from step 1), and
+    prior-season baselines for a core subset of those features.
+
+    Point-in-time mechanics (ewm3/vol/s2d): df is sorted by
+    ['player_id', 'season', 'week'] and grouped by ('player_id',
+    'season'). The ewm/expanding window is computed on the RAW column
+    first (pandas' native, C-level GroupBy.ewm()/.expanding() -- fast),
+    then the WHOLE resulting series is `.shift(1)`-ed within each group.
+    This lands on exactly the same numbers as shifting first and
+    windowing second would (both ewm and expanding are pure
+    left-to-right recursions -- the value at row N-1 never depends on
+    row N or later, so "windowed then shift" and "shift then windowed"
+    agree at every row; verified directly against a per-group
+    Python-loop implementation before switching, since the loop version
+    took ~22s on this dataset and the vectorized version takes under a
+    second). Either way, week N's _ewm3/_vol/_s2d can never see week N's
+    own row. Verified with x = [10, 20, NaN, 40, 50] across weeks 1-5:
+    week 2's ewm3 is exactly week 1's raw value (10.0), and a NaN week
+    (3) leaves the running ewm3 unchanged rather than resetting or
+    zeroing it -- pandas' ewm/expanding skip NaN, they don't propagate
+    it.
+
+    Season boundary (ewm3/vol/s2d/games_played): grouping by
+    ('player_id', 'season') together, not just 'player_id', means week 1
+    of a new season always starts with an empty group -- ewm3/vol/s2d
+    are null and games_played is 0, regardless of how much history the
+    player has from the prior season. This is a DIFFERENT rule than
+    xFP's rate table (add_xfp_features), which deliberately DOES cross
+    season boundaries, AND a different rule than prev_season_* below,
+    which deliberately DOES carry data across the boundary -- all three
+    are intentional, not inconsistent:
+      - ewm3/vol/s2d estimate THIS player's own in-season trend, and
+        blending two seasons together would average a role change across
+        an offseason (new team, new role, new coordinator) as if nothing
+        happened -- that's the kind of leakage this family exists to
+        prevent. Resetting to null/0 at the boundary is correct, not a
+        gap to fix.
+      - xFP's rate table estimates a LEAGUE-WIDE constant (the value of a
+        20-yard target near the goal line, roughly stable year to year),
+        not this player's own trajectory, and with only two seasons
+        cached, resetting it every September would starve the rarer
+        buckets of data for the first several weeks of 2024 AND all of
+        2025.
+      - prev_season_* (below) is a genuinely different quantity from
+        ewm3/vol/s2d: not "this player's trend so far this season" (which
+        must reset) but "what was this player's role LAST season"
+        (which by definition is fixed and cannot leak -- an entire prior
+        season is fully in the past by the time week 1 of the next one
+        kicks off). It gets its OWN columns rather than blending into the
+        in-season window, per PHASE_2B_6_SPEC.md's point-in-time rule
+        ("prior-season aggregates go in their own columns with their own
+        missingness").
+
+    prev_season_<feat> (PREV_SEASON_SOURCE_COLUMNS only -- see that
+    constant's comment for what's excluded and why): each player's
+    FULL-SEASON mean of <feat> in season S, relabeled to season S+1 and
+    left-merged onto every week of that player's S+1 rows. Structurally
+    incapable of leaking -- there's no season-S+1 data anywhere in the
+    computation, only season S's, which is entirely complete by the time
+    S+1 exists. Null for a player with no row in season S at all
+    (rookies, or anyone whose first year in this dataset is the current
+    one) -- correctly "unknown", not "zero". The same value repeats
+    across all of a player's weeks within a season (it's fixed once per
+    player-season, not re-derived per week).
+
+    snap_share_delta_3wk: offense_pct.shift(1) - offense_pct.shift(4) --
+    the last known share minus the share from exactly 3 weeks before
+    that. Both shifts are already point-in-time safe on their own (shift
+    is monotonic), so no additional shift is applied to the difference.
+
+    games_played: `.cumcount()` at row N is the count of PRIOR rows in
+    the (player, season) group -- already shift(1)-shaped by
+    construction (a player's first row of a season gets 0, not 1).
+
+    Simplification: the ewm3 half-life is ROW-based (3 recorded games),
+    not calendar-based. A player coming off a bye week or a missed game
+    has a 2-week gap between rows that this treats as one step, slightly
+    stretching the effective half-life. Not corrected here -- this is an
+    auxiliary "let the model learn the weighting" feature, not something
+    precision-critical enough to justify pandas' more fragile
+    datetime-based `times=` EWM path.
+
+    Idempotent: existing output columns are dropped before recomputing.
+    Row order of the input is preserved in the output (internal
+    computation sorts a copy, then re-aligns to the original index).
+
+    Args:
+        df: player-week frame with player_id, season, week, and every
+            column in ROLLING_SOURCE_COLUMNS plus offense_pct (i.e. df
+            after add_volume_features, add_snap_features,
+            add_situational_features, add_context_features, and
+            add_xfp_features have all already run).
+
+    Returns:
+        Copy of df with ROLLING_OUTPUT_COLUMNS added. Null wherever the
+        player has fewer than the required prior in-season observations
+        (heaviest in week 1 of each season, by construction), wherever
+        the underlying source column is itself null for that position
+        (e.g. dropbacks_ewm3 is null for every RB/WR/TE row, same as
+        dropbacks itself; xfp_ewm3 is null for every QB row), or -- for
+        prev_season_* only -- wherever the player has no row at all in
+        the immediately prior season.
+    """
+    required = ["player_id", "season", "week", "offense_pct"] + ROLLING_SOURCE_COLUMNS
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"add_rolling_features: df is missing columns {missing}")
+
+    out = df.drop(columns=[c for c in ROLLING_OUTPUT_COLUMNS if c in df.columns])
+
+    sorted_df = out.sort_values(["player_id", "season", "week"])
+    group_keys = [sorted_df["player_id"], sorted_df["season"]]
+    grouped = sorted_df.groupby(["player_id", "season"], sort=False)
+
+    def _shift_within_group(s: pd.Series) -> pd.Series:
+        return s.groupby(group_keys, sort=False).shift(1)
+
+    # Computed on the RAW (unshifted) column via pandas' native, C-level
+    # GroupBy.ewm()/.expanding() -- then the WHOLE result is shifted by 1
+    # within each group. This is mathematically identical to shifting
+    # first and windowing second (both ewm and expanding are pure
+    # left-to-right recursions: the value at row N-1 never depends on row
+    # N or later, so "windowed[N-1]" and "shift(windowed)[N]" are the
+    # same number) -- verified directly against the per-group Python-loop
+    # version this replaced. It matters because the per-group
+    # .transform(lambda ...) version took ~22s on 11,869 rows x 34
+    # source columns (a Python callback per (player, season) group, per
+    # column); this vectorized version is under a second.
+    results: dict[str, pd.Series] = {}
+    for col in ROLLING_SOURCE_COLUMNS:
+        ewm_raw = grouped[col].ewm(halflife=EWM_HALFLIFE, min_periods=1).mean().droplevel([0, 1])
+        results[f"{col}_ewm3"] = _shift_within_group(ewm_raw)
+
+        vol_raw = grouped[col].expanding().std().droplevel([0, 1])
+        results[f"{col}_vol"] = _shift_within_group(vol_raw)
+
+        s2d_raw = grouped[col].expanding().mean().droplevel([0, 1])
+        results[f"{col}_s2d"] = _shift_within_group(s2d_raw)
+
+    results["games_played"] = grouped.cumcount()
+    results["snap_share_delta_3wk"] = (
+        _shift_within_group(sorted_df["offense_pct"])
+        - grouped["offense_pct"].shift(4)
+    )
+
+    # Single concat rather than 100+ sequential `out[name] = ...`
+    # assignments -- the latter re-fragments the frame on every insert
+    # (pandas warns about exactly this) and was ~20s on this dataset;
+    # concat once is under a second.
+    new_cols = pd.DataFrame(
+        {name: series.reindex(out.index) for name, series in results.items()},
+        index=out.index,
+    )
+    out = pd.concat([out, new_cols], axis=1)
+
+    # Prior-season baselines: each player's full-season mean in season S
+    # relabeled to season S+1, then left-merged onto every week of that
+    # player's S+1 rows. No shift/expanding mechanics needed -- an entire
+    # prior season is fully in the past regardless of which week of the
+    # CURRENT season a row is on, so the same value applies to all of them.
+    season_avg = (
+        out.groupby(["player_id", "season"])[PREV_SEASON_SOURCE_COLUMNS]
+        .mean()
+        .reset_index()
+    )
+    season_avg["season"] = season_avg["season"] + 1
+    season_avg = season_avg.rename(
+        columns={c: f"prev_season_{c}" for c in PREV_SEASON_SOURCE_COLUMNS}
+    )
+    out = out.merge(season_avg, on=["player_id", "season"], how="left")
 
     return out

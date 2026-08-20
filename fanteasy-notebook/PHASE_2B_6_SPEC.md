@@ -139,7 +139,11 @@ From `load_schedules()`, which carries betting columns
 For every continuous feature above, produce:
 
 - `<feat>_ewm3` — exponentially weighted mean, ~3-week half-life (recency)
-- `<feat>_std` — season-to-date expanding mean (stability)
+- `<feat>_s2d` — season-to-date expanding **mean** (this season's run rate)
+- `<feat>_vol` — season-to-date expanding **standard deviation** (stability —
+  originally mislabeled `_std` in this doc; "season-to-date" was the intended
+  meaning of that suffix, not "standard deviation", and both the mean and the
+  standard deviation are wanted as separate columns)
 - `games_played` — so the model knows how much to trust each
 
 All `.shift(1)`-ed. Let the model learn the weighting rather than picking one
