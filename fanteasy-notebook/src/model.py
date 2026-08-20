@@ -271,6 +271,56 @@ def walk_forward_predict(
     return pd.concat(preds, ignore_index=True)
 
 
+def walk_forward_predict_residual(
+    df: pd.DataFrame,
+    position: str,
+    baseline_col: str,
+    feature_cols: list[str] = FEATURE_COLUMNS,
+    target_col: str = "custom_points",
+    warmup_weeks: int = 4,
+    eval_min_season: int | None = None,
+    lgb_params: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Formulation B: train on (target_col - baseline_col) instead of
+    target_col directly, then reconstruct pred_custom_points =
+    predicted_residual + baseline_col at prediction time. Same idea
+    whether baseline_col is Sleeper's projection (the spec's own
+    Formulation B) or a trailing average (the earlier season_to_date_avg
+    diagnostic that established this pattern) -- isolates whether the
+    feature set adds anything on top of whatever the baseline already
+    knows, rather than asking the model to learn that baseline's
+    information over again from scratch.
+
+    Rows where baseline_col is null can't have a defined residual target
+    and are dropped before training (and so are absent from the
+    returned predictions too) -- reusing walk_forward_predict internally
+    rather than duplicating its fold/training logic.
+
+    Returns:
+        Same shape as walk_forward_predict, plus `residual_target` (the
+        ACTUAL residual, not predicted -- check this isn't degenerate
+        before trusting the reconstruction) and `pred_custom_points`
+        (predicted_residual + baseline_col -- what to actually compare
+        against target_col).
+    """
+    valid = df[df[baseline_col].notna()].copy()
+    residual_col = "_residual_target"
+    valid[residual_col] = valid[target_col] - valid[baseline_col]
+
+    preds = walk_forward_predict(
+        valid, position, feature_cols=feature_cols, target_col=residual_col,
+        warmup_weeks=warmup_weeks, eval_min_season=eval_min_season, lgb_params=lgb_params,
+    )
+    preds = preds.rename(columns={"pred_model_a": "pred_residual", residual_col: "residual_target"})
+    preds = preds.merge(
+        valid[["player_id", "season", "week", target_col, baseline_col]],
+        on=["player_id", "season", "week"], how="left",
+    )
+    preds["pred_custom_points"] = preds["pred_residual"] + preds[baseline_col]
+    return preds
+
+
 def _cast_categoricals(pos_df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     """LightGBM's sklearn wrapper only accepts int/float/bool columns as-is;
     string columns (roof, surface) need pandas 'category' dtype for its

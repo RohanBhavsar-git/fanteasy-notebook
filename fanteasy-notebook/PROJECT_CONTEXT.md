@@ -5,13 +5,20 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > **Last updated:** August 2026. Phase 1 (ingestion) and Phase 2a (custom
 > scoring) are complete and verified against live data. Phase 2b (steps 1-5,
 > full feature table + notebook) is also complete and verified — see
-> **Phase 2b progress** below. Phase 6 (projection model) was investigated
-> and concluded rather than shipped — the model loses to simple baselines
-> at every position, diagnosed as a signal-to-noise ceiling, not a bug —
-> see **Phase 6 findings** below. Phase 6.5 (simulation) and Phase 6 steps
-> 8-10 are still design sketch, contingent on what happens with Phase 6
-> next — see **Verification status** near the end before treating any
-> pipeline claim as settled.
+> **Phase 2b progress** below. `SEASONS` defaults to 2018-2025 (8 seasons) in
+> both notebooks, per the Phase 6 data-volume result below. Phase 6
+> (projection model) was investigated, not shipped — but the earlier
+> **2-season conclusion was wrong**: what looked like a signal-to-noise
+> ceiling was a data-volume ceiling. At 8 seasons, Formulation A (direct
+> prediction of `custom_points`) beats the two weaker baselines at every
+> position and closes real ground on Sleeper's own projection without
+> catching it. Formulation B (predicting the residual against Sleeper's
+> projection instead) was tested too and does not improve on Formulation A.
+> See **Phase 6 findings** below for the full picture, including what's
+> still wrong. Phase 6.5 (simulation) and Phase 6 steps 8-10 are still
+> design sketch, contingent on what happens with Phase 6 next — see
+> **Verification status** near the end before treating any pipeline claim
+> as settled.
 
 ---
 
@@ -202,11 +209,11 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 |---|---|---|
 | 1 | Data ingestion — `src/ingest.py` + `01_data_ingestion.ipynb` | **Done** — runs clean, all sources cached to `data/raw/` |
 | 2a | Custom scoring — `src/features.py` + `02_custom_scoring.ipynb` | **Done** — 100% validated against Sleeper's actual results |
-| 2b | Usage + efficiency features from pbp | Steps 1-4 of 10 **done** (`src/usage.py`) — see **Phase 2b progress** below. Steps 5-10 remain. |
+| 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 8-10 remain, contingent on Phase 6. |
 | 3 | Role classification — rule-based Pocket Passer / 3-Down Back / Slot / etc. | Not started |
 | 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
-| 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated and concluded** — Formulation A loses to every baseline at every position; diagnosed as a signal-to-noise ceiling, not a bug or a tuning gap. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome was deciding not to ship one yet. |
+| 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
 | 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Not started |
 | 7 | JSON export — assemble `player_advanced_stats.json` | Not started |
 | 8 | GitHub Actions weekly automation | Not started |
@@ -245,26 +252,59 @@ Step 5 (`03_usage_features.ipynb`, exercising the full table) is also done. Phas
 
 ---
 
-## Phase 6 findings (Formulation A investigated and concluded)
+## Phase 6 findings
 
-`src/model.py` trains one untuned LightGBM model per position (QB/RB/WR/TE), direct prediction of `custom_points`, expanding-window walk-forward validation (no shuffling, no KFold). The honest conclusion: **the current feature set doesn't yet forecast better than simple baselines, and that's a signal-to-noise finding, not a tuning gap.**
+`src/model.py` trains one untuned LightGBM model per position (QB/RB/WR/TE), expanding-window walk-forward validation (no shuffling, no KFold). Two things changed the conclusion since the first pass: extending `SEASONS` from 2 to 8 years, and testing a second target formulation. Both are documented here in full, including where the model still falls short.
 
-**Model A loses to every baseline at every position.** Corrected numbers (see below for why "corrected" matters), best-performing configuration per position:
+### The 2-season conclusion was premature
 
-| Position | Model | season_to_date_avg | trailing_3wk_avg | sleeper_proj | trailing_xfp |
+The first version of this section said "Model A loses to every baseline at every position" and diagnosed it as a signal-to-noise ceiling — a feature-quality problem. That was wrong. It was a **data-volume ceiling**: at 2 seasons of training history, the model had already caught the *weakest* of the four baselines (`trailing_3wk_avg`, beaten at 3 of 4 positions) while losing to the stronger three. Stating that as "loses to every baseline" overstated the case in the pessimistic direction.
+
+The real test was whether the gap to the *strong* baselines closed as training history grew — both improving together would prove nothing. It did close:
+
+| Position | Volume | Model MAE | season_to_date_avg | trailing_3wk_avg | sleeper_proj | trailing_xfp |
+|---|---|---|---|---|---|---|
+| QB | 2 seasons | 6.82 | 6.61 | 6.79 | **5.54** | N/A |
+| QB | 4 seasons | 6.49 | 6.61 | 6.79 | **5.54** | N/A |
+| QB | 8 seasons | **6.38** | 6.61 | 6.79 | **5.54** | N/A |
+| RB | 2 seasons | 4.42 | 4.25 | 4.49 | **3.87** | 4.24 |
+| RB | 4 seasons | 4.20 | 4.25 | 4.49 | **3.87** | 4.20 |
+| RB | 8 seasons | **4.18** | 4.25 | 4.49 | **3.87** | 4.21 |
+| WR | 2 seasons | 4.08 | 3.99 | 4.22 | **3.77** | 4.02 |
+| WR | 4 seasons | 3.97 | 3.99 | 4.22 | **3.77** | 4.00 |
+| WR | 8 seasons | **3.93** | 3.99 | 4.22 | **3.77** | 4.00 |
+| TE | 2 seasons | 3.23 | 3.12 | 3.32 | **2.88** | 3.03 |
+| TE | 4 seasons | 3.09 | 3.12 | 3.32 | **2.88** | 3.02 |
+| TE | 8 seasons | **3.06** | 3.12 | 3.32 | **2.88** | 3.02 |
+
+(`sleeper_proj` and `trailing_xfp` baselines don't move with training-data volume — they're independent of the model — so their MAE is constant across rows; shown for reference. Baselines were computed once, held fixed, and the model was retrained on 2/4/8 seasons of history against the identical locked evaluation folds — 2024 Wk5 through 2025 Wk18 — so the only thing changing between rows is training-data volume.)
+
+**At 8 seasons, the model beats `season_to_date_avg` and `trailing_3wk_avg` at every position.** It also beats `trailing_xfp` at RB and WR (not just "closes ground" — it's ahead), and comes within 0.04 MAE of it at TE. Against `sleeper_proj` it closes real ground without catching it: the QB gap shrinks from 1.28 MAE at 2 seasons to 0.84 at 8; RB from 0.55 to 0.31; WR from 0.32 to 0.16; TE from 0.35 to 0.17 — roughly halved at every position, but not zero anywhere. Sleeper's projection still wins clearly everywhere — it encodes beat-writer/injury/depth-chart information nflverse-derived features structurally can't see.
+
+**Gains diminish from 4→8 seasons.** The 2→4 season jump closes 2-3x more of the gap to `season_to_date_avg` than the 4→8 jump does, at every position (e.g. WR: 2→4 closes 0.11 MAE, 4→8 closes only 0.05 more). More history keeps helping, but with clearly decreasing returns — consistent with a model that's approaching what this feature set can extract, not one that's data-starved indefinitely.
+
+### Feature-count reduction is not the fix — and the first attempt at this diagnosis was itself wrong
+
+An initial ablation (rank all ~180 features by SHAP importance from one model trained on the *full* dataset, then test top-10/25/50/all) showed a clean "peaks at 25, degrades at scale" pattern at every position — textbook overfitting, or so it looked. Redone properly, deriving the SHAP ranking *inside each walk-forward fold, from that fold's own training data only*: the pattern **disappeared**. 25 features doesn't peak anywhere — it's the single worst option at QB, and RB/WR/TE all prefer the full feature set. The first result was an artifact: ranking features on the full dataset lets the ranking "see" the same weeks later used to score the ablation, which flatters small feature sets in a way that doesn't hold up once the ranking itself is confined to what a fold could actually have known. **This is a distinct failure mode from the training-data leakage `tests/test_no_leakage.py` guards against** — that suite verifies no *feature value* depends on future weeks; it says nothing about whether the *choice of which features to use* was made with future information. Worth remembering for any future feature-selection work in this project, not just this one model.
+
+An earlier residual diagnostic (predict `custom_points − season_to_date_avg` at 2-season volume) found a real but weak signal — predicted and actual residuals correlated at r≈0.11-0.15 — that didn't survive reconstruction (worse MAE than the raw baseline). That result is superseded by the properly-scoped test below, run at 8 seasons against the strongest baseline instead of the weakest.
+
+### Formulation B: predicting the residual against Sleeper
+
+Formulation A predicts `custom_points` directly. Formulation B instead trains on `custom_points − sleeper_projection` and reconstructs `pred = predicted_residual + sleeper_projection` at inference time — the question is whether the feature set can improve on Sleeper's own number rather than just beat trailing averages. Same 8-season volume, same walk-forward setup, same locked evaluation folds (2024 Wk5-2025 Wk18), no tuning.
+
+| Position | Formulation B MAE | season_to_date_avg | trailing_3wk_avg | sleeper_proj | trailing_xfp |
 |---|---|---|---|---|---|
-| QB | 6.83 MAE | 6.61 | 6.79 | **5.51** | N/A (xFP is RB/WR/TE only) |
-| RB | 4.44 MAE | 4.29 | 4.50 | **3.86** | 4.26 |
-| WR | 4.10 MAE | 4.06 | 4.27 | **3.77** | 4.04 |
-| TE | 3.27 MAE | 3.13 | 3.31 | **2.86** | 3.02 |
+| QB | 6.10 | 6.61 | 6.79 | **5.54** | N/A |
+| RB | 4.22 | 4.25 | 4.49 | **3.87** | 4.21 |
+| WR | 4.00 | 3.99 | 4.22 | **3.77** | 4.00 |
+| TE | 3.21 | 3.12 | 3.32 | **2.88** | 3.02 |
 
-Sleeper's projection wins clearly everywhere — it encodes beat-writer/injury/depth-chart information nflverse-derived features structurally can't see.
+Formulation B beats `trailing_3wk_avg` at every position and `season_to_date_avg` at QB and RB, but **loses to `season_to_date_avg` at WR and TE**, and to `trailing_xfp` at RB and TE — a worse record than Formulation A's, which beat both weaker baselines everywhere and even overtook `trailing_xfp` at RB/WR. Like Formulation A, it never catches `sleeper_proj`.
 
-**Feature-count reduction is not the fix — and the first attempt at this diagnosis was itself wrong.** An initial ablation (rank all ~180 features by SHAP importance from one model trained on the *full* dataset, then test top-10/25/50/all) showed a clean "peaks at 25, degrades at scale" pattern at every position — textbook overfitting, or so it looked. Redone properly, deriving the SHAP ranking *inside each walk-forward fold, from that fold's own training data only*: the pattern **disappeared**. 25 features doesn't peak anywhere — it's the single worst option at QB, and RB/WR/TE all prefer the full feature set. The first result was an artifact: ranking features on the full dataset lets the ranking "see" the same weeks later used to score the ablation, which flatters small feature sets in a way that doesn't hold up once the ranking itself is confined to what a fold could actually have known. **This is a distinct failure mode from the training-data leakage `tests/test_no_leakage.py` guards against** — that suite verifies no *feature value* depends on future weeks; it says nothing about whether the *choice of which features to use* was made with future information. Worth remembering for any future feature-selection work in this project, not just this one model.
+The diagnostic explains why. The predicted residual correlates with the actual residual at only r≈0.03-0.05 across all four positions — essentially no case-by-case signal — and its standard deviation (1.7-3.3) is far tighter than the true residual's (4.3-7.4). In practice the model has learned a roughly constant upward shift (mean predicted residual 0.57-0.81, close to the true mean residual of 0.46-0.64) rather than anything player- or week-specific: Sleeper's projections undershoot actual scoring by about half a point on average in this sample, and the model mostly just reproduces that constant correction. That's enough to edge out the weakest baseline everywhere and the second-weakest sometimes, but it isn't forecasting signal, and it's why Formulation A — which at least has the full `custom_points` scale to work with — outperforms it head to head.
 
-**The residual test — the most direct diagnostic run.** Trained the model to predict `custom_points − baseline_season_to_date_avg` (isolating whether the feature set adds anything on top of "how has he been scoring lately," the same idea as Formulation B but against the season-to-date average instead of Sleeper). The model did not collapse to predicting near-zero — predicted and actual residuals correlate at r≈0.11-0.15 across all four positions, a real, non-degenerate signal. But reconstructing `baseline + predicted_residual` produced a *worse* MAE than the raw baseline at every position (4-7% worse), and worse Spearman too. The signal is real and too weak to survive noise at this data volume.
-
-**Conclusion: these features are better at explaining than forecasting.** `target_share_ewm3`, `xfp_s2d`, and the rest of the Phase 2b feature table clearly describe *what happened* — the SHAP rankings surface exactly the volume/opportunity signals a manager would want to see (that part worked). They don't yet predict *what happens next* better than a plain trailing average. The dashboard reflects this honestly: it shows Sleeper's own projections, labeled as Sleeper's, rather than a model that loses to a three-line pandas baseline. The Phase 2b feature table isn't wasted work — it powers the analytical panels (usage trends, xFP/luck, role changes) that Sleeper doesn't show, which was always half the point (see **What this is actually for** in `PHASE_2B_6_SPEC.md`). Revisiting Formulation B, more data, or a materially different feature strategy is a future decision, not something concluded here.
+**Conclusion: Formulation A is the better of the two approaches tested, and neither ships yet.** Direct prediction of `custom_points` at 8 seasons has closed real ground on every baseline except Sleeper's own projection, without catching it. Predicting the residual against Sleeper doesn't help — the residual itself carries almost no learnable signal beyond a near-constant bias correction, and reconstructing from it performs worse than direct prediction against everything except the single weakest baseline. The Phase 2b feature table isn't wasted work either way — it powers the analytical panels (usage trends, xFP/luck, role changes) that Sleeper doesn't show, which was always half the point (see **What this is actually for** in `PHASE_2B_6_SPEC.md`). The dashboard keeps showing Sleeper's own projections, labeled as Sleeper's, rather than a model that still can't beat them. More data, a materially different feature strategy, or blending with Sleeper's number are future decisions, not something concluded here.
 
 ---
 
@@ -325,8 +365,8 @@ assumptions as facts.
 ## What's outstanding
 
 - **`PHASE_2B_6_SPEC.md`** at the repo root is the working spec for Phases 2b, 6, and 6.5. Fold it into this doc and `NOTEBOOK_OUTLINE.md` once those phases are complete.
-- **Phase 2b** — usage and efficiency features from pbp (target share, air-yards share, red-zone touches, aDOT, snap share). Start with snap share to shake out the `pfr_player_id` join early.
 - Bump the Phase 8 CI workflow from Python 3.11 to 3.12
+- **Phase 8 will need incremental season fetching, not a full refetch every run.** `SEASONS` defaults to 2018-2025 (8 seasons) as of the Phase 6 data-volume result — the cached pbp file alone is 142 MB for that range (`data/raw/` is 311 MB total), and a weekly automation job re-downloading all 8 seasons from scratch every run is wasteful and slow. The right shape is closer to "keep 2018-2024 cached as-is, fetch only the current season's new weeks" — not designed yet.
 - Update `DEFAULT_LEAGUE_ID` in `src/ingest.py` each August when Sleeper rolls the league over
 - Consider a season guard in `ingest.py` so requesting an unpublished season fails with a readable message instead of a 404 traceback
 - Push the latest `index.html` changes to GitHub Pages (all recent work is local)
