@@ -3,11 +3,14 @@
 This document captures the "why" behind the FanTeasy Stats project so a new conversation can pick up seamlessly. Read this first before starting any new work.
 
 > **Last updated:** August 2026. Phase 1 (ingestion) and Phase 2a (custom
-> scoring) are complete and verified against live data. Phase 2b steps 1-4
-> (volume/snap/situational/context features, xFP, rolling aggregates) are
-> also complete and verified — see **Phase 2b progress** below. Steps 5-10
-> (exercising notebook, Phase 6 model, Phase 6.5 simulation) are still design
-> sketch — see **Verification status** near the end before treating any
+> scoring) are complete and verified against live data. Phase 2b (steps 1-5,
+> full feature table + notebook) is also complete and verified — see
+> **Phase 2b progress** below. Phase 6 (projection model) was investigated
+> and concluded rather than shipped — the model loses to simple baselines
+> at every position, diagnosed as a signal-to-noise ceiling, not a bug —
+> see **Phase 6 findings** below. Phase 6.5 (simulation) and Phase 6 steps
+> 8-10 are still design sketch, contingent on what happens with Phase 6
+> next — see **Verification status** near the end before treating any
 > pipeline claim as settled.
 
 ---
@@ -203,7 +206,7 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 | 3 | Role classification — rule-based Pocket Passer / 3-Down Back / Slot / etc. | Not started |
 | 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
-| 6 | Projection model — XGBoost/LightGBM regression with time-series CV | Not started |
+| 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated and concluded** — Formulation A loses to every baseline at every position; diagnosed as a signal-to-noise ceiling, not a bug or a tuning gap. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome was deciding not to ship one yet. |
 | 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Not started |
 | 7 | JSON export — assemble `player_advanced_stats.json` | Not started |
 | 8 | GitHub Actions weekly automation | Not started |
@@ -238,7 +241,30 @@ The dashboard already has integration hooks waiting. Search `state.advancedStats
 - `_s2d` (season-to-date expanding mean) and `_vol` (expanding standard deviation) are two separate columns — an earlier pass conflated them under `_std`, describing it in the spec as "expanding mean," which turned out to be a naming error, not a units typo.
 - `prev_season_*` holds last season's full-season average for a core subset of role/opportunity features and does **not** reset at the season boundary the way in-season rolling features do — an entire prior season can't leak forward.
 
-Steps 5-10 remain: `03_usage_features.ipynb` exercising the full table, then Phase 6 (projection model, model A/B, quantile floor/ceiling) and Phase 6.5 (Monte Carlo simulation).
+Step 5 (`03_usage_features.ipynb`, exercising the full table) is also done. Phase 6 (projection model) was picked up next, investigated, and concluded rather than shipped — see **Phase 6 findings** below. Steps 8-10 (quantile floor/ceiling, `src/simulate.py`, calibration/playoff-odds) remain open, contingent on what happens with Phase 6 next.
+
+---
+
+## Phase 6 findings (Formulation A investigated and concluded)
+
+`src/model.py` trains one untuned LightGBM model per position (QB/RB/WR/TE), direct prediction of `custom_points`, expanding-window walk-forward validation (no shuffling, no KFold). The honest conclusion: **the current feature set doesn't yet forecast better than simple baselines, and that's a signal-to-noise finding, not a tuning gap.**
+
+**Model A loses to every baseline at every position.** Corrected numbers (see below for why "corrected" matters), best-performing configuration per position:
+
+| Position | Model | season_to_date_avg | trailing_3wk_avg | sleeper_proj | trailing_xfp |
+|---|---|---|---|---|---|
+| QB | 6.83 MAE | 6.61 | 6.79 | **5.51** | N/A (xFP is RB/WR/TE only) |
+| RB | 4.44 MAE | 4.29 | 4.50 | **3.86** | 4.26 |
+| WR | 4.10 MAE | 4.06 | 4.27 | **3.77** | 4.04 |
+| TE | 3.27 MAE | 3.13 | 3.31 | **2.86** | 3.02 |
+
+Sleeper's projection wins clearly everywhere — it encodes beat-writer/injury/depth-chart information nflverse-derived features structurally can't see.
+
+**Feature-count reduction is not the fix — and the first attempt at this diagnosis was itself wrong.** An initial ablation (rank all ~180 features by SHAP importance from one model trained on the *full* dataset, then test top-10/25/50/all) showed a clean "peaks at 25, degrades at scale" pattern at every position — textbook overfitting, or so it looked. Redone properly, deriving the SHAP ranking *inside each walk-forward fold, from that fold's own training data only*: the pattern **disappeared**. 25 features doesn't peak anywhere — it's the single worst option at QB, and RB/WR/TE all prefer the full feature set. The first result was an artifact: ranking features on the full dataset lets the ranking "see" the same weeks later used to score the ablation, which flatters small feature sets in a way that doesn't hold up once the ranking itself is confined to what a fold could actually have known. **This is a distinct failure mode from the training-data leakage `tests/test_no_leakage.py` guards against** — that suite verifies no *feature value* depends on future weeks; it says nothing about whether the *choice of which features to use* was made with future information. Worth remembering for any future feature-selection work in this project, not just this one model.
+
+**The residual test — the most direct diagnostic run.** Trained the model to predict `custom_points − baseline_season_to_date_avg` (isolating whether the feature set adds anything on top of "how has he been scoring lately," the same idea as Formulation B but against the season-to-date average instead of Sleeper). The model did not collapse to predicting near-zero — predicted and actual residuals correlate at r≈0.11-0.15 across all four positions, a real, non-degenerate signal. But reconstructing `baseline + predicted_residual` produced a *worse* MAE than the raw baseline at every position (4-7% worse), and worse Spearman too. The signal is real and too weak to survive noise at this data volume.
+
+**Conclusion: these features are better at explaining than forecasting.** `target_share_ewm3`, `xfp_s2d`, and the rest of the Phase 2b feature table clearly describe *what happened* — the SHAP rankings surface exactly the volume/opportunity signals a manager would want to see (that part worked). They don't yet predict *what happens next* better than a plain trailing average. The dashboard reflects this honestly: it shows Sleeper's own projections, labeled as Sleeper's, rather than a model that loses to a three-line pandas baseline. The Phase 2b feature table isn't wasted work — it powers the analytical panels (usage trends, xFP/luck, role changes) that Sleeper doesn't show, which was always half the point (see **What this is actually for** in `PHASE_2B_6_SPEC.md`). Revisiting Formulation B, more data, or a materially different feature strategy is a future decision, not something concluded here.
 
 ---
 
