@@ -174,17 +174,32 @@ def add_sleeper_baseline(
 # ==========================================================================
 # WALK-FORWARD VALIDATION
 # ==========================================================================
-def chronological_folds(df: pd.DataFrame, warmup_weeks: int) -> list[tuple[int, int]]:
+def chronological_folds(
+    df: pd.DataFrame, warmup_weeks: int, eval_min_season: int | None = None
+) -> list[tuple[int, int]]:
     """
     (season, week) pairs to evaluate on, in chronological order, skipping
     the first `warmup_weeks` weeks of the EARLIEST season in df (no
     training history exists yet for those). Later seasons are not
     warmed-up again -- by the time a later season starts, the expanding
     training window already has a full prior season in it.
+
+    `eval_min_season`: if set, folds before this season are excluded from
+    the returned (evaluated) list entirely, WITHOUT touching df itself --
+    those earlier seasons' rows remain available as training history for
+    every returned fold (walk_forward_predict's train_mask is unaffected
+    by this parameter). This is what lets a data-volume experiment hold
+    the EVALUATION population fixed (e.g. always 2024-2025) while varying
+    how much pre-2024 history the model gets to train on -- the only way
+    to isolate "does more training history help" from "are we now also
+    being scored on a different, maybe easier or harder, set of weeks."
     """
     weeks = sorted(set(map(tuple, df[["season", "week"]].drop_duplicates().to_numpy())))
     first_season = weeks[0][0]
-    return [(s, w) for s, w in weeks if not (s == first_season and w <= warmup_weeks)]
+    folds = [(s, w) for s, w in weeks if not (s == first_season and w <= warmup_weeks)]
+    if eval_min_season is not None:
+        folds = [(s, w) for s, w in folds if s >= eval_min_season]
+    return folds
 
 
 def walk_forward_predict(
@@ -193,6 +208,7 @@ def walk_forward_predict(
     feature_cols: list[str] = FEATURE_COLUMNS,
     target_col: str = "custom_points",
     warmup_weeks: int = 4,
+    eval_min_season: int | None = None,
     lgb_params: dict | None = None,
 ) -> pd.DataFrame:
     """
@@ -205,6 +221,11 @@ def walk_forward_predict(
     no KFold -- each fold's test rows are never in that fold's own
     training set, by construction.
 
+    `eval_min_season`: see chronological_folds -- restricts which folds
+    get EVALUATED without restricting what a later fold can TRAIN on.
+    Earlier seasons in `df` still feed every evaluated fold's training
+    window even when eval_min_season excludes them from being predicted.
+
     No hyperparameter tuning: `lgb_params` defaults to None, meaning
     LightGBM's own out-of-the-box defaults (objective='regression' is the
     only thing pinned, since the default objective needs to be explicit).
@@ -215,7 +236,7 @@ def walk_forward_predict(
         week), out-of-sample.
     """
     pos_df = df[df["position"] == position].sort_values(["season", "week"]).reset_index(drop=True)
-    folds = chronological_folds(pos_df, warmup_weeks)
+    folds = chronological_folds(pos_df, warmup_weeks, eval_min_season)
     # Cast once on the full frame, before splitting into folds, so train
     # and test always share the same category set -- casting per-fold
     # separately would let a category present only in a later fold's test
