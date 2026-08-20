@@ -76,15 +76,26 @@ Design note on spread_line's sign (add_context_features):
     the sportsbook "-7 favorite" notation). See _team_week_context's
     docstring for the two games used to confirm this.
 
+Design note on xFP's rate table (add_xfp_features):
+    See that function's own docstring for the full reasoning. Short
+    version: the bucket rate for week N is an EXPANDING, GLOBAL average
+    over every target/carry strictly before week N -- crossing season
+    boundaries deliberately, since two seasons of pbp isn't enough to
+    reset the clock every September. QB xfp only covers rushing
+    opportunities, not passing -- QB fp_over_expected is not a
+    meaningful luck signal under this design.
+
 Usage:
     from src.usage import (
         add_volume_features, add_snap_features,
         add_situational_features, add_context_features,
+        add_xfp_features,
     )
     df = add_volume_features(weekly_scored, pbp)
     df = add_snap_features(df, snaps, crosswalk)
     df = add_situational_features(df, pbp)
     df = add_context_features(df, schedule)
+    df = add_xfp_features(df, pbp, scoring_settings)
 """
 
 from __future__ import annotations
@@ -92,6 +103,8 @@ from __future__ import annotations
 import logging
 
 import pandas as pd
+
+from src.features import compute_custom_score
 
 logger = logging.getLogger(__name__)
 
@@ -586,3 +599,280 @@ def add_context_features(df: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFra
 
     context = _team_week_context(schedule)
     return out.merge(context, on=["team", "season", "week"], how="left")
+
+
+# ==========================================================================
+# EXPECTED FANTASY POINTS (xFP) — step 3
+# ==========================================================================
+# Bucket boundaries. yardline_100 is distance to the opponent's end zone,
+# so smaller = closer to scoring. Evaluated at the play's field position
+# at snap, matching the situational-family convention.
+TARGET_AIR_YARDS_BINS = [-float("inf"), 0, 10, 20, float("inf")]
+TARGET_AIR_YARDS_LABELS = ["behind_los", "0-9", "10-19", "20+"]
+TARGET_FIELD_POS_BINS = [-float("inf"), 10, 20, 50, float("inf")]
+TARGET_FIELD_POS_LABELS = ["inside_10", "10-20", "20-50", "beyond_50"]
+CARRY_FIELD_POS_BINS = [-float("inf"), 5, 10, 20, 50, float("inf")]
+CARRY_FIELD_POS_LABELS = ["inside_5", "5-10", "10-20", "20-50", "beyond_50"]
+
+# Merges decided from full 2024-2025 play counts (see the step-3 report --
+# every count and mean was printed before this decision, per the request
+# not to silently trust a thin bucket):
+#   20+ air yards x inside_10 field position:  0 plays -- structurally
+#       near-impossible; you can't throw 20+ air yards starting inside
+#       your opponent's 10, there isn't room on the field.
+#   10-19 air yards x inside_10:               78 plays -- thin.
+#   20+ air yards x 10-20:                     49 plays -- thin.
+# All three merge toward midfield, where the deep-ball sample is large,
+# giving 10-19|<=20 (913 plays) and 20+|<=50 (1,559 plays). Every other
+# target bucket cleared 266 plays on its own. No carry bucket needed
+# merging -- the thinnest (inside_5) still had 1,535 plays.
+_TARGET_BUCKET_MERGES = {
+    "10-19|inside_10": "10-19|<=20",
+    "10-19|10-20": "10-19|<=20",
+    "20+|inside_10": "20+|<=50",
+    "20+|10-20": "20+|<=50",
+    "20+|20-50": "20+|<=50",
+}
+
+XFP_OUTPUT_COLUMNS = ["xfp", "fp_over_expected"]
+
+
+def _target_play_frame(pbp: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per pass attempt with a recorded receiver (a "target"), with
+    ONLY the stat columns compute_custom_score needs to score that single
+    play under this league's rules.
+
+    Built as a fresh, minimal DataFrame rather than a copy of the pbp
+    slice -- pbp already carries its own play-level passing_yards and
+    rushing_yards columns (the PASSER's stat line on that same play), and
+    copying the whole slice would hand compute_custom_score a
+    "passing_yards" column it never asked to build here. Since pass_yd
+    (0.04) is a real active rule, that silently added 0.04 x yards_gained
+    to every target's score. Caught by checking a specific player-week's
+    per-play sum against their real custom_points -- Nico Collins 2025
+    Wk10 scored 22.54 by the buggy version against a real 19.10, and the
+    excess divided by yards_gained was exactly 0.04 on every row.
+
+    Excludes two-point conversion tries (278 across 2024-2025) -- always
+    thrown from the 2-yard line, which would badly distort the inside-10
+    buckets for a play type that isn't a normal-down "opportunity" in the
+    same sense.
+    """
+    mask = (
+        (pbp["season_type"] == "REG") & (pbp["pass_attempt"] == 1)
+        & pbp["receiver_player_id"].notna() & (pbp["two_point_attempt"] == 0)
+    )
+    src = pbp.loc[mask]
+
+    air_yards_band = pd.cut(src["air_yards"], TARGET_AIR_YARDS_BINS,
+                             labels=TARGET_AIR_YARDS_LABELS, right=False)
+    field_pos_band = pd.cut(src["yardline_100"], TARGET_FIELD_POS_BINS,
+                             labels=TARGET_FIELD_POS_LABELS, right=True)
+    raw_bucket = air_yards_band.astype(str) + "|" + field_pos_band.astype(str)
+    bucket = raw_bucket.map(_TARGET_BUCKET_MERGES).fillna(raw_bucket)
+
+    return pd.DataFrame({
+        "player_id": src["receiver_player_id"].to_numpy(),
+        "season": src["season"].to_numpy(),
+        "week": src["week"].to_numpy(),
+        "bucket": bucket.to_numpy(),
+        "receptions": src["complete_pass"].fillna(0).to_numpy(),
+        "receiving_yards": src["yards_gained"].fillna(0).to_numpy(),
+        "receiving_tds": src["pass_touchdown"].fillna(0).to_numpy(),
+        "receiving_2pt_conversions": 0.0,
+        "fumbles_total": src["fumble"].fillna(0).to_numpy(),
+        "fumbles_lost_total": src["fumble_lost"].fillna(0).to_numpy(),
+    })
+
+
+def _carry_play_frame(pbp: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per rush attempt with a recorded rusher (a "carry"), with
+    ONLY the stat columns compute_custom_score needs to score that single
+    play. Built as a fresh, minimal DataFrame for the same reason as
+    _target_play_frame -- pbp's own receiving_yards/passing_yards columns
+    must never reach compute_custom_score for a carry either.
+
+    Excludes qb_kneel plays -- a clock-killing kneel is not a scoring
+    opportunity (same reasoning as designed_rush_attempts's kneel
+    exclusion above) -- and two-point tries, for the same reason as
+    targets.
+    """
+    mask = (
+        (pbp["season_type"] == "REG") & (pbp["rush_attempt"] == 1)
+        & pbp["rusher_player_id"].notna() & (pbp["two_point_attempt"] == 0)
+        & (pbp["qb_kneel"] == 0)
+    )
+    src = pbp.loc[mask]
+
+    field_pos_band = pd.cut(src["yardline_100"], CARRY_FIELD_POS_BINS,
+                             labels=CARRY_FIELD_POS_LABELS, right=True)
+
+    return pd.DataFrame({
+        "player_id": src["rusher_player_id"].to_numpy(),
+        "season": src["season"].to_numpy(),
+        "week": src["week"].to_numpy(),
+        "bucket": field_pos_band.astype(str).to_numpy(),
+        "carries": 1.0,
+        "rushing_yards": src["yards_gained"].fillna(0).to_numpy(),
+        "rushing_tds": src["rush_touchdown"].fillna(0).to_numpy(),
+        "rushing_2pt_conversions": 0.0,
+        "fumbles_total": src["fumble"].fillna(0).to_numpy(),
+        "fumbles_lost_total": src["fumble_lost"].fillna(0).to_numpy(),
+    })
+
+
+def _scored_play_universe(pbp: pd.DataFrame, scoring_settings: dict) -> pd.DataFrame:
+    """
+    Every target and carry across the full pbp, scored per-play with this
+    league's rules and labeled with its (merged) bucket. Long format:
+    player_id, season, week, bucket, points -- one row per play.
+
+    This covers targets and carries only, not a QB's own pass attempts.
+    A QB's rushing opportunities are represented (their carries score
+    like anyone else's); their passing production has no xFP counterpart
+    at all under this design. See add_xfp_features's docstring.
+    """
+    targets = _target_play_frame(pbp)
+    targets["points"] = compute_custom_score(targets, scoring_settings, warn=False)
+
+    carries = _carry_play_frame(pbp)
+    carries["points"] = compute_custom_score(carries, scoring_settings, warn=False)
+
+    cols = ["player_id", "season", "week", "bucket", "points"]
+    return pd.concat([targets[cols], carries[cols]], ignore_index=True)
+
+
+def _bucket_rate_table(plays: pd.DataFrame, season: int, week: int) -> pd.Series:
+    """
+    League-average points per bucket, using ONLY plays strictly before
+    (season, week) in global chronological order -- i.e. all of an
+    earlier season, or an earlier week of the same season. This is what
+    makes xfp for week N safe to use as a week-N feature: it never sees
+    week N or later.
+    """
+    before = plays[
+        (plays["season"] < season)
+        | ((plays["season"] == season) & (plays["week"] < week))
+    ]
+    return before.groupby("bucket")["points"].mean()
+
+
+def add_xfp_features(
+    df: pd.DataFrame, pbp: pd.DataFrame, scoring_settings: dict
+) -> pd.DataFrame:
+    """
+    Add xfp (expected fantasy points from opportunity alone) and
+    fp_over_expected = custom_points - xfp.
+
+    For each player-week, xfp sums the bucket rate for every target and
+    carry the player actually had that week, where each bucket's rate is
+    the league-average points per play in that bucket computed from
+    every play STRICTLY BEFORE that week (see _bucket_rate_table) --
+    an expanding, point-in-time-safe window that crosses season
+    boundaries (unlike the in-season-only rule for Family 6's rolling
+    aggregates -- see the point-in-time note below).
+
+    IMPORTANT SCOPE GAP: this covers targets and carries only, per the
+    spec's Family 1(step 3) bucket list -- there is no bucket for a QB's
+    own pass attempts. A QB's xfp would only reflect their rushing
+    opportunities; their (much larger) passing production has no
+    counterpart in xfp at all, so QB fp_over_expected would read as
+    strongly "positive" for essentially every passing QB regardless of
+    luck -- not a real signal, an artifact of what wasn't modeled. Rather
+    than ship a column that looks like a luck metric but isn't, xfp and
+    fp_over_expected are explicitly forced to null for QB rows below.
+    This must never reach a dashboard panel as if it meant something for
+    QBs -- fix by adding a passing-yardage bucket family, not by
+    interpreting the null as "no opinion."
+
+    Point-in-time note: the rate table is expanding and GLOBAL, not
+    reset at each season boundary. Week 1 of 2025 draws on the entirety
+    of 2024 rather than starting from zero. This was a deliberate choice,
+    not an oversight: with only two seasons of pbp, resetting at the
+    season boundary would leave 2025's early weeks (and, worse, ALL of
+    2024's early weeks, which have no prior season at all) with barely
+    any data behind the rarer buckets. Excluding week N and everything
+    after it -- not just requiring week < N -- is exactly what
+    tests/test_no_leakage.py checks: it proves week N's xfp is unchanged
+    when week N's own plays are removed from the source pbp, which a
+    naive "<=" cutoff bug would fail.
+
+    Idempotent: existing output columns are dropped before recomputing.
+
+    Args:
+        df: player-week frame with player_id, position, team, season,
+            week, custom_points (e.g. weekly_scored.parquet, already
+            scored by compute_custom_score).
+        pbp: play-by-play frame from get_pbp().
+        scoring_settings: from get_sleeper_league()["scoring_settings"] --
+            plays are scored with THIS league's actual rules, not generic
+            PPR, via the same compute_custom_score() used everywhere else.
+
+    Returns:
+        Copy of df with XFP_OUTPUT_COLUMNS added.
+        xfp and fp_over_expected are null for every QB row -- see the
+        SCOPE GAP note above. Not "unknown", deliberately not modeled.
+        xfp is 0 (not null) for an RB/WR/TE player-week with zero
+        qualifying plays (zero targets and zero non-kneel carries) -- a
+        known value, since summing zero opportunities is trivially zero
+        regardless of whether any rate table exists yet.
+        xfp is null when the player had at least one target/carry that
+        week but at least one of those plays fell in a bucket with NO
+        historical plays before that week -- most common in the first
+        few weeks of 2024, before the rarer merged buckets have
+        accumulated data. A single unresolvable play nulls the whole
+        week rather than silently under-counting it (no fake data).
+    """
+    required = ["player_id", "position", "team", "season", "week", "custom_points"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"add_xfp_features: df is missing columns {missing}")
+
+    out = df.drop(columns=[c for c in XFP_OUTPUT_COLUMNS if c in df.columns])
+
+    plays = _scored_play_universe(pbp, scoring_settings)
+
+    cutoffs = sorted(set(zip(out["season"], out["week"])))
+    xfp_parts = []
+    for season, week in cutoffs:
+        this_week = plays[(plays["season"] == season) & (plays["week"] == week)]
+        if this_week.empty:
+            continue
+        rate_table = _bucket_rate_table(plays, season, week)
+        rates = this_week["bucket"].map(rate_table)
+        grouped = rates.groupby(this_week["player_id"])
+        total = grouped.sum(min_count=1)
+        any_null = grouped.apply(lambda s: s.isna().any())
+        total = total.where(~any_null)
+        part = total.reset_index(name="xfp")
+        part["season"] = season
+        part["week"] = week
+        xfp_parts.append(part)
+
+    xfp_table = (
+        pd.concat(xfp_parts, ignore_index=True) if xfp_parts
+        else pd.DataFrame(columns=["player_id", "season", "week", "xfp"])
+    )
+
+    out = out.merge(xfp_table, on=["player_id", "season", "week"], how="left")
+
+    had_any_play = pd.Series(
+        list(zip(out["player_id"], out["season"], out["week"]))
+    ).isin(set(zip(plays["player_id"], plays["season"], plays["week"])))
+    zero_opportunity = (~had_any_play.to_numpy()) & out["xfp"].isna()
+    out.loc[zero_opportunity, "xfp"] = 0.0
+
+    out["fp_over_expected"] = out["custom_points"] - out["xfp"]
+
+    # xFP covers targets and carries only -- a QB's passing production
+    # (the bulk of their real points) has no bucket and no counterpart
+    # here. Leaving xfp/fp_over_expected computed for QB rows would show
+    # every passing QB as wildly "over expected", which isn't a luck
+    # signal, it's just points that were never modeled. Null them
+    # outright rather than let a QB row masquerade as a real estimate --
+    # this must never reach a dashboard panel as if it meant something.
+    out.loc[out["position"] == "QB", ["xfp", "fp_over_expected"]] = pd.NA
+
+    return out

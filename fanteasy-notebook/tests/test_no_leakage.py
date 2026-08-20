@@ -31,17 +31,22 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.ingest import get_id_crosswalk, get_pbp, get_schedule, get_snap_counts  # noqa: E402
+from src.ingest import (  # noqa: E402
+    get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league, get_snap_counts,
+)
 from src.usage import (  # noqa: E402
     CONTEXT_OUTPUT_COLUMNS,
     FANTASY_POSITIONS,
     SITUATIONAL_OUTPUT_COLUMNS,
     SNAP_OUTPUT_COLUMNS,
     VOLUME_OUTPUT_COLUMNS,
+    XFP_OUTPUT_COLUMNS,
     add_context_features,
     add_situational_features,
     add_snap_features,
     add_volume_features,
+    add_xfp_features,
+    _bucket_rate_table,
 )
 
 BOUNDARIES = [(2024, 5), (2024, 10), (2025, 5), (2025, 12)]
@@ -73,6 +78,11 @@ def crosswalk() -> pd.DataFrame:
 @pytest.fixture(scope="module")
 def schedule() -> pd.DataFrame:
     return get_schedule([2024, 2025])
+
+
+@pytest.fixture(scope="module")
+def scoring_settings() -> dict:
+    return get_sleeper_league()["scoring_settings"]
 
 
 def _truncate_after(df: pd.DataFrame, season: int, boundary_week: int) -> pd.DataFrame:
@@ -169,4 +179,62 @@ def test_situational_features_idempotent(weekly_scored, pbp):
 def test_context_features_idempotent(weekly_scored, schedule):
     once = add_context_features(weekly_scored, schedule)
     twice = add_context_features(once, schedule)
+    pd.testing.assert_frame_equal(once, twice)
+
+
+def test_bucket_rate_table_excludes_its_own_week():
+    """
+    Precise, white-box check that _bucket_rate_table(plays, season, week)
+    excludes week == the cutoff itself, not just weeks after it.
+
+    A "<=" vs "<" bug here CANNOT be caught by the black-box
+    truncate-and-compare pattern the other families use (and an earlier,
+    now-removed version of this test tried): week N's own plays are also
+    the NUMERATOR (the player's actual opportunities that week, which is
+    real, already-observed information -- not something point-in-time
+    correctness should hide). Removing week N's plays from pbp entirely
+    breaks that numerator too, which produced a false failure across
+    ~7% of rows unrelated to the rate table itself. The rate table is the
+    only thing that has to stay backward-only; this test isolates it.
+    """
+    plays = pd.DataFrame({
+        "player_id": ["A", "B", "C", "outlier"],
+        "season": [2024, 2024, 2024, 2024],
+        "week": [3, 3, 4, 5],
+        "bucket": ["0-9|20-50"] * 4,
+        "points": [1.0, 2.0, 1.5, 1000.0],
+    })
+    rate = _bucket_rate_table(plays, season=2024, week=5)
+    assert rate["0-9|20-50"] == pytest.approx((1.0 + 2.0 + 1.5) / 3)
+
+
+@pytest.mark.parametrize("season,boundary_week", BOUNDARIES)
+def test_xfp_no_future_leakage(weekly_scored, pbp, scoring_settings, season, boundary_week):
+    """
+    Removing weeks AFTER boundary_week from pbp must not change xfp for
+    any week <= boundary_week -- catches a bug where the rate table's
+    "before this week" filter accidentally looks forward, or a future
+    week's plays otherwise leak backward into an earlier week's rate.
+
+    This does NOT test whether week N's own plays leak into week N's own
+    rate table -- that needs test_bucket_rate_table_excludes_its_own_week
+    above, because week N's own plays must stay in pbp here (they're also
+    the numerator for week N, not just a candidate rate-table input).
+    """
+    pbp_truncated = _truncate_after(pbp, season, boundary_week)
+
+    full = add_xfp_features(weekly_scored, pbp, scoring_settings)
+    truncated = add_xfp_features(weekly_scored, pbp_truncated, scoring_settings)
+
+    mask = (full["season"] == season) & (full["week"] <= boundary_week)
+    cols = ["player_id", "season", "week"] + XFP_OUTPUT_COLUMNS
+    left = full.loc[mask, cols].reset_index(drop=True)
+    right = truncated.loc[mask, cols].reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(left, right)
+
+
+def test_xfp_idempotent(weekly_scored, pbp, scoring_settings):
+    once = add_xfp_features(weekly_scored, pbp, scoring_settings)
+    twice = add_xfp_features(once, pbp, scoring_settings)
     pd.testing.assert_frame_equal(once, twice)
