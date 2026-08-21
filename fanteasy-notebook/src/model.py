@@ -321,6 +321,164 @@ def walk_forward_predict_residual(
     return preds
 
 
+QUANTILES = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+
+def _quantile_col(q: float) -> str:
+    return f"pred_q{round(q * 100)}"
+
+
+def walk_forward_predict_quantile(
+    df: pd.DataFrame,
+    position: str,
+    feature_cols: list[str] = FEATURE_COLUMNS,
+    target_col: str = "custom_points",
+    quantiles: tuple[float, ...] = QUANTILES,
+    warmup_weeks: int = 4,
+    eval_min_season: int | None = None,
+    lgb_params: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Expanding-window walk-forward prediction, LightGBM quantile regression
+    (`objective='quantile'`), one FRESH model per quantile per fold -- same
+    fold structure as walk_forward_predict (train on every row strictly
+    before the fold, predict that fold, no shuffling, no KFold), just fit
+    len(quantiles) times per fold instead of once.
+
+    LightGBM fits each quantile as an INDEPENDENT model -- there's no
+    constraint tying pred_q25 <= pred_q50 <= pred_q75 across the separate
+    fits, so on any given row the predictions can come out non-monotonic
+    ("quantile crossing"). This function does not fix that; check with
+    quantile_crossing_rate() and fix with fix_quantile_crossing() if it
+    occurs.
+
+    Returns:
+        Wide frame: id_cols, target_col, and one pred_q{int(q*100)} column
+        per quantile (e.g. pred_q10, pred_q25, ...) -- one row per
+        (player, evaluated week), out-of-sample.
+    """
+    pos_df = df[df["position"] == position].sort_values(["season", "week"]).reset_index(drop=True)
+    folds = chronological_folds(pos_df, warmup_weeks, eval_min_season)
+    pos_df = _cast_categoricals(pos_df, feature_cols)
+
+    base_params = {"objective": "quantile", "verbosity": -1, "random_state": 42}
+    if lgb_params:
+        base_params.update(lgb_params)
+
+    id_cols = [c for c in ["player_id", "player_display_name", "season", "week"] if c in pos_df.columns]
+    q_cols = [_quantile_col(q) for q in quantiles]
+
+    preds = []
+    for season, week in folds:
+        train_mask = (pos_df["season"] < season) | ((pos_df["season"] == season) & (pos_df["week"] < week))
+        test_mask = (pos_df["season"] == season) & (pos_df["week"] == week)
+        train = pos_df.loc[train_mask]
+        test = pos_df.loc[test_mask]
+        if len(train) < MIN_TRAIN_ROWS or test.empty:
+            continue
+
+        result = test[id_cols + [target_col]].copy()
+        for q, col in zip(quantiles, q_cols):
+            params = dict(base_params, alpha=q)
+            model = lgb.LGBMRegressor(**params)
+            model.fit(train[feature_cols], train[target_col])
+            result[col] = model.predict(test[feature_cols])
+        preds.append(result)
+
+    if not preds:
+        return pd.DataFrame(columns=id_cols + [target_col] + q_cols)
+    return pd.concat(preds, ignore_index=True)
+
+
+def quantile_crossing_rate(preds: pd.DataFrame, quantiles: tuple[float, ...] = QUANTILES) -> dict:
+    """
+    Fraction of rows where the independently-fit quantile predictions are
+    NOT monotonically non-decreasing (pred_q10 <= pred_q25 <= ... <=
+    pred_q90). Crossing is expected occasionally with independent quantile
+    fits; this just measures how often.
+    """
+    cols = [_quantile_col(q) for q in quantiles]
+    vals = preds[cols].to_numpy(dtype=float)
+    is_monotonic = np.all(np.diff(vals, axis=1) >= 0, axis=1)
+    return {
+        "n_rows": len(preds),
+        "n_crossed": int((~is_monotonic).sum()),
+        "crossing_rate": float((~is_monotonic).mean()) if len(preds) else np.nan,
+    }
+
+
+def fix_quantile_crossing(preds: pd.DataFrame, quantiles: tuple[float, ...] = QUANTILES) -> pd.DataFrame:
+    """
+    Rearrangement fix for quantile crossing (Chernozhukov, Fernandez-Val &
+    Galichon 2010): sort each row's independently-fit quantile predictions
+    into non-decreasing order and reassign them back to the same columns.
+    This does not change any column's marginal calibration -- it's the
+    same multiset of predicted values per row, just reordered so pred_q10
+    is always <= pred_q90 -- it only removes crossing, it doesn't pull the
+    values toward each other or shrink the interval.
+    """
+    out = preds.copy()
+    cols = [_quantile_col(q) for q in quantiles]
+    sorted_vals = np.sort(out[cols].to_numpy(dtype=float), axis=1)
+    for i, col in enumerate(cols):
+        out[col] = sorted_vals[:, i]
+    return out
+
+
+def quantile_coverage(
+    preds: pd.DataFrame, target_col: str = "custom_points", quantiles: tuple[float, ...] = QUANTILES
+) -> pd.DataFrame:
+    """
+    Calibration check: for each quantile q, the fraction of ACTUAL outcomes
+    at or below pred_q{q} ("actual_coverage") should be close to q itself
+    ("target_coverage") if the model is well-calibrated. A quantile whose
+    actual_coverage is far from its target is untrustworthy for floor/
+    ceiling calls regardless of how good the point-estimate metrics look.
+    """
+    rows = []
+    for q in quantiles:
+        col = _quantile_col(q)
+        valid = preds[preds[col].notna()]
+        below = (valid[target_col] <= valid[col]).mean() if len(valid) else np.nan
+        rows.append({
+            "quantile": q, "target_coverage": q, "actual_coverage": below, "n": len(valid),
+        })
+    return pd.DataFrame(rows)
+
+
+def quantile_interval_coverage(
+    preds: pd.DataFrame, target_col: str = "custom_points", lower_q: float = 0.1, upper_q: float = 0.9
+) -> dict:
+    """
+    Three-way split for the interval between lower_q and upper_q (e.g. the
+    10th-90th, meant to cover ~80% of outcomes): fraction of actuals below
+    the lower prediction, within the interval, and above the upper
+    prediction. Rows are dropped if either bound is null.
+
+    Uses the same '<=' convention as quantile_coverage() for "at or below"
+    a quantile, so below_q{lower} here always matches
+    quantile_coverage()'s actual_coverage for the same quantile exactly.
+    This isn't a rounding nuance: a target with real point-mass at a
+    specific value (e.g. TE's custom_points is exactly 0.0 for ~19% of
+    player-weeks -- DNP/inactive/no recorded stats) produces enough
+    predicted-vs-actual ties at a quantile near that value that '<=' vs
+    '<' changes the reported figure by double digits, not fractions of a
+    percent.
+    """
+    lower_col, upper_col = _quantile_col(lower_q), _quantile_col(upper_q)
+    valid = preds[preds[lower_col].notna() & preds[upper_col].notna()]
+    below = (valid[target_col] <= valid[lower_col]).mean() if len(valid) else np.nan
+    above = (valid[target_col] > valid[upper_col]).mean() if len(valid) else np.nan
+    within = (1 - below - above) if len(valid) else np.nan
+    return {
+        "lower_q": lower_q, "upper_q": upper_q, "n": len(valid),
+        "target_within": upper_q - lower_q,
+        f"below_q{round(lower_q * 100)}": below,
+        "within_interval": within,
+        f"above_q{round(upper_q * 100)}": above,
+    }
+
+
 def _cast_categoricals(pos_df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     """LightGBM's sklearn wrapper only accepts int/float/bool columns as-is;
     string columns (roof, surface) need pandas 'category' dtype for its
@@ -346,6 +504,34 @@ def _rank_features_by_shap(
     shap_values = explainer.shap_values(X[feature_cols])
     mean_abs_shap = pd.Series(np.abs(shap_values).mean(axis=0), index=feature_cols)
     return mean_abs_shap.sort_values(ascending=False)
+
+
+def shap_top_features_median_model(
+    df: pd.DataFrame,
+    position: str,
+    feature_cols: list[str] = FEATURE_COLUMNS,
+    target_col: str = "custom_points",
+    top_n: int = 20,
+    lgb_params: dict | None = None,
+) -> pd.Series:
+    """
+    SHAP feature-importance ranking for ONE quantile-median (alpha=0.5)
+    model trained on this position's entire dataset -- a final
+    explainability snapshot, not a walk-forward accuracy evaluation. Uses
+    every row on purpose (same reasoning as stable_feature_ranking:
+    explaining the final model is a one-time setup question, not part of
+    the walk-forward accuracy measurement, so there's no leakage concern
+    in using all available data for it).
+
+    Returns the top_n features by mean |SHAP|, descending.
+    """
+    pos_df = df[df["position"] == position].reset_index(drop=True)
+    pos_df = _cast_categoricals(pos_df, feature_cols)
+    params = {"objective": "quantile", "alpha": 0.5, "verbosity": -1, "random_state": 42}
+    if lgb_params:
+        params.update(lgb_params)
+    ranking = _rank_features_by_shap(pos_df, pos_df[target_col], feature_cols, params)
+    return ranking.head(top_n)
 
 
 def walk_forward_predict_selected(

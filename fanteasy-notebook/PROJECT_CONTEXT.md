@@ -209,11 +209,11 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 |---|---|---|
 | 1 | Data ingestion — `src/ingest.py` + `01_data_ingestion.ipynb` | **Done** — runs clean, all sources cached to `data/raw/` |
 | 2a | Custom scoring — `src/features.py` + `02_custom_scoring.ipynb` | **Done** — 100% validated against Sleeper's actual results |
-| 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 8-10 remain, contingent on Phase 6. |
+| 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 6-8 (Phase 6 model A/B + quantile/SHAP) are also done — see **Phase 6 findings**. Steps 9-10 (Phase 6.5 simulation) remain. |
 | 3 | Role classification — rule-based Pocket Passer / 3-Down Back / Slot / etc. | Not started |
 | 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
-| 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
+| 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. Step 8 (quantile floor/ceiling models + SHAP) is done: coverage is measured and honestly overconfident (67-75% actual vs. 80% target for the 10th-90th interval), and SHAP shows nothing that looks like a leak. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
 | 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Not started |
 | 7 | JSON export — assemble `player_advanced_stats.json` | Not started |
 | 8 | GitHub Actions weekly automation | Not started |
@@ -305,6 +305,46 @@ Formulation B beats `trailing_3wk_avg` at every position and `season_to_date_avg
 The diagnostic explains why. The predicted residual correlates with the actual residual at only r≈0.03-0.05 across all four positions — essentially no case-by-case signal — and its standard deviation (1.7-3.3) is far tighter than the true residual's (4.3-7.4). In practice the model has learned a roughly constant upward shift (mean predicted residual 0.57-0.81, close to the true mean residual of 0.46-0.64) rather than anything player- or week-specific: Sleeper's projections undershoot actual scoring by about half a point on average in this sample, and the model mostly just reproduces that constant correction. That's enough to edge out the weakest baseline everywhere and the second-weakest sometimes, but it isn't forecasting signal, and it's why Formulation A — which at least has the full `custom_points` scale to work with — outperforms it head to head.
 
 **Conclusion: Formulation A is the better of the two approaches tested, and neither ships yet.** Direct prediction of `custom_points` at 8 seasons has closed real ground on every baseline except Sleeper's own projection, without catching it. Predicting the residual against Sleeper doesn't help — the residual itself carries almost no learnable signal beyond a near-constant bias correction, and reconstructing from it performs worse than direct prediction against everything except the single weakest baseline. The Phase 2b feature table isn't wasted work either way — it powers the analytical panels (usage trends, xFP/luck, role changes) that Sleeper doesn't show, which was always half the point (see **What this is actually for** in `PHASE_2B_6_SPEC.md`). The dashboard keeps showing Sleeper's own projections, labeled as Sleeper's, rather than a model that still can't beat them. More data, a materially different feature strategy, or blending with Sleeper's number are future decisions, not something concluded here.
+
+### Step 8: quantile models (floor/ceiling) and SHAP
+
+Five LightGBM quantile models per position (`objective='quantile'`, alpha ∈ {0.10, 0.25, 0.50, 0.75, 0.90}), Formulation A's feature set, same 8-season walk-forward setup and locked evaluation folds (2024 Wk5-2025 Wk18) as everything above, no tuning.
+
+**Quantile crossing happens, and is fixed by rearrangement.** LightGBM fits each quantile as an independent model, so nothing enforces `pred_q10 <= pred_q25 <= ... <= pred_q90` on a given row. It crossed on 3.2-9.8% of rows depending on position (QB 8.6%, RB 5.2%, WR 3.2%, TE 9.8%) — common enough to require handling, not an edge case. Fixed with the standard rearrangement approach (Chernozhukov, Fernandez-Val & Galichon 2010): sort each row's five predicted values into non-decreasing order and reassign them back to the same columns. This changes nothing about any single quantile's marginal calibration — same predicted values, same column-by-column accuracy — it only removes the crossing. `fix_quantile_crossing()` / `quantile_crossing_rate()` in `src/model.py`.
+
+**Coverage — the check that matters.** Fraction of actual outcomes at or below each predicted quantile, target vs. actual:
+
+| Position | q10 | q25 | q50 | q75 | q90 |
+|---|---|---|---|---|---|
+| Target | 10% | 25% | 50% | 75% | 90% |
+| QB | 16.8% | 31.5% | 52.1% | 71.4% | 84.7% |
+| RB | 13.2% | 28.7% | 51.5% | 72.5% | 86.9% |
+| WR | 12.9% | 28.4% | 50.7% | 73.5% | 87.9% |
+| TE | 19.1% | 32.9% | 51.8% | 72.2% | 85.8% |
+
+The median (q50) is well-calibrated everywhere — 50.7-52.1% against a 50% target. Every other quantile shows the same systematic pattern at every position: the low quantiles (q10, q25) run **high** (more actuals fall below them than they should) and the high quantiles (q75, q90) run **low** (more actuals exceed them than they should). Put together, the predicted spread is **too narrow** — these are overconfident intervals, not just noisy ones.
+
+The 10th-90th interval, meant to cover ~80% of outcomes, in practice:
+
+| Position | Below q10 | Within | Above q90 |
+|---|---|---|---|
+| Target | 10% | **80%** | 10% |
+| QB | 16.8% | **67.9%** | 15.3% |
+| RB | 13.2% | **73.7%** | 13.1% |
+| WR | 12.9% | **75.0%** | 12.1% |
+| TE | 19.1% | **66.7%** | 14.2% |
+
+None of these hit the "exceeded 30% of the time" failure mode that would make the interval worse than useless, but all four are meaningfully overconfident (67-75% actual coverage against an 80% target) — both tails get breached 1.2-1.9x more often than the interval claims. **Treat the floor/ceiling as directional, not literal probabilities**, until this is corrected (widening the interval, or a proper conformal calibration pass, are the standard fixes — not attempted here per "no tuning").
+
+**TE's zero-inflated target is a genuine data characteristic, not a bug, and it explains TE's worse-than-others floor.** 19.4% of TE player-weeks score exactly 0.0 `custom_points` (rostered but inactive, a healthy scratch, or a snap count too low to record any counting stat) — almost exactly TE's 19.1% q10 coverage figure above. With a fifth of the true distribution sitting at one single point, no quantile near that point can cleanly carve out only 10% of the mass; the model's q10 prediction often lands at or near 0 (correctly — that really is close to the 10th percentile of TE output), but ties between a near-zero prediction and an exactly-zero actual inflate the measured "below" rate well past what a smooth continuous distribution would produce at the same quantile. This is a real property of backup/committee usage at the position, not a modeling failure to fix.
+
+*(Caught and fixed while building this: an earlier version of `quantile_interval_coverage()` used strict `<` for its "below" comparison while `quantile_coverage()` used `<=` — mathematically the same comparison, but with 19% of TE's target at exactly one value, the tie-breaking convention alone moved the reported TE "below q10" figure from 6.5% to 19.1% and "within" from 79.4% to 66.7%, reversing which position looked best-calibrated. Both functions now use the same `<=` convention; `tests/test_model.py::test_quantile_interval_coverage_matches_quantile_coverage_at_the_boundary` locks the two in agreement going forward.)*
+
+**SHAP on the median (q50) model, top 20 features per position — nothing looks like it shouldn't matter.** All four positions' top 20 are dominated by exactly the categories the feature table was built to surface: rolling volume/role share (`target_share_ewm3`, `touch_share_ewm3`, `offense_snaps_ewm3`, `offense_pct_ewm3`), efficiency (`epa_per_dropback_ewm3`, `yards_per_carry_ewm3`, `xfp_ewm3`), pregame game context (`team_implied_total`, `game_total`, `spread`, `temp`, `wind`, `roof` — all genuinely knowable before kickoff), and prior-season carryover (`prev_season_*`). No current-week outcome stat, no ID-like column, and nothing structurally leaky made it into any position's top 20 — consistent with `FEATURE_COLUMNS` being restricted to Family 5/6 by construction (see the module docstring in `src/model.py`).
+
+Two things worth naming, neither a leak: (1) `fp_over_expected` (the touchdown-luck-stripped efficiency signal) appears 3-4 times per position among its own `_ewm3`/`_s2d`/`_vol`/`prev_season_` variants (RB: 4 of 20, WR: 3 of 20) — correlated representations of one underlying quantity splitting SHAP credit between them, so the "20 features" list overstates how many independent signals are actually driving the model. (2) TE's SHAP list includes `avg_cushion_vol` (volatility of the pre-snap coverage cushion, an NGS field) — a legitimate coverage/role signal (man vs. zone, in-line vs. slot usage), just a step further from raw volume than everything else in the list; flagged here for visibility, not because it looks wrong.
+
+`walk_forward_predict_quantile()`, `quantile_crossing_rate()`, `fix_quantile_crossing()`, `quantile_coverage()`, `quantile_interval_coverage()`, and `shap_top_features_median_model()` are all in `src/model.py`. These quantile predictions are exactly what Phase 6.5's simulation is specified to sample from (see `PHASE_2B_6_SPEC.md`'s Phase 6.5 section) — that's the next piece of work, not started yet.
 
 ---
 
