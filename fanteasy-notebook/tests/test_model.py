@@ -21,8 +21,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.model import (  # noqa: E402
+    apply_conformal_widening,
     chronological_folds,
+    conformal_quantile,
+    conformity_scores,
     fix_quantile_crossing,
+    interval_breach_by_prediction_bucket,
     quantile_coverage,
     quantile_crossing_rate,
     quantile_interval_coverage,
@@ -243,3 +247,105 @@ def test_quantile_interval_coverage_matches_quantile_coverage_at_the_boundary():
     assert interval["below_q10"] == pytest.approx(coverage_at_q10)
     assert interval["above_q90"] == pytest.approx(1 - coverage_at_q90)
     assert interval["below_q10"] + interval["within_interval"] + interval["above_q90"] == pytest.approx(1.0)
+
+
+def test_conformity_scores_formula():
+    preds = pd.DataFrame({
+        "custom_points": [5.0, 5.0, 5.0],
+        "pred_q10": [2.0, 6.0, 2.0],   # row1: y > lower (inside on this side)
+        "pred_q90": [8.0, 8.0, 4.0],   # row0: inside both; row1: below lower; row2: above upper
+    })
+    scores = conformity_scores(preds, target_col="custom_points", lower_q=0.1, upper_q=0.9)
+    # row 0: max(2-5, 5-8) = max(-3, -3) = -3 (inside, margin 3)
+    # row 1: max(6-5, 5-8) = max(1, -3) = 1 (fell below the lower bound by 1)
+    # row 2: max(2-5, 5-4) = max(-3, 1) = 1 (fell above the upper bound by 1)
+    np.testing.assert_allclose(scores, [-3.0, 1.0, 1.0])
+
+
+def test_conformal_quantile_matches_known_order_statistic():
+    # n=9, target_coverage=0.8 -> ceil(10*0.8)=8th order statistic (1-indexed)
+    scores = np.array([9.0, 1.0, 2.0, 8.0, 3.0, 7.0, 4.0, 6.0, 5.0])
+    result = conformal_quantile(scores, target_coverage=0.8)
+    assert result == 8.0
+
+    # clipped at the max when the requested rank exceeds n
+    small = np.array([1.0, 2.0, 3.0])
+    assert conformal_quantile(small, target_coverage=0.99) == 3.0
+
+
+def test_apply_conformal_widening_shifts_bounds_and_coverage_matches_suffix_reader():
+    preds = pd.DataFrame({
+        "custom_points": [1.0, 5.0, 9.0],
+        "pred_q10": [2.0, 4.0, 6.0],
+        "pred_q90": [3.0, 6.0, 8.0],
+    })
+    widened = apply_conformal_widening(preds, lower_q=0.1, upper_q=0.9, widen_by=1.5)
+
+    np.testing.assert_allclose(widened["pred_q10_cqr"], [0.5, 2.5, 4.5])
+    np.testing.assert_allclose(widened["pred_q90_cqr"], [4.5, 7.5, 9.5])
+    # originals untouched
+    np.testing.assert_allclose(widened["pred_q10"], preds["pred_q10"])
+
+    before = quantile_interval_coverage(widened, target_col="custom_points", lower_q=0.1, upper_q=0.9)
+    after = quantile_interval_coverage(
+        widened, target_col="custom_points", lower_q=0.1, upper_q=0.9, suffix="_cqr"
+    )
+    # every row's actual now falls inside the widened interval
+    assert after["within_interval"] == pytest.approx(1.0)
+    assert after["within_interval"] >= before["within_interval"]
+
+
+def test_conformal_widening_fixes_undercoverage_on_held_out_calibration_split():
+    """
+    End-to-end check: build quantile predictions that are deliberately
+    too narrow (known undercoverage), split into a calibration half and
+    a later evaluation half (respecting time order -- calibration is
+    weeks 1-10, evaluation is weeks 11-20, never overlapping), calibrate
+    on the EARLIER half only, and confirm coverage on the LATER,
+    untouched-by-calibration half moves from clearly-undercovered toward
+    the ~80% target.
+    """
+    rng = np.random.default_rng(1)
+    n = 4000
+    actual = rng.normal(loc=10, scale=5, size=n)
+    # Deliberately too-narrow interval: true 10th/90th of N(10,5) are
+    # roughly 3.6/16.4, but predict a much tighter band around the mean.
+    pred_lower = np.full(n, 8.0)
+    pred_upper = np.full(n, 12.0)
+    week = np.repeat(np.arange(1, 21), n // 20)
+
+    preds = pd.DataFrame({
+        "custom_points": actual, "pred_q10": pred_lower, "pred_q90": pred_upper, "week": week,
+    })
+    calib = preds[preds["week"] <= 10]
+    evaluation = preds[preds["week"] > 10]
+
+    before = quantile_interval_coverage(evaluation, target_col="custom_points", lower_q=0.1, upper_q=0.9)
+    assert before["within_interval"] < 0.6  # confirm it's badly undercovered to start
+
+    scores = conformity_scores(calib, target_col="custom_points", lower_q=0.1, upper_q=0.9)
+    widen_by = conformal_quantile(scores, target_coverage=0.8)
+    widened_eval = apply_conformal_widening(evaluation, lower_q=0.1, upper_q=0.9, widen_by=widen_by)
+
+    after = quantile_interval_coverage(
+        widened_eval, target_col="custom_points", lower_q=0.1, upper_q=0.9, suffix="_cqr"
+    )
+    assert after["within_interval"] == pytest.approx(0.8, abs=0.03)
+
+
+def test_interval_breach_by_prediction_bucket_shape():
+    n = 300
+    rng = np.random.default_rng(2)
+    calib = pd.DataFrame({
+        "custom_points": rng.normal(10, 3, size=n),
+        "pred_q50": np.linspace(0, 20, n),
+        "pred_q10": np.linspace(0, 20, n) - 5,
+        "pred_q90": np.linspace(0, 20, n) + 5,
+    })
+    result = interval_breach_by_prediction_bucket(
+        calib, target_col="custom_points", lower_q=0.1, upper_q=0.9, n_bins=3
+    )
+    assert len(result) == 3
+    assert result["n"].sum() == n
+    for _, row in result.iterrows():
+        assert row["below"] + row["within"] + row["above"] == pytest.approx(1.0)

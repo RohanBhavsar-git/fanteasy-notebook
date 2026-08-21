@@ -344,7 +344,51 @@ None of these hit the "exceeded 30% of the time" failure mode that would make th
 
 Two things worth naming, neither a leak: (1) `fp_over_expected` (the touchdown-luck-stripped efficiency signal) appears 3-4 times per position among its own `_ewm3`/`_s2d`/`_vol`/`prev_season_` variants (RB: 4 of 20, WR: 3 of 20) — correlated representations of one underlying quantity splitting SHAP credit between them, so the "20 features" list overstates how many independent signals are actually driving the model. (2) TE's SHAP list includes `avg_cushion_vol` (volatility of the pre-snap coverage cushion, an NGS field) — a legitimate coverage/role signal (man vs. zone, in-line vs. slot usage), just a step further from raw volume than everything else in the list; flagged here for visibility, not because it looks wrong.
 
-`walk_forward_predict_quantile()`, `quantile_crossing_rate()`, `fix_quantile_crossing()`, `quantile_coverage()`, `quantile_interval_coverage()`, and `shap_top_features_median_model()` are all in `src/model.py`. These quantile predictions are exactly what Phase 6.5's simulation is specified to sample from (see `PHASE_2B_6_SPEC.md`'s Phase 6.5 section) — that's the next piece of work, not started yet.
+`walk_forward_predict_quantile()`, `quantile_crossing_rate()`, `fix_quantile_crossing()`, `quantile_coverage()`, `quantile_interval_coverage()`, and `shap_top_features_median_model()` are all in `src/model.py`. These quantile predictions are exactly what Phase 6.5's simulation is specified to sample from (see `PHASE_2B_6_SPEC.md`'s Phase 6.5 section) — Phase 6.5 flagged the undercoverage above as a prerequisite blocker for its own step 9; the following subsection addresses it.
+
+### Calibrating the quantile intervals: conformalized quantile regression (CQR)
+
+Standard CQR (Romano, Patterson & Candès 2019), applied separately per position and per interval pair (10th-90th, 25th-75th), on the same quantile models from step 8 — no retraining, no tuning, purely a post-hoc statistical correction:
+
+1. **Conformity score** per calibration row: `E = max(pred_lower - actual, actual - pred_upper)` — positive if the actual outcome fell outside the predicted interval on either side, a negative margin if it fell inside.
+2. **Widening amount**: the finite-sample-corrected empirical quantile of those scores — the `ceil((n+1) × target_coverage)`-th order statistic, which is what gives CQR its coverage guarantee at finite n (a naive `np.quantile` under-widens slightly).
+3. **Apply**: subtract that amount from every predicted lower bound, add it to every predicted upper bound, in the evaluation set. One constant per position per interval pair — not scaled by the prediction's own magnitude.
+
+**The calibration split, stated plainly:** calibration uses every walk-forward fold from 2018 Wk5 through 2024 Wk4 — the entire history *before* the locked evaluation window — and evaluation is the same locked folds as everything else in this document (2024 Wk5-2025 Wk18). These are generated in a single pass of `walk_forward_predict_quantile()` with `eval_min_season=None`, so the calibration predictions are already genuinely out-of-sample (each fold's model trained on strictly earlier weeks only) and the split is chronologically disjoint by construction — calibration is never computed on the fold being evaluated or on anything later. This is one fixed calibration reservoir (not re-expanded fold-by-fold through the evaluation window); simpler to reason about, and with 5.5-6 years of history behind it, more than large enough (3,774-14,158 calibration rows depending on position) for a stable widening constant.
+
+**Coverage, before and after:**
+
+| Position | Interval | Target | Before | After | Width before | Width after | Width ×  |
+|---|---|---|---|---|---|---|---|
+| QB | 10-90 | 80% | 67.9% | **82.6%** | 16.36 | 20.98 | 1.28x |
+| QB | 25-75 | 50% | 39.9% | **53.2%** | 8.56 | 11.09 | 1.30x |
+| RB | 10-90 | 80% | 73.7% | **84.5%** | 11.31 | 12.77 | 1.13x |
+| RB | 25-75 | 50% | 43.9% | **56.3%** | 5.76 | 6.69 | 1.16x |
+| WR | 10-90 | 80% | 75.0% | **86.0%** | 11.17 | 12.38 | 1.11x |
+| WR | 25-75 | 50% | 45.2% | **55.8%** | 5.57 | 6.33 | 1.14x |
+| TE | 10-90 | 80% | 66.7% | **84.7%** | 7.97 | 8.91 | 1.12x |
+| TE | 25-75 | 50% | 39.3% | **56.7%** | 3.98 | 4.69 | 1.18x |
+
+Median (q50) coverage is untouched by CQR (there's no interval around a single point to widen) and stays at 50.7-52.1% across all four positions — already well-calibrated, as found in step 8. Every interval moved from clearly undercovered to within a few points of nominal, at the cost of 11-30% wider bounds depending on position and interval — QB needed the most correction (widest before, most correction after), the skill positions needed the least. This is the expected trade the request called out, and it's a modest one: nowhere does fixing coverage require doubling the interval.
+
+**The correction overshoots slightly, and does so asymmetrically — worth knowing before sampling from it.** Every corrected interval landed a little *above* its target (82.6-86.0% against 80%; 53.2-56.7% against 50%), and the two tails don't share the overshoot evenly: the lower bound consistently ends up more conservative than the upper bound (e.g. QB 10-90 after: below=7.5% against a 10% target, above=9.9% — almost exactly on target). This isn't a bug — a single symmetric widening constant responds to whichever tail was worse in the calibration data, and at every position the *floor* was the worse-calibrated side before correction (see step 8's finding that low quantiles ran high everywhere). Fixing the floor by the amount needed pulls the ceiling along with it by the same constant, which overshoots the ceiling's smaller original problem. An asymmetric CQR variant (a separate widening constant per side) would target each tail independently; not implemented here since the request specified widening the interval by one empirical quantile of the combined score, and the aggregate coverage achieved is already close to nominal.
+
+**Checked whether undercoverage is uniform across the prediction range, since that changes whether one global constant is enough — it's mostly uniform, except at TE.** Bucketing each position's calibration set into predicted-magnitude terciles and looking at the *raw*, pre-CQR breach rate:
+
+| Position | Low tercile within | Mid tercile within | High tercile within |
+|---|---|---|---|
+| QB | 65.1% | 64.5% | 65.5% |
+| RB | 68.4% | 68.3% | 68.7% |
+| WR | 69.1% | 70.6% | 68.2% |
+| TE | **60.3%** | 67.9% | 67.4% |
+
+QB, RB, and WR are flat within 1-2 points across the whole predicted range — a single global constant is a reasonable fit for all three. **TE is not**: its bottom tercile (the lowest-predicted, most backup/committee-usage third of TE player-weeks — exactly where the 19.4% zero-inflation concentrates) is 6-8 points worse-covered than the other two-thirds of the range. A single global TE correction, calibrated on the whole range, therefore under-corrects precisely the low-usage TEs it matters most for and slightly over-corrects the rest — a real, disclosed limitation, not something the current fix resolves.
+
+One direction-of-miscoverage pattern held at all four positions, independent of the terciles-are-flat-or-not finding above: within every tercile, low-predicted rows breach low (actual busts below the floor) more than they breach high, and high-predicted rows breach high (actual booms above the ceiling) more than they breach low — the floor is the bigger problem for backup-caliber weeks, the ceiling is the bigger problem for every-week starters. The single symmetric constant used here doesn't correct for this directional shift with predicted magnitude, only for the aggregate rate; that's the same root cause as the overshoot asymmetry above.
+
+**Tie-breaking:** the coverage checks reported before and after reuse `quantile_coverage()`/`quantile_interval_coverage()` unchanged from step 8's `<=` fix, so the same TE zero-inflation tie-breaking care applies identically on both sides of this comparison — no new inconsistency was introduced computing "after" numbers. The CQR conformity score itself has no boolean comparison to get wrong (it's a continuous `max()` of two differences), so ties at the boundary (a near-zero prediction against an exactly-zero actual, common for TE) just produce a legitimate `E ≈ 0` conformity score rather than an ambiguity — nothing to fix there, just worth naming since it's the same population of rows.
+
+**Bottom line for Phase 6.5 step 9:** the prerequisite `PHASE_2B_6_SPEC.md` flagged is addressed — aggregate interval coverage is now within a few points of nominal at every position, using a leak-free, time-respecting calibration split, with no tuning of the underlying models. The residual asymmetry (floor slightly over-conservative relative to ceiling) and the TE low-usage-tercile gap are disclosed limitations to carry into the simulator, not blockers: sampling from these calibrated intervals will be slightly more conservative than necessary on the floor side for every position, and specifically still a bit optimistic for backup/committee TEs. `conformity_scores()`, `conformal_quantile()`, `apply_conformal_widening()`, and `interval_breach_by_prediction_bucket()` are in `src/model.py`.
 
 ---
 

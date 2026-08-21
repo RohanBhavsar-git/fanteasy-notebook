@@ -298,22 +298,28 @@ predicts several points along the range (say the 10th, 25th, 50th, 75th, and
 `objective='quantile'`. Those predicted percentiles are what the simulation
 samples from.
 
-**Status check (Aug 2026): these intervals are not calibrated yet, and that
-blocks step 9.** The quantile models built in Phase 6 step 8 are undercovered
-— the 10th-90th percentile interval, meant to hold ~80% of outcomes, actually
-holds 67-75% depending on position (see `PROJECT_CONTEXT.md`'s Phase 6
-findings). Sampling directly from these percentiles today would understate
-variance in exactly the way the next section warns about for teammate
-correlation: too-narrow intervals produce simulated totals that cluster too
-tightly around the average, which is the same overconfidence failure —
-"you'll show 85% when the truth is 65%." **Calibrating these intervals
-(widening them, or a proper conformal-calibration pass) is a prerequisite for
-step 9, not a nice-to-have.** Building the simulator on top of miscalibrated
-percentiles would launder that overconfidence into every win-probability and
-playoff-odds number it produces — the specific thing the calibration-plot
-requirement later in this section exists to catch, except by then it would be
-catching a problem seeded upstream instead of one introduced by the simulator
-itself.
+**Status check (Aug 2026): calibrated via conformalized quantile regression —
+the step-9 prerequisite is addressed.** The quantile models built in Phase 6
+step 8 were undercovered (10th-90th interval held 67-75% of outcomes against
+an 80% target). Fixed with standard CQR (Romano, Patterson & Candès 2019):
+conformity scores from a calibration split strictly before the locked
+evaluation window (2018 Wk5-2024 Wk4, never the evaluation folds themselves
+or anything later), one widening constant per position per interval pair, no
+retraining. Aggregate coverage is now within a few points of nominal
+everywhere (82.6-86.0% for the 10th-90th, against an 80% target) at the cost
+of 11-30% wider intervals — see `PROJECT_CONTEXT.md`'s Phase 6 findings for
+the full table.
+
+Two disclosed limitations to carry into the simulator, not blockers: the
+correction is a single symmetric constant per interval, so it overshoots
+slightly and asymmetrically (the floor ends up more conservative than the
+ceiling, since the floor was the worse-calibrated side beforehand at every
+position); and TE's lowest-predicted-usage tercile (where the position's
+19.4% zero-inflation concentrates) remains 6-8 points worse-covered than the
+rest of TE's range even after the global correction — a single constant
+under-corrects backup/committee TEs specifically. Sampling from these
+intervals for step 9 is reasonable with those two caveats in mind, not
+something requiring further work before starting.
 
 ### The hard part: players are not independent
 

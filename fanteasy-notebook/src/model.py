@@ -426,7 +426,8 @@ def fix_quantile_crossing(preds: pd.DataFrame, quantiles: tuple[float, ...] = QU
 
 
 def quantile_coverage(
-    preds: pd.DataFrame, target_col: str = "custom_points", quantiles: tuple[float, ...] = QUANTILES
+    preds: pd.DataFrame, target_col: str = "custom_points", quantiles: tuple[float, ...] = QUANTILES,
+    suffix: str = "",
 ) -> pd.DataFrame:
     """
     Calibration check: for each quantile q, the fraction of ACTUAL outcomes
@@ -434,10 +435,16 @@ def quantile_coverage(
     ("target_coverage") if the model is well-calibrated. A quantile whose
     actual_coverage is far from its target is untrustworthy for floor/
     ceiling calls regardless of how good the point-estimate metrics look.
+
+    `suffix` reads pred_q{q}{suffix} instead of pred_q{q} -- e.g.
+    suffix="_cqr" to check coverage of conformal-widened bounds (see
+    apply_conformal_widening) using the exact same tie-breaking
+    convention as the unadjusted check, so a before/after comparison
+    never silently reintroduces the '<' vs '<=' inconsistency fixed here.
     """
     rows = []
     for q in quantiles:
-        col = _quantile_col(q)
+        col = _quantile_col(q) + suffix
         valid = preds[preds[col].notna()]
         below = (valid[target_col] <= valid[col]).mean() if len(valid) else np.nan
         rows.append({
@@ -447,7 +454,8 @@ def quantile_coverage(
 
 
 def quantile_interval_coverage(
-    preds: pd.DataFrame, target_col: str = "custom_points", lower_q: float = 0.1, upper_q: float = 0.9
+    preds: pd.DataFrame, target_col: str = "custom_points", lower_q: float = 0.1, upper_q: float = 0.9,
+    suffix: str = "",
 ) -> dict:
     """
     Three-way split for the interval between lower_q and upper_q (e.g. the
@@ -464,8 +472,11 @@ def quantile_interval_coverage(
     predicted-vs-actual ties at a quantile near that value that '<=' vs
     '<' changes the reported figure by double digits, not fractions of a
     percent.
+
+    `suffix`: same purpose as in quantile_coverage -- pass "_cqr" to
+    report coverage of the conformal-widened bounds.
     """
-    lower_col, upper_col = _quantile_col(lower_q), _quantile_col(upper_q)
+    lower_col, upper_col = _quantile_col(lower_q) + suffix, _quantile_col(upper_q) + suffix
     valid = preds[preds[lower_col].notna() & preds[upper_col].notna()]
     below = (valid[target_col] <= valid[lower_col]).mean() if len(valid) else np.nan
     above = (valid[target_col] > valid[upper_col]).mean() if len(valid) else np.nan
@@ -477,6 +488,105 @@ def quantile_interval_coverage(
         "within_interval": within,
         f"above_q{round(upper_q * 100)}": above,
     }
+
+
+# ==========================================================================
+# CONFORMALIZED QUANTILE REGRESSION (CQR) -- Phase 6.5 prerequisite
+# ==========================================================================
+def conformity_scores(
+    calib_preds: pd.DataFrame, target_col: str, lower_q: float, upper_q: float
+) -> np.ndarray:
+    """
+    CQR conformity score (Romano, Patterson & Candes 2019) for the
+    interval [lower_q, upper_q], one per calibration row: how far the
+    ACTUAL outcome fell outside the PREDICTED interval.
+        E_i = max(pred_lower_i - y_i, y_i - pred_upper_i)
+    Positive if y_i fell outside the interval on either side; a negative
+    margin if y_i fell inside it. calib_preds should already have
+    quantile crossing fixed (fix_quantile_crossing) so pred_lower_i <=
+    pred_upper_i for every row -- this formula doesn't require it, but a
+    crossed row's "interval" isn't a real interval to begin with.
+
+    No boolean tie-breaking here (unlike quantile_coverage): this is a
+    continuous max() of two differences, so point-mass in the target
+    (e.g. TE's ~19% exact-zero custom_points) doesn't create a </<=
+    ambiguity in the score itself -- it just means many calibration rows
+    can land at exactly E_i = 0 when both the prediction and the actual
+    are 0, which is a real, correctly-computed conformity score, not a
+    tie to break.
+    """
+    lower_col, upper_col = _quantile_col(lower_q), _quantile_col(upper_q)
+    return np.maximum(
+        (calib_preds[lower_col] - calib_preds[target_col]).to_numpy(),
+        (calib_preds[target_col] - calib_preds[upper_col]).to_numpy(),
+    )
+
+
+def conformal_quantile(scores: np.ndarray, target_coverage: float) -> float:
+    """
+    The finite-sample-corrected empirical quantile of calibration
+    conformity scores that gives CQR its coverage GUARANTEE at finite n
+    (Romano, Patterson & Candes 2019): the ceil((n+1) * target_coverage)
+    -th order statistic, clipped to the largest observed score if the
+    calibration set is too small for that rank to exist. A naive
+    np.quantile(scores, target_coverage) uses n instead of (n+1) and
+    under-widens slightly, losing the finite-sample guarantee (the two
+    converge as n grows, so this only matters when the calibration set
+    is small).
+    """
+    sorted_scores = np.sort(scores)
+    n = len(sorted_scores)
+    if n == 0:
+        raise ValueError("conformal_quantile: empty calibration score set")
+    rank = min(int(np.ceil((n + 1) * target_coverage)), n)
+    return float(sorted_scores[rank - 1])
+
+
+def apply_conformal_widening(
+    preds: pd.DataFrame, lower_q: float, upper_q: float, widen_by: float
+) -> pd.DataFrame:
+    """
+    Applies the CQR adjustment: subtract widen_by from the lower bound,
+    add it to the upper bound, for every row -- a single, constant,
+    additive correction (not scaled by the prediction's own magnitude).
+    Writes NEW pred_q{lower}_cqr / pred_q{upper}_cqr columns; the
+    original pred_q{lower}/pred_q{upper} columns are left untouched so
+    before/after can be compared on the same frame.
+    """
+    out = preds.copy()
+    lower_col, upper_col = _quantile_col(lower_q), _quantile_col(upper_q)
+    out[f"{lower_col}_cqr"] = out[lower_col] - widen_by
+    out[f"{upper_col}_cqr"] = out[upper_col] + widen_by
+    return out
+
+
+def interval_breach_by_prediction_bucket(
+    calib_preds: pd.DataFrame, target_col: str, lower_q: float, upper_q: float, n_bins: int = 3,
+) -> pd.DataFrame:
+    """
+    Diagnostic for whether a single GLOBAL widening constant is an
+    appropriate fix, or whether undercoverage is concentrated at one end
+    of the prediction range: buckets the calibration set into n_bins
+    equal-count groups by predicted median (pred_q50), and reports the
+    RAW (pre-CQR) breach rate below lower_q and above upper_q within
+    each bucket. Similar breach rates across buckets means one global
+    constant is a reasonable fit; a breach rate concentrated in one
+    bucket means a single constant over-widens easy-to-predict weeks and
+    under-widens hard ones.
+    """
+    lower_col, upper_col = _quantile_col(lower_q), _quantile_col(upper_q)
+    out = calib_preds.copy()
+    out["_bucket"] = pd.qcut(out["pred_q50"], n_bins, labels=[f"bucket_{i + 1}_of_{n_bins}" for i in range(n_bins)])
+    rows = []
+    for bucket, g in out.groupby("_bucket", observed=True):
+        below = (g[target_col] <= g[lower_col]).mean()
+        above = (g[target_col] > g[upper_col]).mean()
+        rows.append({
+            "bucket": bucket, "n": len(g),
+            "pred_q50_min": g["pred_q50"].min(), "pred_q50_max": g["pred_q50"].max(),
+            "below": below, "within": 1 - below - above, "above": above,
+        })
+    return pd.DataFrame(rows)
 
 
 def _cast_categoricals(pos_df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
