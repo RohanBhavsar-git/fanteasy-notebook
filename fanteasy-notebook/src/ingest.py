@@ -496,6 +496,46 @@ def _sleeper_projections_to_df(raw: list | dict) -> pd.DataFrame:
     return _normalize_id_column(df, "sleeper_id")
 
 
+def get_sleeper_matchups(league_id: str, week: int, refresh: bool = False) -> pd.DataFrame:
+    """
+    Real weekly fantasy matchups — /league/{id}/matchups/{week}. One row
+    per (roster_id, matchup_id): the roster's ACTUAL total points that
+    week (Sleeper's own league-scoring total — ground truth for who won
+    that matchup), `starters` (ordered sleeper player_ids, including
+    K/DST slots), and `starters_points` (Sleeper's actual per-starter
+    points that week, same order).
+
+    Returns an EMPTY DataFrame (not a raise) if the week has no
+    matchups — most leagues run a 14-17 week fantasy schedule inside the
+    NFL's 18-week regular season, so a late week can be a genuine bye on
+    the fantasy calendar rather than a broken fetch.
+    """
+    cache_name = f"sleeper_matchups_{league_id}_wk{week}"
+    if not refresh:
+        cached = _read_cache_json(cache_name)
+        if cached is not None:
+            return _sleeper_matchups_to_df(cached)
+    logger.info(f"Fetching Sleeper matchups for league {league_id} week {week}...")
+    data = _sleeper_get(f"{SLEEPER_API}/league/{league_id}/matchups/{week}", required=False)
+    if data is None:
+        data = []
+    _write_cache_json(data, cache_name)
+    return _sleeper_matchups_to_df(data)
+
+
+def _sleeper_matchups_to_df(raw: list) -> pd.DataFrame:
+    if not raw:
+        return pd.DataFrame(columns=["roster_id", "matchup_id", "points", "starters", "starters_points"])
+    rows = [{
+        "roster_id": entry.get("roster_id"),
+        "matchup_id": entry.get("matchup_id"),
+        "points": entry.get("points"),
+        "starters": entry.get("starters") or [],
+        "starters_points": entry.get("starters_points") or [],
+    } for entry in raw]
+    return pd.DataFrame(rows)
+
+
 # ==========================================================================
 # CONVENIENCE: full Phase 1 fetch bundle
 # ==========================================================================

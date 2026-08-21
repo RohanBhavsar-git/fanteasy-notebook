@@ -15,10 +15,15 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > catching it. Formulation B (predicting the residual against Sleeper's
 > projection instead) was tested too and does not improve on Formulation A.
 > See **Phase 6 findings** below for the full picture, including what's
-> still wrong. Phase 6.5 (simulation) and Phase 6 steps 8-10 are still
-> design sketch, contingent on what happens with Phase 6 next — see
-> **Verification status** near the end before treating any pipeline claim
-> as settled.
+> still wrong. Phase 6's quantile models are now CQR-calibrated (see
+> **Phase 6 findings**), and Phase 6.5 step 9 (`src/simulate.py` — game-
+> environment sampling, matchup simulation) is done and validated against
+> 204 real historical matchups — see **Phase 6.5 findings**: calibration
+> looks reasonable where there's enough data to judge it, but simulated
+> win probability does **not** clearly beat a naive baseline at this
+> sample size, reported plainly rather than reframed. Step 10 (season
+> simulation, playoff odds) is not started — see **Verification status**
+> near the end before treating any pipeline claim as settled.
 
 ---
 
@@ -209,12 +214,12 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 |---|---|---|
 | 1 | Data ingestion — `src/ingest.py` + `01_data_ingestion.ipynb` | **Done** — runs clean, all sources cached to `data/raw/` |
 | 2a | Custom scoring — `src/features.py` + `02_custom_scoring.ipynb` | **Done** — 100% validated against Sleeper's actual results |
-| 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 6-8 (Phase 6 model A/B + quantile/SHAP) are also done — see **Phase 6 findings**. Steps 9-10 (Phase 6.5 simulation) remain. |
+| 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 6-9 (Phase 6 model A/B + quantile/SHAP/CQR, Phase 6.5 game-environment simulation) are also done — see **Phase 6 findings** and **Phase 6.5 findings**. Step 10 (season simulation, playoff odds) remains. |
 | 3 | Role classification — rule-based Pocket Passer / 3-Down Back / Slot / etc. | Not started |
 | 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
 | 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. Step 8 (quantile floor/ceiling models + SHAP) is done: coverage is measured and honestly overconfident (67-75% actual vs. 80% target for the 10th-90th interval), and SHAP shows nothing that looks like a leak. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
-| 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Not started |
+| 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Step 9 **done** (`src/simulate.py` — game-environment sampling, matchup simulation) — see **Phase 6.5 findings**. Validated against 204 real historical matchups: calibration is reasonable where there's enough data to judge it; win-prediction accuracy does not clearly beat a naive baseline at this sample size. Step 10 (season simulation, playoff odds) not started, per explicit scope stop. |
 | 7 | JSON export — assemble `player_advanced_stats.json` | Not started |
 | 8 | GitHub Actions weekly automation | Not started |
 
@@ -392,6 +397,27 @@ One direction-of-miscoverage pattern held at all four positions, independent of 
 
 ---
 
+## Phase 6.5 findings (step 9: game-environment simulation)
+
+`src/simulate.py` implements the spec's "option 1" correlation approach: `sample_player_week()`, `simulate_matchup()`, `calibration_report()`. `simulate_season()` and playoff odds (step 10) are **not implemented** — stopped here per explicit instruction, after matchup-level results.
+
+**Mechanism: a one-factor Gaussian copula.** Every player-week draws a percentile `u = Phi(sqrt(rho)*z_game + sqrt(1-rho)*z_player)`, where `z_game` is ONE shared standard-normal draw per real NFL game (grouped by `game_id`) and `z_player` is that row's own idiosyncratic draw. Two players sharing a `game_id` have percentile correlation exactly `rho`; players in different games are independent — regardless of which *fantasy* team they're on, so two opposing managers who each started a player from the same real game still move together, matching the spec's framing that a shootout lifts everyone in it. `rho = 0.35` is a fixed constant, not fit to data — the spec's own option 2 ("measure the correlations directly") is explicitly deferred; this is option 1, the one the spec says to start with.
+
+Each player's percentile is mapped through *their own* 5 CQR-calibrated quantile points (`pred_q10_cqr`, `pred_q25_cqr`, `pred_q50`, `pred_q75_cqr`, `pred_q90_cqr`) via a piecewise-linear inverse-CDF, linearly extrapolated beyond the 10th/90th (`np.interp`'s default flat-clipping would understate exactly the tail variance a simulation needs most). Building this surfaced a genuine new finding: CQR's 10-90 and 25-75 interval pairs are widened by *different* constants (see above), which can reintroduce quantile crossing *between* pairs (e.g. `pred_q25_cqr` below `pred_q10_cqr`) even though each pair is individually monotonic after its own widening. `sample_player_week()` defensively re-sorts all 5 points per row before building the inverse-CDF — the same rearrangement fix as `fix_quantile_crossing()`, applied again at a new seam it didn't originally cover.
+
+**K/DST and the ~0.5% of skill-position starters without model coverage** use Sleeper's own point projection as a fixed, zero-variance contribution — all 5 quantile columns set to the same value, since interpolating identical points always returns that constant regardless of the percentile drawn. No special-casing was needed in `simulate.py` itself for this; it falls out of feeding it degenerate quantiles. This mirrors the dashboard's existing convention of showing Sleeper's K/DST numbers labeled as Sleeper's, not the model's — consistent with CLAUDE.md's scope boundary, not a new exception.
+
+**Validated on 204 real historical matchups** (2024 Wk5-17 and 2025 Wk1-17 — the locked evaluation window, minus fantasy-playoff bye weeks; 2,837 starters had real model coverage, 816 were K/DST fallbacks, and 18 (~0.5% of all starter-slots) were unexpected missing-skill-coverage fallbacks not investigated further given the size):
+
+- **Win-prediction accuracy: simulation does not beat the naive baseline.** Simulation picked the actual winner 61.3% of the time (125/204); naive (whichever team has the higher summed point-estimate projection) picked it 62.7% of the time (128/204). The spec's own acceptance criterion — "simulated win probabilities beat a naive baseline... on historical weeks" — **is not met** by this result, reported plainly rather than reframed.
+- **The gap is structural and tiny, not a clear loss.** Correlation and variance change the *spread* of a simulated total, not its mean, so the simulation's implied favorite (win probability > 50%) matches naive's point-estimate favorite in 191/204 matchups (93.6%) by construction. The two methods only diverge in genuine toss-up games — every one of the 13 disagreements has a simulated win probability between 43% and 59%. On those 13 games, naive got 8 right and simulation got 5 — a gap fully explainable by chance at this sample size (13 coin flips), not a reliable difference either way. 204 matchups isn't enough to distinguish the two methods; more historical seasons of real matchup data would be needed for a fair test.
+- **Calibration is reasonable where there's enough data, untested where there isn't.** Binning both sides of every matchup's probability (408 observations total) into deciles: the six well-populated middle bins (0.2-0.8, 385/408 = 94% of the sample) track the predicted rate within about 2-4 points — e.g. predicted 74.7% in the 0.7-0.8 bin, actual 73.5%. The four extreme bins (0.0-0.2 and 0.8-1.0) show a directional overconfidence pattern — e.g. predicted 93.5%, actual only 50% — but each has just 2-10 observations, nowhere near enough to call this conclusive rather than suggestive.
+- **10,000-sim matchups run in a fraction of a second** (see `tests/test_simulate.py`'s timing test), well inside the spec's "seconds, not minutes" bar.
+
+**Bottom line:** the correlation mechanism is implemented and tested as specified, but the two validation checks land differently — calibration looks reasonable in the range where there's enough data to judge it, while the win-accuracy comparison does not show simulation beating naive, and the sample is too small (204 matchups, 13 disagreements) to say whether that's a real gap or noise. Worth revisiting once more historical matchup weeks are available, not something to paper over now.
+
+---
+
 ## Design decisions worth preserving (the "why")
 
 Things that took real conversation to arrive at — a new Claude should NOT re-litigate these unless Rohan explicitly asks:
@@ -445,6 +471,7 @@ assumptions as facts.
 | `pfr_player_id` → `gsis_id` join (needed for snap share) | **Verified** — 99.67% match for QB/RB/WR/TE (14,281/14,328 snap-count rows, 2024-2025). The 0.33% miss is fringe/practice-squad players absent from the crosswalk entirely, not a format bug. O-line (T/G/C/OL) and long-snapper (LS) match at 0-18% — `load_ff_playerids()` carries almost no offensive linemen (53 OT, 6 C, 1 T, no `G` category in 12,470 rows) since it's sourced from fantasy-platform rosters and o-linemen are never fantasy-relevant. Out of scope for the projection model regardless (skill positions only), so this doesn't block Phase 2b. |
 | Season/week boundary handling | **Partly verified** — requesting a season nflverse hasn't published (e.g. 2026 in the offseason) 404s with a raw traceback rather than a readable message |
 | xFP (`add_xfp_features()`) reproduces `custom_points` on real plays | **Verified** — per-play scores summed over a player's actual weekly plays matched `custom_points` exactly on 6 of 8 spot-checked player-weeks (2025 Wk10 WR/RB sample); the other 2 differed by exactly −2.00, fully explained by the deliberate two-point-conversion exclusion (see design decisions above) — the only known discrepancy. Caught and fixed one real bug in the process: an early version silently added `0.04 × passing_yards` to every target's score because raw pbp's own play-level `passing_yards` column leaked into the synthetic play frame. |
+| `src/simulate.py` matchup simulation beats a naive baseline on real historical matchups | **Verified false** — tested against 204 real Sleeper matchups (2024 Wk5-17, 2025 Wk1-17); simulation and naive disagreed on the favorite in only 13 of them, and naive was right on more of those (8 vs 5) — a difference explainable by chance at this sample size, not a demonstrated edge for simulation. Calibration itself looks reasonable in the well-populated 0.2-0.8 probability range. See **Phase 6.5 findings**. |
 
 ## What's outstanding
 
