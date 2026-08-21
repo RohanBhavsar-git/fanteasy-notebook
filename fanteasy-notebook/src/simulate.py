@@ -1,6 +1,6 @@
 """
-FanTeasy Stats -- Phase 6.5 step 9: game-environment sampling and matchup
-simulation.
+FanTeasy Stats -- Phase 6.5 steps 9-10: game-environment sampling, matchup
+simulation, and season simulation (playoff-qualification odds).
 
 Per PHASE_2B_6_SPEC.md, the part that matters is correlating players who
 share a real NFL game -- ignoring it makes simulated totals cluster too
@@ -24,6 +24,14 @@ outcomes, exactly as the spec describes.
 `rho` is a fixed constant (GAME_ENVIRONMENT_RHO), not fit to data --
 Phase 6.5's own spec defers "measure the correlations directly" (its
 option 2) to later work and says to start with the simpler option 1.
+
+That untuned constant matters more for simulate_season() than for a
+single simulate_matchup() call: one week's correlation error is one
+week's error, but a season simulation compounds the same rho across
+every remaining week, so a wrong rho biases the whole standings
+distribution, not just one game. See PROJECT_CONTEXT.md's Phase 6.5
+findings for the rho sensitivity report (0.2 / 0.35 / 0.5) run for
+exactly this reason.
 
 Player distributions come from src/model.py's CQR-calibrated quantiles
 (pred_q10_cqr, pred_q25_cqr, pred_q50, pred_q75_cqr, pred_q90_cqr -- q50
@@ -199,6 +207,115 @@ def simulate_matchup(
         "team_a_totals": team_a_totals,
         "team_b_totals": team_b_totals,
     }
+
+
+def simulate_season(
+    remaining_weeks: list[tuple[int, list[tuple[int, int]]]],
+    starting_standings: pd.DataFrame,
+    lineup_builder,
+    playoff_teams: int,
+    n_sims: int = 3000,
+    rho: float = GAME_ENVIRONMENT_RHO,
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """
+    Monte Carlo simulates the REMAINING regular-season schedule and
+    reports each roster's probability of qualifying for the playoffs.
+
+    Deliberately scoped to playoff QUALIFICATION, not bracket-round
+    outcomes: which teams make the playoffs is fully decided by regular-
+    season standings (wins, then points_for as tiebreak) BEFORE the
+    bracket starts, so simulating the bracket itself isn't needed to
+    answer "who makes it." (Bracket-round / championship-odds simulation
+    would be a separate, later piece of work.)
+
+    Correlation: each remaining week's matchups are simulated TOGETHER
+    in one sample_player_week() call across every roster playing that
+    week, so game-environment correlation applies across every real NFL
+    game that week -- not just within one fantasy matchup at a time.
+    Different weeks are independent of each other (a team's week 10
+    performance doesn't carry into week 11 beyond what each week's own
+    per-player quantiles already encode).
+
+    Args:
+        remaining_weeks: [(week, [(roster_a, roster_b), ...]), ...] in
+            chronological order -- the real schedule of who plays whom,
+            which is known in advance; only the outcomes are simulated.
+        starting_standings: one row per roster_id, columns roster_id,
+            wins, points_for -- the REAL record through the last
+            completed week, which every trial starts from.
+        lineup_builder: callable (roster_id, week) -> DataFrame with
+            `game_id` and QUANTILE_COLUMNS, one row per starter -- kept
+            as an injected callback so this function stays agnostic of
+            Sleeper-specific lineup/crosswalk/fallback logic (that glue
+            lives in the calling script, not here).
+        playoff_teams: how many roster_ids qualify (top by wins, then
+            points_for).
+        n_sims: number of Monte Carlo trials of the ENTIRE remaining
+            season (each trial simulates every remaining week once).
+        rho: game-environment correlation, passed through to
+            sample_player_week. Fixed by the caller, not tuned here --
+            see GAME_ENVIRONMENT_RHO's docstring note that correlation
+            compounds across many simulated weeks, so this matters more
+            here than for a single matchup.
+        seed: for reproducible draws (tests; pass None for real use).
+
+    Returns:
+        DataFrame: roster_id, playoff_prob, mean_final_wins,
+        mean_final_points_for.
+    """
+    roster_ids = starting_standings["roster_id"].tolist()
+    n_rosters = len(roster_ids)
+    row_of = {r: i for i, r in enumerate(roster_ids)}
+
+    wins = np.tile(starting_standings["wins"].to_numpy(dtype=float)[:, None], (1, n_sims))
+    points_for = np.tile(starting_standings["points_for"].to_numpy(dtype=float)[:, None], (1, n_sims))
+
+    rng = np.random.default_rng(seed)
+    week_seeds = rng.integers(0, 2**31 - 1, size=max(len(remaining_weeks), 1))
+
+    for week_i, (week, matchups) in enumerate(remaining_weeks):
+        frames = []
+        row_range = {}
+        cursor = 0
+        for roster_a, roster_b in matchups:
+            for roster_id in (roster_a, roster_b):
+                lineup = lineup_builder(roster_id, week)
+                frames.append(lineup)
+                row_range[roster_id] = (cursor, cursor + len(lineup))
+                cursor += len(lineup)
+        combined = pd.concat(frames, ignore_index=True)
+
+        draws = sample_player_week(combined, n_sims=n_sims, rho=rho, seed=int(week_seeds[week_i]))
+
+        for roster_a, roster_b in matchups:
+            a0, a1 = row_range[roster_a]
+            b0, b1 = row_range[roster_b]
+            totals_a = draws[a0:a1].sum(axis=0)
+            totals_b = draws[b0:b1].sum(axis=0)
+            points_for[row_of[roster_a]] += totals_a
+            points_for[row_of[roster_b]] += totals_b
+            wins[row_of[roster_a]] += (totals_a > totals_b).astype(float)
+            wins[row_of[roster_b]] += (totals_b > totals_a).astype(float)
+
+    # Vectorized standings rank across all n_sims trials at once: encode
+    # (wins, points_for) as one sortable score -- wins dominates as long
+    # as its multiplier comfortably exceeds any plausible points_for
+    # total, which a full season's points_for total (a few thousand at
+    # most) is nowhere close to here.
+    combined_score = wins * 100_000.0 + points_for
+    rank_order = np.argsort(-combined_score, axis=0)
+    qualifier_rows = rank_order[:playoff_teams, :]
+
+    made_playoffs = np.zeros((n_rosters, n_sims), dtype=bool)
+    np.put_along_axis(made_playoffs, qualifier_rows, True, axis=0)
+
+    return pd.DataFrame({
+        "roster_id": roster_ids,
+        "playoff_prob": made_playoffs.mean(axis=1),
+        "mean_final_wins": wins.mean(axis=1),
+        "mean_final_points_for": points_for.mean(axis=1),
+    })
 
 
 def calibration_report(

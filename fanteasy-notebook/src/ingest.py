@@ -536,6 +536,55 @@ def _sleeper_matchups_to_df(raw: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def get_sleeper_bracket(league_id: str, refresh: bool = False) -> list:
+    """
+    Real playoff bracket — /league/{id}/winners_bracket. Only meaningful
+    once a season's playoffs have started/completed; each entry is one
+    bracket match: `m` (match id), `r` (round), `t1`/`t2` (roster_ids, OR
+    a reference to an earlier match via `t1_from`/`t2_from` — {"w": m}
+    for that match's winner, {"l": m} for its loser).
+
+    Kept as the raw list (not flattened to a DataFrame) since its shape
+    is irregular — see playoff_participants_from_bracket() for the one
+    thing this project needs out of it.
+    """
+    cache_name = f"sleeper_bracket_{league_id}"
+    if not refresh:
+        cached = _read_cache_json(cache_name)
+        if cached is not None:
+            return cached
+    logger.info(f"Fetching Sleeper winners_bracket for league {league_id}...")
+    data = _sleeper_get(f"{SLEEPER_API}/league/{league_id}/winners_bracket", required=False)
+    if data is None:
+        data = []
+    _write_cache_json(data, cache_name)
+    return data
+
+
+def playoff_participants_from_bracket(bracket: list) -> set:
+    """
+    The set of roster_ids that actually made the playoffs, read off a
+    completed winners_bracket.
+
+    A match's t1/t2 slot is a REAL seeded participant only when there's
+    no t1_from/t2_from key for that slot — a "_from" key means the slot
+    is filled by an earlier match's winner or loser, not a new playoff
+    entrant. E.g. a bye team enters round 2 directly as a literal t1
+    with no t1_from, while everyone advancing out of round 1 reaches
+    round 2 only via t2_from. Taking the union of every direct slot
+    across the whole bracket recovers exactly the league's playoff
+    field, including any top-seed byes, without needing to already know
+    the league's playoff_teams count.
+    """
+    participants = set()
+    for match in bracket:
+        if "t1_from" not in match and match.get("t1") is not None:
+            participants.add(match["t1"])
+        if "t2_from" not in match and match.get("t2") is not None:
+            participants.add(match["t2"])
+    return participants
+
+
 # ==========================================================================
 # CONVENIENCE: full Phase 1 fetch bundle
 # ==========================================================================

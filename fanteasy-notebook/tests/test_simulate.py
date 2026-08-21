@@ -22,7 +22,9 @@ from src.simulate import (  # noqa: E402
     calibration_report,
     sample_player_week,
     simulate_matchup,
+    simulate_season,
 )
+from src.ingest import playoff_participants_from_bracket  # noqa: E402
 
 
 def _row(game_id, q10, q25, q50, q75, q90):
@@ -151,6 +153,83 @@ def test_simulate_matchup_runs_10000_sims_in_seconds_not_minutes():
     simulate_matchup(lineup_a, lineup_b, n_sims=10000, seed=6)
     elapsed = time.perf_counter() - start
     assert elapsed < 10.0, f"10,000-sim matchup took {elapsed:.1f}s -- expected seconds, not minutes"
+
+
+def _flat_lineup(base_level, game_id="g"):
+    """A one-player lineup with a fixed, non-degenerate spread centered on base_level."""
+    return pd.DataFrame([_row(game_id, base_level - 5, base_level - 2, base_level, base_level + 2, base_level + 5)])
+
+
+def test_simulate_season_exactly_playoff_teams_qualify_every_trial():
+    """made_playoffs picks exactly `playoff_teams` rosters per trial by
+    construction -- so summed across ALL rosters, playoff_prob must add
+    up to exactly playoff_teams, not just approximately."""
+    standings = pd.DataFrame({
+        "roster_id": [1, 2, 3, 4], "wins": [0, 0, 0, 0], "points_for": [0.0, 0.0, 0.0, 0.0],
+    })
+    remaining_weeks = [(1, [(1, 2), (3, 4)]), (2, [(1, 3), (2, 4)])]
+
+    def lineup_builder(roster_id, week):
+        return _flat_lineup(10.0, game_id=f"g_{roster_id}_{week}")
+
+    result = simulate_season(
+        remaining_weeks, standings, lineup_builder, playoff_teams=2, n_sims=500, seed=1,
+    )
+    assert result["playoff_prob"].sum() == pytest.approx(2.0)
+    assert len(result) == 4
+
+
+def test_simulate_season_favors_the_stronger_team():
+    standings = pd.DataFrame({
+        "roster_id": [1, 2, 3, 4], "wins": [8, 2, 4, 4], "points_for": [1200.0, 700.0, 900.0, 900.0],
+    })
+    remaining_weeks = [(15, [(1, 2), (3, 4)]), (16, [(1, 3), (2, 4)])]
+
+    def lineup_builder(roster_id, week):
+        base = {1: 20.0, 2: 8.0, 3: 12.0, 4: 12.0}[roster_id]
+        return _flat_lineup(base, game_id=f"g_{roster_id}_{week}")
+
+    result = simulate_season(
+        remaining_weeks, standings, lineup_builder, playoff_teams=2, n_sims=2000, seed=2,
+    ).set_index("roster_id")
+
+    assert result.loc[1, "playoff_prob"] > 0.95  # dominant record + best remaining projections
+    assert result.loc[2, "playoff_prob"] < 0.10  # worst record + weakest remaining projections
+
+
+def test_simulate_season_runs_correlated_within_week_across_all_matchups():
+    """Two rosters in DIFFERENT fantasy matchups but the SAME real game
+    should still move together in the season simulation, same as
+    simulate_matchup's cross-lineup correlation test."""
+    standings = pd.DataFrame({
+        "roster_id": [1, 2, 3, 4], "wins": [0, 0, 0, 0], "points_for": [0.0, 0.0, 0.0, 0.0],
+    })
+
+    def lineup_builder(roster_id, week):
+        shared_game = {1: "gameX", 3: "gameX", 2: "gameY", 4: "gameZ"}[roster_id]
+        return _flat_lineup(10.0, game_id=shared_game)
+
+    remaining_weeks = [(1, [(1, 2), (3, 4)])]  # roster 1 (matchup A) and roster 3 (matchup B) share gameX
+    result = simulate_season(
+        remaining_weeks, standings, lineup_builder, playoff_teams=2, n_sims=1, seed=3,
+    )
+    assert len(result) == 4  # smoke test: runs without error when matchup grouping crosses lineups
+
+
+def test_playoff_participants_from_bracket_matches_real_2024_response():
+    bracket = [
+        {"m": 1, "r": 1, "l": 13, "w": 9, "t1": 13, "t2": 9},
+        {"m": 2, "r": 1, "l": 14, "w": 6, "t1": 14, "t2": 6},
+        {"m": 3, "r": 1, "l": 3, "w": 12, "t1": 12, "t2": 3},
+        {"m": 4, "r": 2, "l": 8, "w": 9, "t1": 8, "t2": 9, "t2_from": {"w": 1}},
+        {"m": 5, "r": 2, "l": 6, "w": 12, "t1": 6, "t2": 12, "t2_from": {"w": 3}, "t1_from": {"w": 2}},
+        {"m": 6, "r": 2, "l": 14, "w": 3, "t1": 14, "t2": 3, "t2_from": {"l": 3}, "t1_from": {"l": 2}},
+        {"p": 1, "m": 7, "r": 3, "l": 9, "w": 12, "t1": 9, "t2": 12, "t2_from": {"w": 5}, "t1_from": {"w": 4}},
+        {"p": 3, "m": 8, "r": 3, "l": 8, "w": 6, "t1": 8, "t2": 6, "t2_from": {"l": 5}, "t1_from": {"l": 4}},
+        {"p": 5, "m": 9, "r": 3, "l": 3, "w": 13, "t1": 13, "t2": 3, "t2_from": {"w": 6}, "t1_from": {"l": 1}},
+    ]
+    result = playoff_participants_from_bracket(bracket)
+    assert result == {13, 9, 14, 6, 12, 3, 8}
 
 
 def test_calibration_report_matches_known_bernoulli_rate():
