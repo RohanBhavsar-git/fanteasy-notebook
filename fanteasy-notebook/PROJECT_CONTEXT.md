@@ -226,7 +226,7 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 | 5 | Heatmap zones — field-location frequency tables | Not started |
 | 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. Step 8 (quantile floor/ceiling models + SHAP) is done: coverage is measured and honestly overconfident (67-75% actual vs. 80% target for the 10th-90th interval), and SHAP shows nothing that looks like a leak. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
 | 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Steps 9-10 **done** (`src/simulate.py` — game-environment sampling, matchup + season simulation, playoff-qualification odds) — see **Phase 6.5 findings**. Validated against 204 real historical matchups and 8 season-snapshot combinations: calibration is reasonable where there's enough data to judge it in both. Untuned rho=0.35 sensitivity for playoff odds is small (~0.7pt mean, ~3pt max across rho 0.2-0.5). Championship/bracket-round odds are a separate, not-yet-started piece of work. |
-| 7 | JSON export — assemble `player_advanced_stats.json` | Not started |
+| 7 | JSON export — assemble `player_advanced_stats.json` | **Done** — `src/export.py` + `07_export_json.ipynb`. Predicts the real upcoming week (2026 Wk1) by reusing the existing point-in-time-safe feature pipeline on a stub row, not new future-facing logic. 300 players (2026 league is `pre_draft` as of this run, so scope is top-300 by projection until the real draft happens — picks up real rosters automatically on a re-run, no code change needed), 132 KB, crosswalk match rate 98.99%. `role`/`radar`/`heatmap` (Phases 3-5) can slot in as new per-player keys later without restructuring anything. |
 | 8 | GitHub Actions weekly automation | Not started |
 
 Notebooks are kept single-purpose: `01_data_ingestion.ipynb` does ingestion only,
@@ -510,6 +510,7 @@ assumptions as facts.
 - **Season Leaders panel** on the dashboard is pending replacement
 - **Build out the Python notebook pipeline**, phases 2 through 8
 - **Historical champion data** — plan is to maintain a small `champions.json` file by hand for the league's history
+- **Re-run `07_export_json.ipynb` after the 2026 draft.** The league (`DEFAULT_LEAGUE_ID`) was `pre_draft` with zero rostered players when Phase 7 was built, so the committed `player_advanced_stats.json` reflects top-300-by-projection only, not real rosters — no code change needed, just a re-run once the draft happens.
 
 ---
 
