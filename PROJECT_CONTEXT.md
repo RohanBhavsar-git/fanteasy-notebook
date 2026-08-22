@@ -717,6 +717,31 @@ resource that doesn't exist just delays the same failure. Covered by
 `tests/test_ingest.py` (4 tests: retry-then-succeed, exhausts-then-raises,
 never-retries-a-404, args/kwargs pass through cleanly).
 
+`weekly-update.yml`'s SECOND real run then hit a different, unrelated bug:
+its commit step ran `git pull --rebase` BEFORE staging/committing
+`scripts/weekly_update.py`'s own output, so rebase refused to run against
+a dirty working tree ("cannot pull with rebase: You have unstaged
+changes"). `retrain.yml` had the identical latent bug in the same
+copy-pasted three-line pattern — it only didn't trigger on retrain's first
+run because `models/fanteasy_model.joblib` was still untracked that time
+(an untracked file doesn't block rebase the way a modified TRACKED one
+does). Fixed in both workflows by reordering to commit first, then
+`git pull --rebase`, then push.
+
+**Both workflows are now verified successful end to end on real GitHub
+Actions infrastructure, not just locally.** `weekly-update.yml`'s third
+run completed in ~2 minutes and committed a real, correct
+`data/output/player_advanced_stats.json`: `meta.model_version` is
+`a011dc8` (the ARTIFACT's own trained-model commit, not the workflow run's
+own HEAD — confirms the "model stays fixed between retrains" design is
+actually holding in production), `meta.performance` matches the artifact's
+walk-forward numbers exactly, `meta.caveats` includes both the base
+caveats and the two weekly-only ones, 300 players at 220,002 bytes
+(matching the local dry run's 220,020 almost exactly), and a spot-checked
+player's `usage`/`trend` blocks show the expected pattern for week 1 of a
+new season — every in-season `_ewm3` value null, `prev_season_*` populated
+from real 2025 data, `floor <= point <= ceiling` holding.
+
 ---
 
 ## Design decisions worth preserving (the "why")
@@ -777,14 +802,15 @@ assumptions as facts.
 | `rho=0.35` sensitivity for season-long playoff odds | **Verified small** — re-ran every validation snapshot at rho ∈ {0.2, 0.35, 0.5}; mean \|P(rho=0.5) − P(rho=0.2)\| across all 112 (season, snapshot, roster) combinations is 0.0065, max 0.0327. Smaller than the "correlation compounds across weeks" intuition alone would suggest — a season's cumulative win total averages many largely-independent weekly outcomes, which damps how much one shared weekly correlation parameter can move a season-long summary statistic, except for teams sitting on the playoff bubble across most of the remaining schedule. See **Phase 6.5 findings**. |
 | Phase 3' trend window (3 vs. 4 vs. 5-week EWM half-life) | **Verified** — 3 beats 4 and 5 on both hold-rate and correlation with next-week usage, for every one of target_share/carry_share/offense_pct/rz_opportunity_share, over 21,000+ real player-weeks per feature (2018-2025). See **Phase 3' findings**. |
 | Phase 3' trend leakage (`add_trend_features`) | **Verified** — future-truncation and same-week-perturbation tests both pass (`tests/test_no_leakage.py`), same two-pronged pattern used for Family 6's rolling aggregates. |
-| `scripts/retrain.py` runs end-to-end and matches published Phase 6 numbers | **Verified locally** against warm `data/raw/` caches — see **Phase 8 findings**. Not yet run on GitHub Actions infrastructure itself (cold runner, real network fetch of all 8 seasons) — that's the first real `workflow_dispatch` run, still to happen. |
-| `scripts/weekly_update.py` runs end-to-end for a real pre-season week | **Verified locally** against the real live 2026 league and a freshly-retrained artifact — correctly detected target week 1, correctly handled the real "2026 stats not published yet" 404, produced a 300-player JSON matching the already-committed Phase 7 export's shape. See **Phase 8 findings**. Not yet run on GitHub Actions infrastructure itself. |
+| `scripts/retrain.py` runs end-to-end and matches published Phase 6 numbers | **Verified** — locally against warm `data/raw/` caches, AND on real GitHub Actions infrastructure (`workflow_dispatch`, cold runner, ~5 min, committed a 7.57 MB artifact whose walk-forward performance numbers match the local run). See **Phase 8 findings**. |
+| `scripts/weekly_update.py` runs end-to-end for a real pre-season week | **Verified** — locally, AND on real GitHub Actions infrastructure (third `workflow_dispatch` attempt succeeded after two real bugs found and fixed by the first two attempts — a test-fixture network dependency and a git commit-step ordering bug, both now fixed for future runs too). Correctly detected target week 1, correctly handled the real "2026 stats not published yet" 404, committed a 300-player, 220,002-byte JSON with `meta.model_version` correctly pinned to the artifact's own trained commit. See **Phase 8 findings**. |
 | `history_seed` (2 seasons) is sufficient for Family 6 rolling/prev_season_* correctness | **Verified** — `build_feature_table([2024, 2025])`'s 2025 rolling outputs match the full 8-season build's 2025 rows exactly on every `ROLLING_OUTPUT_COLUMNS` entry except `xfp`/`fp_over_expected` and their derivatives (a disclosed, separate, self-correcting gap — see **Phase 8 findings**). |
 
 ## What's outstanding
 
 - **`PHASE_2B_6_SPEC.md`** at the repo root is the working spec for Phases 2b, 6, and 6.5. Fold it into this doc and `NOTEBOOK_OUTLINE.md` once those phases are complete.
-- **Trigger the first real `retrain.yml` and `weekly-update.yml` `workflow_dispatch` runs on GitHub Actions itself.** Both are verified locally (see **Phase 8 findings**) but haven't yet run on GitHub's actual runners — a cold checkout, real network fetch of all 8 seasons for `retrain.yml`, and the `contents: write` push step are all still unverified outside a local venv.
+- ~~Trigger the first real `retrain.yml` and `weekly-update.yml` `workflow_dispatch` runs on GitHub Actions itself.~~ **Done** — both succeeded on real GitHub Actions infrastructure; see **Phase 8 findings** for the two real bugs their first attempts caught (a test-fixture network dependency, a git commit-step ordering bug) and how they were fixed.
+- **`weekly-update.yml` hasn't yet run on its actual Tuesday cron schedule** — every verification so far is `workflow_dispatch`. The season hasn't started (2026 preseason as of this writing), so there's nothing scheduled to observe yet; worth a spot-check once the first real Tuesday during the season rolls around.
 - Update `DEFAULT_LEAGUE_ID` in `src/ingest.py` each August when Sleeper rolls the league over
 - **`HISTORICAL_SEASONS` in `scripts/retrain.py`** (currently `2018-2025`, mirroring every other model in this pipeline) needs bumping by hand once nflverse publishes a new season's data — same manual-update pattern as `DEFAULT_LEAGUE_ID`, not automatic.
 - `src/ingest.py`'s fetchers still 404 with a raw traceback for an unpublished season in the general case — only `src/pipeline.py::build_weekly_scored`'s single-current-season path was fixed (see Verification status). A general `ingest.py`-level season guard is still undone, same open item as before Phase 8.
