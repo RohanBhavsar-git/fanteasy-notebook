@@ -34,10 +34,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.ingest import (  # noqa: E402
     get_id_crosswalk, get_ngs_data, get_pbp, get_schedule, get_sleeper_league, get_snap_counts,
 )
+from src.pipeline import build_weekly_scored  # noqa: E402
 from src.usage import (  # noqa: E402
     CONTEXT_OUTPUT_COLUMNS,
     EFFICIENCY_OUTPUT_COLUMNS,
-    FANTASY_POSITIONS,
     ROLLING_OUTPUT_COLUMNS,
     SITUATIONAL_OUTPUT_COLUMNS,
     SNAP_OUTPUT_COLUMNS,
@@ -60,9 +60,20 @@ BOUNDARIES = [(2024, 5), (2024, 10), (2025, 5), (2025, 12)]
 
 @pytest.fixture(scope="module")
 def weekly_scored() -> pd.DataFrame:
-    path = PROJECT_ROOT / "data" / "processed" / "weekly_scored.parquet"
-    df = pd.read_parquet(path)
-    df = df[(df["season_type"] == "REG") & df["position"].isin(FANTASY_POSITIONS)]
+    """
+    Builds Phase 2a's weekly_scored table directly via
+    src.pipeline.build_weekly_scored, instead of reading the local
+    data/processed/weekly_scored.parquet cache 02_custom_scoring.ipynb
+    writes -- that file is gitignored and doesn't exist on a fresh CI
+    checkout (see .github/workflows/retrain.yml), so this fixture would
+    hard-fail before a single leakage test ran. build_weekly_scored
+    already goes through get_weekly_stats/get_pbp's own fetch-or-cache
+    logic, so this works identically whether data/raw/ is warm (fast,
+    local) or empty (a real fetch, CI). Verified to match the notebook's
+    own cached weekly_scored.parquet for season 2025 to within
+    floating-point noise before this fixture was changed.
+    """
+    df = build_weekly_scored([2024, 2025])
     return df.reset_index(drop=True)
 
 
