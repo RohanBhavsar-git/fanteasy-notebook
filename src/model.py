@@ -745,6 +745,106 @@ def stable_feature_ranking(selections: pd.DataFrame, all_feature_cols: list[str]
 
 
 # ==========================================================================
+# FINAL (NO-HOLDOUT) MODELS -- Phase 8: persisted across weekly inference runs
+# ==========================================================================
+def train_final_models(
+    df: pd.DataFrame,
+    feature_cols: list[str] = FEATURE_COLUMNS,
+    target_col: str = "custom_points",
+    positions: tuple[str, ...] = POSITIONS,
+    quantile_alphas: tuple[float, float] = (0.10, 0.90),
+) -> dict:
+    """
+    One point-regression model and one pair of quantile models (default
+    q10/q90, matching src/export.py's floor/ceiling) per position, each
+    trained on EVERY row of df for that position -- no fold held out, the
+    same "nothing to hold out against a week that hasn't been played yet"
+    reasoning src/export.py::predict_target_week already uses, generalized
+    so the resulting model objects can be PERSISTED (see src/artifacts.py)
+    and reused across many weekly inference runs instead of being retrained
+    inline on every single export.
+
+    Returns:
+        {position: {"point": LGBMRegressor, "quantiles": {alpha: LGBMRegressor}}}
+        -- positions with no rows in df are silently skipped (mirrors
+        predict_target_week's per-position `if pos_test.empty: continue`).
+    """
+    pos_df = _cast_categoricals(df, feature_cols)
+    models: dict = {}
+    for position in positions:
+        rows = pos_df[pos_df["position"] == position]
+        if rows.empty:
+            continue
+        reg_model = lgb.LGBMRegressor(objective="regression", verbosity=-1, random_state=42)
+        reg_model.fit(rows[feature_cols], rows[target_col])
+
+        q_models = {}
+        for alpha in quantile_alphas:
+            q_model = lgb.LGBMRegressor(objective="quantile", alpha=alpha, verbosity=-1, random_state=42)
+            q_model.fit(rows[feature_cols], rows[target_col])
+            q_models[alpha] = q_model
+
+        models[position] = {"point": reg_model, "quantiles": q_models}
+    return models
+
+
+def predict_with_models(
+    test_df: pd.DataFrame,
+    models: dict,
+    cqr_widen_by_10_90: dict[str, float],
+    feature_cols: list[str] = FEATURE_COLUMNS,
+    lower_alpha: float = 0.10,
+    upper_alpha: float = 0.90,
+) -> pd.DataFrame:
+    """
+    Predict point/floor/ceiling for test_df's rows using ALREADY-TRAINED
+    per-position models (from train_final_models, fresh or loaded from a
+    saved artifact) and CQR widening constants -- the shared prediction
+    step behind both a fresh train-then-predict call and a
+    load-artifact-then-predict call, so a train-and-predict-immediately
+    run and a load-artifact-and-predict-later run can never silently
+    diverge in how floor/ceiling get built.
+
+    Same floor <= point <= ceiling clipping as
+    src/export.py::predict_target_week: point comes from a SEPARATE model
+    than floor/ceiling, so nothing mathematically guarantees the two
+    agree on their own.
+
+    Returns: player_id, position, point, floor, ceiling -- one row per
+    (position, player) present in test_df AND in `models`.
+    """
+    pos_df = _cast_categoricals(test_df, feature_cols)
+    results = []
+    for position, bundle in models.items():
+        rows = pos_df[pos_df["position"] == position]
+        if rows.empty:
+            continue
+
+        point_raw = bundle["point"].predict(rows[feature_cols])
+        q_lower = bundle["quantiles"][lower_alpha].predict(rows[feature_cols])
+        q_upper = bundle["quantiles"][upper_alpha].predict(rows[feature_cols])
+
+        floor_raw = np.minimum(q_lower, q_upper)
+        ceiling_raw = np.maximum(q_lower, q_upper)
+        widen_by = cqr_widen_by_10_90[position]
+        floor = floor_raw - widen_by
+        ceiling = ceiling_raw + widen_by
+        point = np.clip(point_raw, floor, ceiling)
+
+        results.append(pd.DataFrame({
+            "player_id": rows["player_id"].to_numpy(),
+            "position": position,
+            "point": point,
+            "floor": floor,
+            "ceiling": ceiling,
+        }))
+
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame(
+        columns=["player_id", "position", "point", "floor", "ceiling"]
+    )
+
+
+# ==========================================================================
 # METRICS
 # ==========================================================================
 def _metrics(actual: pd.Series, pred: pd.Series) -> dict:

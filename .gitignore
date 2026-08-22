@@ -10,6 +10,13 @@ data/output/*
 !data/output/.gitkeep
 !data/output/player_advanced_stats.json
 
+# models/ holds the Phase 8 model artifact (src/artifacts.py) -- committed
+# by retrain.yml only, same "deliverable, not cache" exception as
+# data/output/ above. weekly-update.yml reads it but never writes it.
+models/*
+!models/.gitkeep
+!models/fanteasy_model.joblib
+
 # Python
 __pycache__/
 *.py[cod]

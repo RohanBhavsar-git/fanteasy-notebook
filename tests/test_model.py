@@ -27,9 +27,11 @@ from src.model import (  # noqa: E402
     conformity_scores,
     fix_quantile_crossing,
     interval_breach_by_prediction_bucket,
+    predict_with_models,
     quantile_coverage,
     quantile_crossing_rate,
     quantile_interval_coverage,
+    train_final_models,
     walk_forward_predict,
     walk_forward_predict_quantile,
 )
@@ -349,3 +351,105 @@ def test_interval_breach_by_prediction_bucket_shape():
     assert result["n"].sum() == n
     for _, row in result.iterrows():
         assert row["below"] + row["within"] + row["above"] == pytest.approx(1.0)
+
+
+# ==========================================================================
+# PHASE 8: train_final_models / predict_with_models
+# ==========================================================================
+def test_train_final_models_fits_one_point_model_and_a_quantile_pair_per_position(monkeypatch):
+    """
+    No-holdout training (Phase 8's artifact path): every row for a
+    position should be used to fit its models -- unlike walk_forward_*,
+    there's no train/test split here at all. Checks fit() is called with
+    ALL of that position's rows, once for the point model and once per
+    quantile alpha, and that positions absent from df are skipped.
+    """
+    df = _synthetic_position_df(n_players=4, seasons=(2024,), weeks=range(1, 6))
+    import src.model as model_module
+
+    fit_calls = []
+
+    class _RecordingModel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def fit(self, X, y):
+            fit_calls.append((self.kwargs.get("objective"), self.kwargs.get("alpha"), len(X)))
+            return self
+
+        def predict(self, X):
+            return np.zeros(len(X))
+
+    monkeypatch.setattr(model_module.lgb, "LGBMRegressor", _RecordingModel)
+
+    feature_cols = ["feat_a", "feat_b"]
+    models = train_final_models(df, feature_cols=feature_cols, positions=("WR", "QB"))
+
+    n_wr_rows = (df["position"] == "WR").sum()
+    assert "WR" in models
+    assert "QB" not in models  # no QB rows in the synthetic df -- silently skipped
+
+    assert set(models["WR"].keys()) == {"point", "quantiles"}
+    assert set(models["WR"]["quantiles"].keys()) == {0.10, 0.90}
+
+    # one point fit + one fit per quantile alpha, every one on ALL WR rows
+    assert ("regression", None, n_wr_rows) in fit_calls
+    assert ("quantile", 0.10, n_wr_rows) in fit_calls
+    assert ("quantile", 0.90, n_wr_rows) in fit_calls
+    assert len(fit_calls) == 3
+
+
+def test_predict_with_models_builds_floor_point_ceiling_with_cqr_widening_and_clipping():
+    """
+    Uses fake pre-trained models (skip real LightGBM entirely) with fixed
+    predict() outputs to check the arithmetic predict_with_models is
+    responsible for: floor/ceiling from min/max of the two quantile
+    predictions, CQR widening applied per-position, and point clipped into
+    [floor, ceiling] -- the same invariant src/export.py's
+    validate_export() checks on the final exported JSON.
+    """
+    class _FixedModel:
+        def __init__(self, value):
+            self.value = value
+
+        def predict(self, X):
+            return np.full(len(X), self.value)
+
+    models = {
+        "WR": {
+            "point": _FixedModel(50.0),  # deliberately outside [floor, ceiling] before clipping
+            "quantiles": {0.10: _FixedModel(12.0), 0.90: _FixedModel(8.0)},  # crossed on purpose
+        },
+    }
+    cqr_widen_by = {"WR": 1.0}
+    test_df = pd.DataFrame({
+        "player_id": ["p1", "p2"],
+        "position": ["WR", "WR"],
+        "feat_a": [0.0, 0.0],
+    })
+
+    result = predict_with_models(test_df, models, cqr_widen_by, feature_cols=["feat_a"])
+
+    assert list(result["player_id"]) == ["p1", "p2"]
+    # floor/ceiling take min/max of the (crossed) quantile predictions, then widen by 1.0
+    assert (result["floor"] == 8.0 - 1.0).all()
+    assert (result["ceiling"] == 12.0 + 1.0).all()
+    # point (50.0) is clipped down to the widened ceiling, not left out of range
+    assert (result["point"] == result["ceiling"]).all()
+    assert (result["floor"] <= result["point"]).all()
+    assert (result["point"] <= result["ceiling"]).all()
+
+
+def test_predict_with_models_skips_positions_not_present_in_test_df():
+    class _FixedModel:
+        def predict(self, X):
+            return np.zeros(len(X))
+
+    models = {
+        "WR": {"point": _FixedModel(), "quantiles": {0.10: _FixedModel(), 0.90: _FixedModel()}},
+        "QB": {"point": _FixedModel(), "quantiles": {0.10: _FixedModel(), 0.90: _FixedModel()}},
+    }
+    test_df = pd.DataFrame({"player_id": ["p1"], "position": ["WR"], "feat_a": [0.0]})
+
+    result = predict_with_models(test_df, models, {"WR": 0.0, "QB": 0.0}, feature_cols=["feat_a"])
+    assert set(result["position"]) == {"WR"}

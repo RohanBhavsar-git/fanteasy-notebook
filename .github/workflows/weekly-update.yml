@@ -1,0 +1,63 @@
+name: Weekly Update
+
+# Inference only -- never trains anything. Loads the model artifact
+# retrain.yml already committed (models/fanteasy_model.joblib), fetches
+# only the current season's data, predicts the upcoming week, and commits
+# the regenerated data/output/player_advanced_stats.json. See
+# scripts/weekly_update.py's module docstring for the full mechanism and
+# scripts/retrain.py for why training lives in a separate, manual workflow.
+
+on:
+  schedule:
+    # Tuesdays 8am ET during the NFL season (games post MNF stats by then).
+    # Cron has no DST awareness, so this is split in two fixed-UTC entries
+    # rather than one: 12:00 UTC = 8am EDT (Sept-Oct, before DST ends the
+    # first Sunday of November) and 13:00 UTC = 8am EST (Nov-Feb, covering
+    # the rest of the season through playoffs). Off by up to an hour for
+    # the few days either side of the actual changeover -- not worth a
+    # third entry for that. workflow_dispatch below covers any manual/
+    # off-schedule run, including testing before the season starts.
+    - cron: "0 12 * 9,10 2"
+    - cron: "0 13 * 11,12,1,2 2"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Never run two weekly updates on top of each other (a manual dispatch
+# racing the schedule, say) -- queue instead of clobbering.
+concurrency:
+  group: weekly-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run weekly update
+        run: python scripts/weekly_update.py
+
+      - name: Commit and push updated JSON
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+          git add data/output/player_advanced_stats.json
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Weekly update: $(date -u +'%Y-%m-%d')"
+          git push

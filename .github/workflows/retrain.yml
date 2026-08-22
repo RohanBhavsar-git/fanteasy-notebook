@@ -1,0 +1,60 @@
+name: Retrain Model
+
+# workflow_dispatch only, NEVER scheduled -- this is the expensive job
+# (fetches all historical seasons from scratch and walk-forward-validates
+# the point model). Keeping it manual keeps the model fixed between
+# retrains, so weekly-update.yml's week-to-week output changes come from
+# new data, not a moving model. See scripts/retrain.py's module docstring
+# for exactly what this computes and what it deliberately doesn't
+# recompute every run (the CQR floor/ceiling widening constants).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Never run two retrains on top of each other.
+concurrency:
+  group: retrain
+  cancel-in-progress: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    # Fetching 8 seasons of play-by-play from scratch plus walk-forward
+    # validation across ~2 seasons x 4 positions is the most expensive
+    # job in this pipeline -- generous headroom over the ~10-15 min a
+    # local run against warm caches takes, since a cold CI runner has to
+    # fetch everything over the network first.
+    timeout-minutes: 90
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Retrain model
+        run: python scripts/retrain.py
+
+      - name: Report model artifact size
+        run: ls -lh models/fanteasy_model.joblib
+
+      - name: Commit and push model artifact
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+          git add models/fanteasy_model.joblib
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Retrain model: $(date -u +'%Y-%m-%d')"
+          git push

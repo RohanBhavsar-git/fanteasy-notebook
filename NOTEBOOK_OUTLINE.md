@@ -3,9 +3,12 @@
 A rubric for building the data pipeline that feeds the dashboard's "advanced analytics" panels. The deliverable is a single JSON file (`player_advanced_stats.json`) that the dashboard fetches on load.
 
 > **Updated August 2026.** The nflverse client changed from `nfl_data_py` (deprecated)
-> to `nflreadpy`. Phases 1 and 2a are complete and verified. Phases 2b-8 are still
-> design sketches written before anything ran — treat their snippets as intent, not
-> tested code, and check `PROJECT_CONTEXT.md`'s Verification status table.
+> to `nflreadpy`. Phases 1, 2a, 2b, 3', 6, 6.5, 7, and 8 are complete and verified
+> (Phase 6 investigated and deliberately not shipped as a model — see its section).
+> Phases 4-5 (radar/heatmap) are still design sketches written before anything ran —
+> treat those two sections' snippets as intent, not tested code. Check
+> `PROJECT_CONTEXT.md`'s Verification status table before treating any other claim
+> in this file as settled either.
 >
 > **`PHASE_2B_6_SPEC.md` (repo root) supersedes the Phase 2 and Phase 6 sections
 > below.** It carries the point-in-time correctness rules, the expected-fantasy-points
@@ -37,7 +40,7 @@ The dashboard already has hooks waiting to consume this file — search `// Hook
 | **`scikit-learn`** | Pulled in as `lightgbm`'s sklearn-wrapper dependency (`LGBMRegressor`), not for role classification — that idea was dropped, see Phase 3'. |
 | **`xgboost`** or **`lightgbm`** | For the custom projection model. Tree-based handles tabular fantasy data well. |
 | **`matplotlib` / `seaborn`** | Only for your own EDA — the dashboard renders everything client-side. |
-| **GitHub Actions** | Schedule the notebook to run weekly (Tuesday morning after MNF stats post) and commit the JSON. |
+| **GitHub Actions** | Two workflows, not a single scheduled notebook run — see Phase 8. `weekly-update.yml` runs Tuesday mornings (after MNF stats post) and commits the JSON; `retrain.yml` is manual-only. |
 
 Don't bother with PFF/Sportradar paid APIs unless you specifically want contested-catch% or YPRR. Everything else is in nflverse.
 
@@ -135,43 +138,61 @@ That stack is what a mid-to-senior data scientist would build today. Ship those 
 
 ## Project structure
 
+Updated to match what actually exists as of Phase 8 (the original sketch below
+predated Phase 1 and named files that were never built this way — `src/`'s
+actual module list, the notebook names, and the two-workflow `.github/` layout
+all differ from that first guess; this is the real structure):
+
 ```
 fanteasy-notebook/
 ├── notebooks/
-│   ├── 01_data_ingestion.ipynb       # Pull nflverse + Sleeper data
-│   ├── 02_feature_engineering.ipynb  # Compute per-player aggregates
-│   ├── 03_usage_trends.ipynb         # Usage trend signal (Phase 3' -- role classification was dropped)
-│   ├── 04_radar_metrics.ipynb        # Build 0-100 radar values
-│   ├── 05_heatmap_zones.ipynb        # Field-zone frequency tables
-│   ├── 06_projection_model.ipynb     # Train + predict your custom model
-│   └── 07_export_json.ipynb          # Assemble final player_advanced_stats.json
+│   ├── 01_data_ingestion.ipynb   # Phase 1
+│   ├── 02_custom_scoring.ipynb   # Phase 2a
+│   ├── 03_usage_features.ipynb   # Phase 2b steps 1-5
+│   ├── 04_usage_trends.ipynb     # Phase 3'
+│   └── 07_export_json.ipynb      # Phase 7 (manual/exploratory export -- weekly-update.yml
+│                                  #           is the automated path now, see Phase 8)
 ├── src/
-│   ├── ingest.py        # Reusable data-pull functions
-│   ├── features.py      # Feature computation
-│   ├── usage.py         # Usage/efficiency features + trend signal (Family 7 -- replaces role classification)
-│   ├── radar.py         # Radar metric normalization
-│   ├── heatmap.py       # Heatmap zone builders
-│   ├── projection.py    # Model training + inference
-│   └── export.py        # JSON assembly
+│   ├── ingest.py         # Phase 1 -- data-pull functions, all cached to data/raw/
+│   ├── features.py       # Phase 2a -- custom scoring engine
+│   ├── usage.py          # Phase 2b + 3' -- usage/efficiency features + trend signal (Family 7)
+│   ├── model.py           # Phase 6 -- walk-forward validation, quantile models, CQR
+│   ├── simulate.py        # Phase 6.5 -- game-environment + season simulation
+│   ├── export.py          # Phase 7 -- JSON assembly
+│   ├── pipeline.py        # Phase 8 -- shared fetch/score/feature orchestration
+│   └── artifacts.py       # Phase 8 -- model artifact save/load
+│   # radar.py / heatmap.py (Phases 4-5) not built yet -- see the phase table above
+├── scripts/                # Phase 8 -- CI entry points, no notebook execution in CI
+│   ├── retrain.py          # .github/workflows/retrain.yml calls this
+│   └── weekly_update.py    # .github/workflows/weekly-update.yml calls this
+├── models/                 # Phase 8 -- gitignored except the one committed artifact
+│   └── fanteasy_model.joblib
 ├── data/
-│   ├── raw/             # Downloaded play-by-play, stats (gitignored)
-│   ├── processed/       # Cached features
+│   ├── raw/              # Downloaded play-by-play, stats (gitignored)
+│   ├── processed/        # Cached features (gitignored)
 │   └── output/
-│       └── player_advanced_stats.json
+│       └── player_advanced_stats.json   # the one file data/ commits
 ├── tests/
-│   ├── test_features.py
-│   └── test_export.py
+│   ├── test_no_leakage.py
+│   ├── test_model.py
+│   ├── test_simulate.py
+│   ├── test_trend.py
+│   ├── test_export.py
+│   ├── test_pipeline.py    # Phase 8
+│   └── test_artifacts.py   # Phase 8
 ├── .github/workflows/
-│   └── weekly_update.yml  # Run notebook, commit JSON
+│   ├── retrain.yml         # workflow_dispatch only -- train + walk-forward validate
+│   └── weekly-update.yml   # Tuesdays in-season + workflow_dispatch -- inference only
 ├── requirements.txt
-├── .venv/               # local environment, gitignored
+├── .venv/                # local environment, gitignored
+├── CLAUDE.md / PROJECT_CONTEXT.md / NOTEBOOK_OUTLINE.md / PHASE_2B_6_SPEC.md
 └── README.md
 ```
 
 **Local environment:** Python 3.12.9 in `.venv`, VS Code with the Microsoft Python
 and Jupyter extensions. Deliberately not 3.14 — SHAP and MLflow lag new Python
-releases, and local should match CI. The Phase 8 workflow below still says `3.11`
-and needs bumping to `3.12`.
+releases, and local should match CI. Both Phase 8 workflows pin `3.12`, matching
+local — the version mismatch noted in earlier drafts of this doc is resolved.
 
 Notebooks for exploration → modules for reusable code → CI for automation. Production code lives in `src/`; notebooks just orchestrate and visualize.
 
@@ -587,47 +608,69 @@ Aim to keep the file under ~2 MB (1500 active players × ~1 KB each). The dashbo
 
 ## Phase 8 — Deployment
 
+**Done.** The sections below described the plan before anything was built;
+what actually shipped is two separate GitHub Actions workflows, not the
+single notebook-execution sketch originally drafted here — see
+`PROJECT_CONTEXT.md`'s **Phase 8 findings** for the full reasoning,
+verification results, and disclosed limitations. Kept below for the parts
+that turned out right (hosting the JSON in the same repo) and as a record
+of what changed and why.
+
 ### Hosting the JSON
 
-Two options:
+Two options were considered:
 
 1. **Commit to the same repo** as `index.html`. Pros: free, no infra. Cons: bloats git history with weekly binary diffs.
 2. **GitHub Pages separate branch** or **a release artifact**. Cleaner but slightly more setup.
 
-I'd start with option 1 — commit the JSON to a `data/` folder alongside index.html. Update the dashboard to fetch:
+Option 1 shipped — `data/output/player_advanced_stats.json` is committed
+alongside `index.html` (see `.gitignore`'s `data/output/` exception). The
+"bloats git history" concern turned out smaller in practice than expected
+at this project's scale (one JSON file, weekly at most, no other binary
+churn) — not revisited.
 
-```js
-const advUrl = 'https://rohanbhavsar-git.github.io/fanteasystats/data/player_advanced_stats.json';
-state.advancedStats = await fetchJSON(advUrl).then(j => j.players).catch(() => null);
-```
+### Automation — two workflows, not one
 
-### Weekly automation
+The single "run the notebook, commit the JSON" sketch originally drafted
+here doesn't fit once the projection model itself needs training: running
+`jupyter nbconvert --execute notebooks/07_export_json.ipynb` on a schedule
+would retrain fresh LightGBM models on every single weekly run, meaning
+week-to-week output changes would come from BOTH new data AND a moving
+model with no way to tell which caused a given swing. Splitting training
+from inference fixes this: the model stays fixed between manual retrains,
+so `weekly-update.yml`'s output changes only ever reflect new data.
 
-GitHub Actions can run the notebook every Tuesday morning:
+- **`.github/workflows/retrain.yml`** — `workflow_dispatch` only, never
+  scheduled (this is the expensive job: fetches all `HISTORICAL_SEASONS`
+  from scratch, walk-forward-validates against baselines, trains final
+  no-holdout models). Calls `scripts/retrain.py`. Commits
+  `models/fanteasy_model.joblib` (a `.gitignore` exception, same pattern
+  as the JSON) — **7.57 MB** as of the first local verification run, not a
+  git-bloat concern at this workflow's manual/infrequent frequency.
+- **`.github/workflows/weekly-update.yml`** — Tuesdays in-season (two cron
+  entries to approximate 8am ET across the DST boundary) plus
+  `workflow_dispatch`. Inference only: loads the committed artifact,
+  fetches ONLY the current season, predicts the upcoming week, commits
+  the regenerated JSON. Never retrains. Calls `scripts/weekly_update.py`.
 
-```yaml
-# .github/workflows/weekly_update.yml
-name: Weekly Update
-on:
-  schedule:
-    - cron: '0 12 * * 2'  # Tuesdays 8am ET = 12pm UTC
-  workflow_dispatch:       # Allow manual triggers
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }   # match local .venv
-      - run: pip install -r requirements.txt
-      - run: jupyter nbconvert --to notebook --execute notebooks/07_export_json.ipynb
-      - run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add data/player_advanced_stats.json
-          git commit -m "Weekly update: $(date +'%Y-%m-%d')" || echo "No changes"
-          git push
-```
+Both workflows: Python 3.12 (matching local, not the `3.11` this doc
+originally specified), `contents: write` permission, `pytest -q` as a
+required step BEFORE the real work runs (a failing test suite aborts the
+job before anything gets committed), and every fetch/validation failure
+raises rather than degrading silently — a partial or stale JSON/artifact
+is never committed, matching this project's "fail loudly" convention.
+
+The one piece of real design work Phase 8 needed beyond "wire up two YAML
+files": `weekly-update.yml`'s "current season only" fetch scope can't by
+itself supply what `add_rolling_features` needs from the season BEFORE the
+one being predicted (`prev_season_*`) or what `get_export_candidates`
+needs (every player who's ever appeared). `retrain.yml` solves this by
+embedding a small `history_seed` — a trimmed 2-completed-season slice of
+raw feature-input columns, not the full 8-season table — in the artifact
+itself. See `PROJECT_CONTEXT.md`'s **Phase 8 findings** for the full
+mechanism and two disclosed limitations this accepts (candidate-universe
+freshness bounded by retrain cadence; `xfp` running noisier in a season's
+first few weeks under weekly-only inference).
 
 ---
 

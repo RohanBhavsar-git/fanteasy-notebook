@@ -35,8 +35,21 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > changing, which is what a trend signal is for. The 3-week EWM window
 > (already `EWM_HALFLIFE`, reused rather than re-derived) was validated
 > empirically against 4- and 5-week alternatives before being kept — see
-> **Phase 3' findings** below. See **Verification status** near the end
-> before treating any pipeline claim as settled.
+> **Phase 3' findings** below. Phase 8 (automation) is done — **two**
+> GitHub Actions workflows, not one: `retrain.yml` (`workflow_dispatch`
+> only, never scheduled) fetches all historical seasons, walk-forward-
+> validates, and commits a model artifact; `weekly-update.yml` (Tuesday
+> mornings in-season plus `workflow_dispatch`) is inference-only — it
+> never retrains, loads the committed artifact, fetches only the current
+> season, and commits the regenerated JSON. Verified end-to-end locally
+> against real cached data before either workflow's first real run — see
+> **Phase 8 findings** below for the mechanism (a `history_seed` embedded
+> in the artifact is what makes "current season only" possible at all),
+> the artifact size, and two disclosed limitations (a candidate universe
+> that's only as fresh as the last retrain; `xfp` running noisier in a
+> season's first few weeks under weekly-only inference). See
+> **Verification status** near the end before treating any pipeline claim
+> as settled.
 
 ---
 
@@ -234,7 +247,7 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 | 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. Step 8 (quantile floor/ceiling models + SHAP) is done: coverage is measured and honestly overconfident (67-75% actual vs. 80% target for the 10th-90th interval), and SHAP shows nothing that looks like a leak. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
 | 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Steps 9-10 **done** (`src/simulate.py` — game-environment sampling, matchup + season simulation, playoff-qualification odds) — see **Phase 6.5 findings**. Validated against 204 real historical matchups and 8 season-snapshot combinations: calibration is reasonable where there's enough data to judge it in both. Untuned rho=0.35 sensitivity for playoff odds is small (~0.7pt mean, ~3pt max across rho 0.2-0.5). Championship/bracket-round odds are a separate, not-yet-started piece of work. |
 | 7 | JSON export — assemble `player_advanced_stats.json` | **Done** — `src/export.py` + `07_export_json.ipynb`. Predicts the real upcoming week (2026 Wk1) by reusing the existing point-in-time-safe feature pipeline on a stub row, not new future-facing logic. 300 players (2026 league is `pre_draft` as of this run, so scope is top-300 by projection until the real draft happens — picks up real rosters automatically on a re-run, no code change needed), 219 KB (grew from 132 KB after Phase 3''s `trend` key was added), crosswalk match rate 98.99%. `trend` (Phase 3') is now a real per-player key, entirely null in the current pre-draft/Wk1 export by construction (no in-season games yet) — will populate from week 6 onward once real games exist. `radar`/`heatmap` (Phases 4-5) can still slot in as new per-player keys later without restructuring anything. |
-| 8 | GitHub Actions weekly automation | Not started |
+| 8 | GitHub Actions automation | **Done** — two workflows, not one: `.github/workflows/retrain.yml` (train + validate, `workflow_dispatch` only) and `.github/workflows/weekly-update.yml` (inference only, Tuesdays in-season + `workflow_dispatch`). See **Phase 8 findings** below. |
 
 Notebooks are kept single-purpose: `01_data_ingestion.ipynb` does ingestion only,
 `02_custom_scoring.ipynb` does scoring only. Exploration and debugging belong in a
@@ -545,6 +558,142 @@ Each remaining week's matchups are simulated together in one `sample_player_week
 
 ---
 
+## Phase 8 findings
+
+Two GitHub Actions workflows, not one — `.github/workflows/retrain.yml`
+(`workflow_dispatch` only, never scheduled) and
+`.github/workflows/weekly-update.yml` (Tuesdays in-season plus
+`workflow_dispatch`) — backed by `scripts/retrain.py` / `scripts/
+weekly_update.py` and two new modules, `src/pipeline.py` (shared
+fetch-score-feature orchestration, factored out of what
+`02_custom_scoring.ipynb`/`03_usage_features.ipynb` already do cell by
+cell) and `src/artifacts.py` (model artifact save/load). Both workflows
+were verified end-to-end against real cached data BEFORE either one's
+first real GitHub Actions run — see the Verification status table.
+
+**The core design problem: "fetch current season only" and "the model
+needs last season's data" are in tension, and the resolution is a small
+embedded history seed, not a compromise on either.** `add_rolling_features`
+needs `prev_season_*` (last season's full-season average) and
+`get_export_candidates` needs every player who's ever appeared, for ANY
+prior season — neither is available from a bare current-season fetch,
+which is all `weekly-update.yml` does (ephemeral runners have no
+persistent `data/raw/` to be incremental against, so there's nothing to
+avoid re-fetching except by not fetching multi-season history at all
+during a weekly run). The fix: `retrain.yml` embeds a `history_seed` in
+the artifact — a trimmed slice of the most recent `HISTORY_SEED_SEASONS_BACK`
+(2) completed seasons' RAW feature-input columns only (`src/pipeline.py`'s
+`HISTORY_SEED_COLUMNS`: `player_id`/`position`/`team`/`season`/`week`/
+`custom_points` + every `ROLLING_SOURCE_COLUMNS` entry — NOT the full
+~340-column feature table). `weekly_update.py` concatenates this seed with
+the current season's freshly-fetched raw features and a target-week stub
+row, then reuses `src/export.py::build_target_week_features` COMPLETELY
+UNMODIFIED to run `add_context_features`/`add_rolling_features`/
+`add_trend_features` over the combined frame — the exact point-in-time
+mechanism the original single Phase 7 export already used for a full
+8-season table, just with a much smaller "historical" base. Verified
+directly: `build_feature_table([2024, 2025])`'s rolling outputs for 2025
+match the full `build_feature_table([2018..2025])`'s 2025 rows on every
+one of the ~170 rolling columns EXCEPT `xfp`/`fp_over_expected` and their
+`_ewm3`/`_s2d`/`_vol` derivatives (see the xFP caveat below) — 2 seasons of
+seed is enough for everything that only needs "one season back" (`prev_season_*`)
+or "this season's own weeks" (`_ewm3`/`_s2d`/`_vol` for every other feature).
+
+**Two real, disclosed limitations this design accepts rather than hides**
+(both are in the exported JSON's `meta.caveats` under weekly-only runs,
+`WEEKLY_EXTRA_CAVEATS` in `scripts/weekly_update.py`):
+- **The candidate universe and `prev_season_*` are only as fresh as the
+  last retrain's `history_seed`.** A player absent from both the seed's 2
+  seasons and the current season isn't a projection candidate until the
+  next retrain re-seeds with newer history. In practice this only affects
+  players who haven't played an NFL snap in 2+ years — a real edge case
+  (a comeback after a long injury/retirement absence), not a routine one.
+- **`xfp`/`fp_over_expected` run noisier in the first few weeks of a
+  season under weekly-only inference.** `add_xfp_features`'s bucket rate
+  table is an expanding window over whatever `pbp` it's given (already
+  documented as "a two-season compromise, not a permanent design" even in
+  the FULL-history case — see the design decisions below); fed only the
+  CURRENT season's own plays during weekly inference, an early week's rate
+  table has just that week's few hundred plays to average, not the
+  multi-season history `retrain.py` trains the model against. This is a
+  genuine train/serve skew on a handful of the ~180 model features (xfp's
+  RB/WR/TE-only rolled versions), bounded and self-correcting — it
+  converges toward normal as the season accumulates its own sample — not
+  fixed here, because a real fix means feeding this call multiple prior
+  seasons' `pbp` too, exactly the fetch cost "current season only" exists
+  to avoid. `src/pipeline.py::build_raw_features`'s docstring has the full
+  mechanism.
+
+**`retrain.py` deliberately does NOT re-derive the CQR floor/ceiling
+widening constants on every run.** Doing that properly needs walk-forward
+QUANTILE predictions across the ENTIRE multi-season history (calibration
+= every fold before the eval window, not just the eval window itself) —
+the single most expensive computation in this whole pipeline (see the CQR
+section above: it required its own dedicated analysis pass). Unlike
+point-MAE-vs-baselines, that constant doesn't meaningfully drift retrain
+to retrain (no hyperparameter tuning happens anywhere in this pipeline, so
+what it's correcting for doesn't change either). `CQR_WIDEN_BY_10_90` in
+`src/export.py` is carried into the artifact as-is; recomputing it is a
+deliberate, separate, manual step, not something the automated retrain
+does.
+
+**Bug caught while wiring this up: `src/pipeline.py::build_weekly_scored`
+initially skipped `add_pick_six_column`.** `pass_int_td` is the one active
+scoring rule with no weekly-stats column — pick-sixes have to be derived
+from `pbp` — and this went unnoticed until `compute_custom_score` printed
+its own "Non-zero scoring rules with no column mapping: ['pass_int_td']"
+warning on the first real run. Fixed by calling `add_pick_six_column`
+before `compute_custom_score`, matching `02_custom_scoring.ipynb`'s own
+cell order exactly. Regression-checked directly afterward:
+`build_weekly_scored([2025])`'s `custom_points` matches the already-
+validated `weekly_scored.parquet` (built by the notebook) to within
+floating-point noise (max abs diff ~4e-7) across all 6,037 rows.
+
+**A second, smaller bug caught the same way: `HISTORY_SEED_COLUMNS` listed
+`offense_pct` twice** (once explicitly, once already inside
+`ROLLING_SOURCE_COLUMNS` via `SNAP_OUTPUT_COLUMNS`). Selecting it produced
+a DataFrame with two identically-named columns, which doesn't fail at
+selection time — it fails much later, inside `pd.concat`, with a confusing
+`"Reindexing only valid with uniquely valued Index objects"` error.
+`dict.fromkeys(...)` dedupes while preserving order; a regression test
+(`tests/test_pipeline.py::test_history_seed_columns_has_no_duplicates`)
+locks this down directly rather than trusting it by inspection.
+
+**Local end-to-end verification, before either workflow's first real
+GitHub Actions run:**
+- `python scripts/retrain.py` against warm local caches (`data/raw/`
+  already had all 8 seasons cached) completed cleanly: 45,693-row x
+  346-column feature table, walk-forward performance over the 2024-2025
+  eval window closely matches the already-published Phase 6 numbers (QB
+  6.36 vs. the published 6.38 model MAE; RB 4.17 vs. 4.18; WR 3.95 vs.
+  3.93; TE 3.03 vs. 3.06 — small differences expected, since this script's
+  baseline-comparison convention differs slightly from the original
+  hand-run analysis's, not because anything regressed), and wrote a
+  **7.57 MB** artifact (`models/fanteasy_model.joblib`).
+- `python scripts/weekly_update.py` against that artifact, for the real
+  live 2026 league (`pre_draft`, zero games played): correctly detected
+  target week 1 from the real published schedule, correctly treated the
+  current season's stats/pbp fetch coming back HTTP 404 (nothing published
+  for an unstarted season yet — a real, expected condition, distinguished
+  from a genuine fetch failure via `src/pipeline.py::_is_unpublished_season_error`
+  checking for a 404 specifically, not swallowing connection errors
+  generally) as zero current-season rows rather than crashing, and
+  produced a 300-player, 220,020-byte JSON — matching the shape of the
+  already-committed Phase 7 export (219,330 bytes, 300 players) almost
+  exactly.
+- Full test suite (97 tests: the original 87 plus 10 new — `tests/
+  test_artifacts.py`, `tests/test_pipeline.py`, and additions to `tests/
+  test_model.py` for `train_final_models`/`predict_with_models`) passes.
+
+**Artifact size is not a git-bloat concern at `retrain.yml`'s frequency.**
+7.57 MB, committed only on a manual, infrequent `workflow_dispatch` — not
+on every `weekly-update.yml` run, which never touches `models/`. A few
+retrains a year adding ~7-8 MB each is a trivial cost to git history;
+revisit only if retrain frequency ever becomes routine/scheduled (it
+deliberately isn't).
+
+---
+
 ## Design decisions worth preserving (the "why")
 
 Things that took real conversation to arrive at — a new Claude should NOT re-litigate these unless Rohan explicitly asks:
@@ -596,28 +745,31 @@ assumptions as facts.
 | Custom scorer reproduces league scoring | **Verified** — 100% exact, 0 mismatches across 739 rostered player-weeks (2025 wks 5/8/10/12/15), every position including K |
 | pandas 3.x compatibility | **Verified in practice** — full pipeline runs on pandas 3.0.5 / numpy 2.5.1 |
 | `pfr_player_id` → `gsis_id` join (needed for snap share) | **Verified** — 99.67% match for QB/RB/WR/TE (14,281/14,328 snap-count rows, 2024-2025). The 0.33% miss is fringe/practice-squad players absent from the crosswalk entirely, not a format bug. O-line (T/G/C/OL) and long-snapper (LS) match at 0-18% — `load_ff_playerids()` carries almost no offensive linemen (53 OT, 6 C, 1 T, no `G` category in 12,470 rows) since it's sourced from fantasy-platform rosters and o-linemen are never fantasy-relevant. Out of scope for the projection model regardless (skill positions only), so this doesn't block Phase 2b. |
-| Season/week boundary handling | **Partly verified** — requesting a season nflverse hasn't published (e.g. 2026 in the offseason) 404s with a raw traceback rather than a readable message |
+| Season/week boundary handling | **Partly verified** — requesting a season nflverse hasn't published (e.g. 2026 in the offseason) still 404s with a raw traceback in `src/ingest.py` generally. `src/pipeline.py::build_weekly_scored` now catches exactly this case (verified live: `scripts/weekly_update.py` hit the real 2026 stats_player 404 and correctly degraded to zero current-season rows instead of crashing) — narrowly, for Phase 8's single-current-season caller only, not a general `ingest.py` fix. |
 | xFP (`add_xfp_features()`) reproduces `custom_points` on real plays | **Verified** — per-play scores summed over a player's actual weekly plays matched `custom_points` exactly on 6 of 8 spot-checked player-weeks (2025 Wk10 WR/RB sample); the other 2 differed by exactly −2.00, fully explained by the deliberate two-point-conversion exclusion (see design decisions above) — the only known discrepancy. Caught and fixed one real bug in the process: an early version silently added `0.04 × passing_yards` to every target's score because raw pbp's own play-level `passing_yards` column leaked into the synthetic play frame. |
 | `src/simulate.py` matchup win probability is calibrated in the populated range | **Verified** — tested against 204 real Sleeper matchups (2024 Wk5-17, 2025 Wk1-17). The well-populated 0.2-0.8 probability decile bins (385/408 observations) track the actual rate within ~2-4 points; simulation and naive point-estimate comparison agree on the favorite in 191/204 matchups (93.6%, expected by construction — correlation/variance affect a total's spread, not its mean), so the two are not distinguishable on win-pick accuracy at this sample size, which isn't what this check was revised to test for. See **Phase 6.5 findings**. |
 | `simulate_season()` playoff-qualification probability is calibrated | **Partly verified** — tested on 8 (season, snapshot-week) combinations across the 2 completed seasons available (2024, 2025), 112 nominal team-observations. The best-populated bins (0-10% and 90-100% predicted, 45% of the sample) track the actual rate almost exactly; the middle bins scatter more but every one has only 5-10 observations, where that's expected noise, not a demonstrated bias. The 4 snapshots per season aren't independent of each other (same 14 teams, one realized season), so the true independent sample size is closer to 2 than 112 — suggestive, not a confident confirmation. See **Phase 6.5 findings**. |
 | `rho=0.35` sensitivity for season-long playoff odds | **Verified small** — re-ran every validation snapshot at rho ∈ {0.2, 0.35, 0.5}; mean \|P(rho=0.5) − P(rho=0.2)\| across all 112 (season, snapshot, roster) combinations is 0.0065, max 0.0327. Smaller than the "correlation compounds across weeks" intuition alone would suggest — a season's cumulative win total averages many largely-independent weekly outcomes, which damps how much one shared weekly correlation parameter can move a season-long summary statistic, except for teams sitting on the playoff bubble across most of the remaining schedule. See **Phase 6.5 findings**. |
 | Phase 3' trend window (3 vs. 4 vs. 5-week EWM half-life) | **Verified** — 3 beats 4 and 5 on both hold-rate and correlation with next-week usage, for every one of target_share/carry_share/offense_pct/rz_opportunity_share, over 21,000+ real player-weeks per feature (2018-2025). See **Phase 3' findings**. |
 | Phase 3' trend leakage (`add_trend_features`) | **Verified** — future-truncation and same-week-perturbation tests both pass (`tests/test_no_leakage.py`), same two-pronged pattern used for Family 6's rolling aggregates. |
+| `scripts/retrain.py` runs end-to-end and matches published Phase 6 numbers | **Verified locally** against warm `data/raw/` caches — see **Phase 8 findings**. Not yet run on GitHub Actions infrastructure itself (cold runner, real network fetch of all 8 seasons) — that's the first real `workflow_dispatch` run, still to happen. |
+| `scripts/weekly_update.py` runs end-to-end for a real pre-season week | **Verified locally** against the real live 2026 league and a freshly-retrained artifact — correctly detected target week 1, correctly handled the real "2026 stats not published yet" 404, produced a 300-player JSON matching the already-committed Phase 7 export's shape. See **Phase 8 findings**. Not yet run on GitHub Actions infrastructure itself. |
+| `history_seed` (2 seasons) is sufficient for Family 6 rolling/prev_season_* correctness | **Verified** — `build_feature_table([2024, 2025])`'s 2025 rolling outputs match the full 8-season build's 2025 rows exactly on every `ROLLING_OUTPUT_COLUMNS` entry except `xfp`/`fp_over_expected` and their derivatives (a disclosed, separate, self-correcting gap — see **Phase 8 findings**). |
 
 ## What's outstanding
 
 - **`PHASE_2B_6_SPEC.md`** at the repo root is the working spec for Phases 2b, 6, and 6.5. Fold it into this doc and `NOTEBOOK_OUTLINE.md` once those phases are complete.
-- Bump the Phase 8 CI workflow from Python 3.11 to 3.12
-- **Phase 8 will need incremental season fetching, not a full refetch every run.** `SEASONS` defaults to 2018-2025 (8 seasons) as of the Phase 6 data-volume result — the cached pbp file alone is 142 MB for that range (`data/raw/` is 311 MB total), and a weekly automation job re-downloading all 8 seasons from scratch every run is wasteful and slow. The right shape is closer to "keep 2018-2024 cached as-is, fetch only the current season's new weeks" — not designed yet.
+- **Trigger the first real `retrain.yml` and `weekly-update.yml` `workflow_dispatch` runs on GitHub Actions itself.** Both are verified locally (see **Phase 8 findings**) but haven't yet run on GitHub's actual runners — a cold checkout, real network fetch of all 8 seasons for `retrain.yml`, and the `contents: write` push step are all still unverified outside a local venv.
 - Update `DEFAULT_LEAGUE_ID` in `src/ingest.py` each August when Sleeper rolls the league over
-- Consider a season guard in `ingest.py` so requesting an unpublished season fails with a readable message instead of a 404 traceback
+- **`HISTORICAL_SEASONS` in `scripts/retrain.py`** (currently `2018-2025`, mirroring every other model in this pipeline) needs bumping by hand once nflverse publishes a new season's data — same manual-update pattern as `DEFAULT_LEAGUE_ID`, not automatic.
+- `src/ingest.py`'s fetchers still 404 with a raw traceback for an unpublished season in the general case — only `src/pipeline.py::build_weekly_scored`'s single-current-season path was fixed (see Verification status). A general `ingest.py`-level season guard is still undone, same open item as before Phase 8.
 - Push the latest `index.html` changes to GitHub Pages (all recent work is local)
 - **Activity feed panel** sizing vs matchups panel — layout issue, minor
 - **NFL sidebar** currently shows preseason week labels; should default to last completed regular-season week
 - **Season Leaders panel** on the dashboard is pending replacement
-- **Build out the Python notebook pipeline**, phases 2 through 8
+- **Build out the Python notebook pipeline**, phases 4-5 (radar/heatmap) still not started
 - **Historical champion data** — plan is to maintain a small `champions.json` file by hand for the league's history
-- **Re-run `07_export_json.ipynb` after the 2026 draft.** The league (`DEFAULT_LEAGUE_ID`) was `pre_draft` with zero rostered players when Phase 7 was built, so the committed `player_advanced_stats.json` reflects top-300-by-projection only, not real rosters — no code change needed, just a re-run once the draft happens.
+- **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
 
 ---
 

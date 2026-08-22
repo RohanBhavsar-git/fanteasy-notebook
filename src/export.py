@@ -65,11 +65,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from src.model import FEATURE_COLUMNS, _cast_categoricals
+from src.model import FEATURE_COLUMNS, _cast_categoricals, predict_with_models, train_final_models
 
 logger = logging.getLogger(__name__)
 
@@ -141,8 +140,6 @@ TREND_FEATURE_LABELS = {
     "carry_share": "carry_share",
     "rz_opportunity_share": "red_zone_share",
 }
-
-LGB_BASE_PARAMS = {"verbosity": -1, "random_state": 42}
 
 
 # ==========================================================================
@@ -263,11 +260,15 @@ def predict_target_week(
     fold to hold out against a week that hasn't been played, so this trains
     on everything available, once, rather than walk-forward folds.
 
-    `point` is clipped into [floor, ceiling] after CQR widening: it comes
-    from a SEPARATE model than floor/ceiling, so nothing mathematically
-    guarantees the two agree on their own -- clipping enforces the
-    floor <= point <= ceiling invariant the dashboard depends on, rather
-    than hoping two independently-trained models happen to agree.
+    Training and prediction are delegated to src/model.py's
+    train_final_models/predict_with_models -- the same two functions
+    Phase 8's retrain.yml uses to produce a model artifact and
+    weekly-update.yml uses to predict FROM one (see
+    predict_target_week_from_artifact below). Keeping this function as a
+    thin train-then-predict wrapper over those two, rather than its own
+    parallel fit/predict logic, means the "trained fresh right now" and
+    "trained earlier, loaded from disk" code paths can never quietly
+    diverge in how floor/ceiling get built.
 
     Returns: player_id, position, point, floor, ceiling -- one row per
     (position, player) in combined_features' target week.
@@ -278,43 +279,37 @@ def predict_target_week(
     )
     test_mask = (combined_features["season"] == target_season) & (combined_features["week"] == target_week)
 
-    results = []
-    for position in EXPORT_POSITIONS:
-        pos_train = combined_features[train_mask & (combined_features["position"] == position)]
-        pos_test = combined_features[test_mask & (combined_features["position"] == position)]
-        if pos_test.empty:
-            continue
+    train_df = combined_features[train_mask]
+    test_df = combined_features[test_mask]
+    models = train_final_models(train_df, feature_cols=feature_cols, positions=EXPORT_POSITIONS)
+    return predict_with_models(test_df, models, CQR_WIDEN_BY_10_90, feature_cols=feature_cols)
 
-        reg_params = dict(LGB_BASE_PARAMS, objective="regression")
-        reg_model = lgb.LGBMRegressor(**reg_params)
-        reg_model.fit(pos_train[feature_cols], pos_train["custom_points"])
-        point_raw = reg_model.predict(pos_test[feature_cols])
 
-        q_preds = {}
-        for alpha in (0.10, 0.90):
-            q_params = dict(LGB_BASE_PARAMS, objective="quantile", alpha=alpha)
-            q_model = lgb.LGBMRegressor(**q_params)
-            q_model.fit(pos_train[feature_cols], pos_train["custom_points"])
-            q_preds[alpha] = q_model.predict(pos_test[feature_cols])
+def predict_target_week_from_artifact(
+    combined_features: pd.DataFrame,
+    target_season: int,
+    target_week: int,
+    artifact: dict,
+) -> pd.DataFrame:
+    """
+    Inference-only counterpart to predict_target_week: no training here at
+    all, just predict_with_models against models ALREADY TRAINED and saved
+    by retrain.yml (see src/artifacts.py::load_model_artifact). This is
+    what weekly-update.yml calls -- it keeps the model fixed between
+    retrains, so week-to-week output changes come from new data, not a
+    retrained model.
 
-        floor_raw = np.minimum(q_preds[0.10], q_preds[0.90])
-        ceiling_raw = np.maximum(q_preds[0.10], q_preds[0.90])
-        widen_by = CQR_WIDEN_BY_10_90[position]
-        floor = floor_raw - widen_by
-        ceiling = ceiling_raw + widen_by
-        point = np.clip(point_raw, floor, ceiling)
+    Uses the artifact's OWN feature_columns/cqr_widen_by_10_90 (not this
+    module's FEATURE_COLUMNS/CQR_WIDEN_BY_10_90 constants) -- the artifact
+    is self-describing so a weekly run always matches whatever retrain.yml
+    actually trained, even if this module's constants are edited later.
 
-        results.append(pd.DataFrame({
-            "player_id": pos_test["player_id"].to_numpy(),
-            "position": position,
-            "point": point,
-            "floor": floor,
-            "ceiling": ceiling,
-        }))
-
-    return pd.concat(results, ignore_index=True) if results else pd.DataFrame(
-        columns=["player_id", "position", "point", "floor", "ceiling"]
-    )
+    Returns: same shape as predict_target_week.
+    """
+    feature_cols = artifact["feature_columns"]
+    test_mask = (combined_features["season"] == target_season) & (combined_features["week"] == target_week)
+    test_df = combined_features[test_mask]
+    return predict_with_models(test_df, artifact["models"], artifact["cqr_widen_by_10_90"], feature_cols=feature_cols)
 
 
 # ==========================================================================
@@ -424,11 +419,21 @@ def assemble_player_advanced_stats(
     target_week: int,
     seasons_trained: list[int],
     model_version: str,
+    performance: dict = PERFORMANCE_BY_POSITION,
+    caveats: list = CAVEATS,
 ) -> tuple[dict, dict]:
     """
     Joins everything onto scoped_predictions and crosswalks gsis_id ->
     sleeper_id AT THIS FINAL STEP, since Sleeper's ID is what the JSON is
     keyed by but every upstream computation is in gsis_id space.
+
+    `performance` defaults to this module's PERFORMANCE_BY_POSITION
+    constant (the one-time Phase 6 walk-forward result, for manual/notebook
+    use) but Phase 8's weekly_update.py passes the LOADED ARTIFACT's own
+    `performance` dict instead -- retrain.yml recomputes walk-forward MAE
+    vs. baselines on every run (see scripts/retrain.py), so the exported
+    JSON should report whatever the artifact that produced its predictions
+    actually measured, not a number that could be stale by several retrains.
 
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
@@ -483,8 +488,8 @@ def assemble_player_advanced_stats(
             "week": target_week,
             "model_version": model_version,
             "seasons_trained": seasons_trained,
-            "performance": PERFORMANCE_BY_POSITION,
-            "caveats": CAVEATS,
+            "performance": performance,
+            "caveats": caveats,
         },
         "players": players,
     }

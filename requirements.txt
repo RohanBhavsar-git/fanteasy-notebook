@@ -22,6 +22,10 @@ scikit-learn>=1.3.0        # lgb.LGBMRegressor's sklearn wrapper requires this d
 scipy>=1.11.0               # spearmanr for rank-correlation metrics
 shap>=0.43.0                # walk_forward_predict_selected's fold-internal feature ranking imports this directly
 
+# Phase 8: model artifact persistence (src/artifacts.py) -- already pulled in
+# transitively by scikit-learn, listed explicitly since it's imported directly
+joblib>=1.3.0
+
 # Later phases (uncomment as you get to them):
 # xgboost>=2.0.0             # Phase 6: cross-check against lightgbm
 # optuna>=3.4.0              # Phase 6: hyperparameter tuning
