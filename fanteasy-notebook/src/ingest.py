@@ -536,6 +536,30 @@ def _sleeper_matchups_to_df(raw: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def get_sleeper_rosters(league_id: str, refresh: bool = False) -> list:
+    """
+    Real fantasy rosters — /league/{id}/rosters. One entry per roster_id,
+    including `players` (every sleeper_id on that roster, any slot) and
+    `starters`. A newly-created league returns one empty-`players` entry per
+    roster_id until the draft happens — that's real, current league state,
+    not a fetch failure, so this doesn't raise on an empty players list the
+    way other Sleeper fetchers raise on a fully empty response.
+
+    Kept as the raw list (matches get_sleeper_bracket's convention) since
+    downstream code typically just wants a fast set-membership check over
+    every rostered player_id, not a flattened table.
+    """
+    cache_name = f"sleeper_rosters_{league_id}"
+    if not refresh:
+        cached = _read_cache_json(cache_name)
+        if cached is not None:
+            return cached
+    logger.info(f"Fetching Sleeper rosters for league {league_id}...")
+    data = _sleeper_get(f"{SLEEPER_API}/league/{league_id}/rosters")
+    _write_cache_json(data, cache_name)
+    return data
+
+
 def get_sleeper_bracket(league_id: str, refresh: bool = False) -> list:
     """
     Real playoff bracket — /league/{id}/winners_bracket. Only meaningful
