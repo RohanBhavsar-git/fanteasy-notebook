@@ -4,6 +4,12 @@ data/processed/
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 
+# data/output/ holds the Phase 7 export -- the actual dashboard deliverable,
+# not intermediate cache, so it's committed while raw/processed stay excluded.
+data/output/*
+!data/output/.gitkeep
+!data/output/player_advanced_stats.json
+
 # Python
 __pycache__/
 *.py[cod]
