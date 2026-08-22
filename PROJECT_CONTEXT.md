@@ -125,6 +125,8 @@ These are non-negotiable — they've shaped every decision we've made:
 - League-wide KPI cards (top scorer, biggest blowout, closest game, etc.)
 - Activity feed (transactions, waivers, trades) — real Sleeper data
 - Season Leaders panel (pending replacement per outstanding item)
+- **Usage Trending panel** (Phase 8 round 1) — biggest risers/fallers by target/carry/snap-share trend signal, one row per player showing current share + direction. `red_zone_share` deliberately excluded (hold-rate under 50%, see Phase 3' findings). Honest empty state ("No trend signal yet... populate from Week 6 onward") when `player_advanced_stats.json` hasn't accumulated 5 games this season yet — this is what actually renders as of the 2026 pre-season export.
+- **xFP Regression panel** (Phase 8 round 1) — season `fp_over_expected` leaders/laggards, RB/WR/TE only, explicitly labeled "luck indicator, not a prediction." Pulls from the most recently COMPLETED season, so unlike Usage Trending it already shows real 2025 numbers even in the 2026 pre-season export, not an empty state.
 
 ### Matchups tab
 - Weekly matchup cards with 🏆 winner badge, blowout/nail-biter emoji markers
@@ -169,7 +171,8 @@ These are non-negotiable — they've shaped every decision we've made:
 ### Player Detail page
 - Real 64px headshot hero
 - 4 KPI cards in icon-tile style: Season Pts, Avg/Game (with position rank like "QB7 overall"), Sleeper Proj, Best Week
-- **Position profile panel**: Currently a placeholder card ("Awaiting model output") with a bulleted list of what stats will appear per position once the notebook lands
+- **Opportunity Shares panel** (Phase 8 round 1) — plain snap %/target share/carry share/red-zone share, no interpretation layered on. Carry share and red-zone share are read from the export's `trend.<feature>.current` (no `usage.*` counterpart exists for those two); red-zone share specifically uses the properly-combined `trend.red_zone_share`, not the two separate `usage.rz_target_share_ewm3`/`rz_carry_share_ewm3` (different denominators, can't be summed — see design decisions below). Per-stat empty state ("— · No games yet") when a value is null, not a whole-panel placeholder.
+- **Position profile panel**: Currently a placeholder card ("Awaiting model output") with a bulleted list of what stats will appear per position once the notebook lands — the Opportunity Shares panel above now covers part of what this promised (the plain share numbers); this one is still Phases 4-5's radar, not yet built
 - **Field heatmap panel**: Same placeholder pattern
 - **Weekly Production chart** — real bars, 3 reference lines toggleable via legend:
   - **Season Avg** (dashed gray, on by default) — this player's own avg

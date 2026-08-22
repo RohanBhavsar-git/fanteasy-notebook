@@ -2805,6 +2805,272 @@
       : "Sleeper's own projection is more accurate than this model at every position.";
   }
 
+  // ---- Phase 8 round 1: usage trends, xFP regression, opportunity shares.
+  // All three panels below read from state.advancedStats.players[id], the
+  // same object getMyProj() already reads. Every helper here returns an
+  // honest empty result (null/[]) rather than a fake number when the export
+  // hasn't loaded or doesn't cover a player -- the panels render an
+  // "Awaiting model output" placeholder in that case, same pattern already
+  // used for the Position Profile / Heatmap cards below.
+  function getAdvancedPlayer(playerId) {
+    return state.advancedStats?.players?.[playerId] || null;
+  }
+
+  const TREND_FEATURE_LABELS = { target_share: 'Target Share', carry_share: 'Carry Share', snap_share: 'Snap Share' };
+
+  // Combined usage-trend leaderboard across every player the export covers.
+  // red_zone_share is deliberately excluded here -- PROJECT_CONTEXT.md's
+  // Phase 3' findings measured its hold-rate under 50% even at the
+  // validated window/threshold (a "rise" reverts more often than it holds),
+  // too noisy for a waiver-wire risers/fallers list. Per player, only the
+  // single largest-magnitude signal among target/carry/snap share is kept
+  // (not one row per feature) -- this is meant to answer "who's trending
+  // right now", not "rank every feature separately".
+  function getUsageTrendLeaders(limit) {
+    const players = state.advancedStats?.players;
+    if (!players) return { risers: [], fallers: [] };
+    const rows = [];
+    Object.entries(players).forEach(([playerId, data]) => {
+      const trend = data.trend;
+      if (!trend) return;
+      let best = null;
+      ['target_share', 'carry_share', 'snap_share'].forEach(feat => {
+        const t = trend[feat];
+        if (!t || t.signal == null || !t.direction || t.direction === 'stable') return;
+        if (!best || Math.abs(t.signal) > Math.abs(best.signal)) {
+          best = { feature: feat, current: t.current, signal: t.signal, direction: t.direction };
+        }
+      });
+      if (best) rows.push({ playerId, ...best });
+    });
+    const risers = rows.filter(r => r.direction === 'rising').sort((a, b) => b.signal - a.signal).slice(0, limit);
+    const fallers = rows.filter(r => r.direction === 'falling').sort((a, b) => a.signal - b.signal).slice(0, limit);
+    return { risers, fallers };
+  }
+
+  // Season-long xFP luck leaderboard. RB/WR/TE only by construction -- xfp
+  // has no counterpart for QB passing production (see PROJECT_CONTEXT.md's
+  // design decisions), so every QB row's fp_over_expected is already null
+  // and drops out of `rows` on its own, with no explicit position filter
+  // needed here. fp_over_expected > 0 means scoring ABOVE what opportunity
+  // alone implies -- a luck indicator, not a prediction.
+  function getXfpLeaders(limit) {
+    const players = state.advancedStats?.players;
+    if (!players) return { positive: [], negative: [] };
+    const rows = [];
+    Object.entries(players).forEach(([playerId, data]) => {
+      const xfp = data.xfp;
+      if (!xfp || xfp.fp_over_expected == null) return;
+      rows.push({ playerId, ...xfp });
+    });
+    const positive = rows.filter(r => r.fp_over_expected > 0).sort((a, b) => b.fp_over_expected - a.fp_over_expected).slice(0, limit);
+    const negative = rows.filter(r => r.fp_over_expected < 0).sort((a, b) => a.fp_over_expected - b.fp_over_expected).slice(0, limit);
+    return { positive, negative };
+  }
+
+  function trendRowHtml(r) {
+    const player = state.playersById[r.playerId];
+    if (!player) return '';
+    const rising = r.direction === 'rising';
+    const pct = r.current != null ? (r.current * 100).toFixed(1) + '%' : '—';
+    return `
+      <div class="kpi-card" data-player-id="${r.playerId}" style="cursor: pointer;">
+        <div class="kpi-icon ${rising ? 'trend' : 'target'}">${rising ? '↑' : '↓'}</div>
+        <div class="kpi-content">
+          <div class="kpi-label">${player.name} <span class="pos-badge ${player.position}" style="font-size: 9px; padding: 1px 4px;">${player.position}</span></div>
+          <div class="kpi-value">${pct}</div>
+          <div class="kpi-sub">${TREND_FEATURE_LABELS[r.feature]} · ${player.team || 'FA'}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderUsageTrendingPanel() {
+    const advanced = state.advancedStats;
+    const { risers, fallers } = advanced ? getUsageTrendLeaders(5) : { risers: [], fallers: [] };
+    const hasAny = risers.length || fallers.length;
+
+    let body;
+    if (!advanced) {
+      body = `
+        <div class="pd-placeholder">
+          <div class="pd-placeholder-icon">📈</div>
+          <div class="pd-placeholder-title">Awaiting model output</div>
+          <div class="pd-placeholder-text">
+            Once <code>player_advanced_stats.json</code> loads, this panel will show players whose target, carry,
+            or snap share is running meaningfully above or below their own season baseline.
+          </div>
+        </div>
+      `;
+    } else if (!hasAny) {
+      body = `
+        <div class="pd-placeholder">
+          <div class="pd-placeholder-icon">📈</div>
+          <div class="pd-placeholder-title">No trend signal yet</div>
+          <div class="pd-placeholder-text">
+            Usage trends need at least 5 games played this season and populate from Week 6 onward.
+            Nothing to show until then.
+          </div>
+        </div>
+      `;
+    } else {
+      body = `
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+          <div>
+            <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--success); margin-bottom: 8px;">🔺 Risers</div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              ${risers.length ? risers.map(trendRowHtml).join('') : '<div class="pd-placeholder-text">None right now</div>'}
+            </div>
+          </div>
+          <div>
+            <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--danger); margin-bottom: 8px;">🔻 Fallers</div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              ${fallers.length ? fallers.map(trendRowHtml).join('') : '<div class="pd-placeholder-text">None right now</div>'}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Usage Trending</div>
+          <div class="panel-note">Target/carry/snap share vs. own baseline</div>
+        </div>
+        ${body}
+      </div>
+    `;
+  }
+
+  function xfpRowHtml(r) {
+    const player = state.playersById[r.playerId];
+    if (!player) return '';
+    const positive = r.fp_over_expected > 0;
+    const sign = positive ? '+' : '';
+    const color = positive ? 'var(--success)' : 'var(--danger)';
+    return `
+      <div class="kpi-card" data-player-id="${r.playerId}" style="cursor: pointer;">
+        <div class="kpi-icon ${positive ? 'trend' : 'target'}">🎲</div>
+        <div class="kpi-content">
+          <div class="kpi-label">${player.name} <span class="pos-badge ${player.position}" style="font-size: 9px; padding: 1px 4px;">${player.position}</span></div>
+          <div class="kpi-value" style="color: ${color};">${sign}${r.fp_over_expected.toFixed(1)} pts</div>
+          <div class="kpi-sub">${r.season_actual.toFixed(1)} actual vs. ${r.season_xfp.toFixed(1)} expected</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderXfpPanel() {
+    const advanced = state.advancedStats;
+    const { positive, negative } = advanced ? getXfpLeaders(5) : { positive: [], negative: [] };
+    const hasAny = positive.length || negative.length;
+
+    let body;
+    if (!advanced) {
+      body = `
+        <div class="pd-placeholder">
+          <div class="pd-placeholder-icon">🎲</div>
+          <div class="pd-placeholder-title">Awaiting model output</div>
+          <div class="pd-placeholder-text">
+            Once <code>player_advanced_stats.json</code> loads, this panel will show RB/WR/TE running furthest
+            above or below what their opportunities alone would predict.
+          </div>
+        </div>
+      `;
+    } else if (!hasAny) {
+      body = `
+        <div class="pd-placeholder">
+          <div class="pd-placeholder-icon">🎲</div>
+          <div class="pd-placeholder-title">No games played yet</div>
+          <div class="pd-placeholder-text">
+            xFP compares actual production to opportunity across the completed season.
+            Nothing to show until real games are on the board.
+          </div>
+        </div>
+      `;
+    } else {
+      body = `
+        <div style="display: flex; flex-direction: column; gap: 6px;">
+          <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--success);">Over Expected (lucky)</div>
+          ${positive.length ? positive.map(xfpRowHtml).join('') : '<div class="pd-placeholder-text">None</div>'}
+          <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--danger); margin-top: 8px;">Under Expected (unlucky)</div>
+          ${negative.length ? negative.map(xfpRowHtml).join('') : '<div class="pd-placeholder-text">None</div>'}
+        </div>
+      `;
+    }
+
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">xFP Regression</div>
+          <div class="panel-note">Luck indicator, not a prediction · RB/WR/TE only</div>
+        </div>
+        ${body}
+      </div>
+    `;
+  }
+
+  // Player Detail's plain opportunity-share readout -- no radar, no
+  // percentile, no interpretation, just the trailing numbers themselves.
+  // Snap %/Target Share come from the export's `usage` block; Carry Share
+  // and Red-Zone Share have no `usage.*` counterpart (the export only
+  // curated a subset of rolling columns there) so they're read from
+  // `trend.<feature>.current` instead -- the SAME underlying _ewm3 value,
+  // just exposed under a different key. Red-Zone Share specifically uses
+  // trend.red_zone_share (the properly combined rz_opportunity_share
+  // metric), not usage.rz_target_share_ewm3/rz_carry_share_ewm3 separately
+  // -- those two have different denominators and can't be added together,
+  // see PROJECT_CONTEXT.md's design decisions.
+  function renderOpportunitySharesPanel(p) {
+    const advanced = getAdvancedPlayer(p.player_id);
+    if (!advanced) {
+      return `
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Opportunity Shares</div>
+            <div class="panel-note">Trailing usage, most recent games</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">📋</div>
+            <div class="pd-placeholder-title">Awaiting model output</div>
+            <div class="pd-placeholder-text">
+              Once <code>player_advanced_stats.json</code> covers this player, snap %, target share, carry share,
+              and red-zone share will appear here.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    const usage = advanced.usage || {};
+    const trend = advanced.trend || {};
+    const shareCard = (icon, iconClass, label, value, sub) => `
+      <div class="injury-stat-card">
+        <div class="injury-stat-icon ${iconClass}">${icon}</div>
+        <div class="injury-stat-content">
+          <div class="injury-stat-label">${label}</div>
+          ${value != null
+            ? `<div class="injury-stat-value">${(value * 100).toFixed(1)}%</div><div class="injury-stat-sub">${sub}</div>`
+            : `<div class="injury-stat-value" style="color: var(--text-muted);">—</div><div class="injury-stat-sub">No games yet</div>`}
+        </div>
+      </div>
+    `;
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Opportunity Shares</div>
+          <div class="panel-note">Trailing 3-week usage, as of last update</div>
+        </div>
+        <div class="injury-stat-grid">
+          ${shareCard('🏃', 'blue', 'Snap %', usage.offense_pct_ewm3, 'Of offensive snaps')}
+          ${shareCard('🎯', 'purple', 'Target Share', usage.target_share_ewm3, 'Of team targets')}
+          ${shareCard('🔄', 'orange', 'Carry Share', trend.carry_share?.current, 'Of team carries')}
+          ${shareCard('🔴', 'red', 'Red-Zone Share', trend.red_zone_share?.current, 'Of team RZ plays')}
+        </div>
+      </div>
+    `;
+  }
+
   // Cache player database in memory (5MB JSON) — too big for localStorage in some browsers
   let _playerDbCache = null;
   async function fetchPlayerDatabase() {
@@ -4365,7 +4631,19 @@
           </div>
         </div>
       </div>
+
+      <div class="dashboard-grid" style="margin-top: 16px;">
+        ${renderUsageTrendingPanel()}
+        ${renderXfpPanel()}
+      </div>
     `;
+
+    main.querySelectorAll('[data-player-id]').forEach(el => {
+      el.addEventListener('click', () => {
+        state.activePlayerId = el.dataset.playerId;
+        renderView();
+      });
+    });
 
     document.getElementById('prev-week')?.addEventListener('click', () => {
       const weeks = getAvailableWeeks();
@@ -5363,6 +5641,8 @@
           </div>
         </div>
       </div>
+
+      ${renderOpportunitySharesPanel(p)}
 
       <div class="pd-analytics-grid">
         <div class="panel">
