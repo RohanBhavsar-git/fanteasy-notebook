@@ -2,10 +2,13 @@
 FanTeasy Stats -- Phase 7: JSON export.
 
 Produces data/output/player_advanced_stats.json: this league's custom model's
-projection (point/floor/ceiling), a trailing usage snapshot, and a season-long
-xFP/luck summary, for the dashboard to consume -- keyed by Sleeper player_id,
-since Sleeper's ID is the only one the dashboard has (it never sees gsis_id;
-that's an internal, nflverse-side detail of this pipeline).
+projection (point/floor/ceiling), a trailing usage snapshot, a Phase 3'
+usage-trend block (current opportunity share, a normalized trend signal, and
+a rising/falling/stable direction label per player -- see src/usage.py's
+Family 7), and a season-long xFP/luck summary, for the dashboard to consume
+-- keyed by Sleeper player_id, since Sleeper's ID is the only one the
+dashboard has (it never sees gsis_id; that's an internal, nflverse-side
+detail of this pipeline).
 
 Scope: this league's real 2026 rosters, union the top ~300 remaining
 QB/RB/WR/TE by this model's own point projection. K/DST are excluded
@@ -98,6 +101,9 @@ PERFORMANCE_BY_POSITION = {
 CAVEATS = [
     "Sleeper's projections are more accurate than this model at every position.",
     "Floor/ceiling intervals are conformally calibrated; ceilings run conservative.",
+    "The red_zone_share trend signal is real but noisier than snap/target/carry "
+    "share -- red-zone opportunities are low-volume, and a 'rising' read reverts "
+    "more often than it holds even at the validated window and threshold.",
 ]
 
 # A curated subset of ROLLING_OUTPUT_COLUMNS for the `usage` block -- role
@@ -121,6 +127,20 @@ USAGE_EXPORT_COLUMNS = [
     "snap_share_delta_3wk", "rz_target_share_ewm3", "rz_carry_share_ewm3",
     "prev_season_target_share", "prev_season_touch_share", "prev_season_offense_pct",
 ]
+
+# Phase 3' trend block: src/usage.py's internal column-name feature ->
+# the human-readable key the export uses. rz_opportunity_share is renamed
+# rather than reused verbatim because it means something a reader has to
+# infer from Family 4's raw column names (rz_targets + rz_carries over
+# their respective team totals) -- "red_zone_share" says what it is without
+# that context. The others keep their existing names since they're already
+# plain English.
+TREND_FEATURE_LABELS = {
+    "offense_pct": "snap_share",
+    "target_share": "target_share",
+    "carry_share": "carry_share",
+    "rz_opportunity_share": "red_zone_share",
+}
 
 LGB_BASE_PARAMS = {"verbosity": -1, "random_state": 42}
 
@@ -206,7 +226,9 @@ def build_target_week_features(
     set -- the same reason src/model.py's walk_forward_predict casts before
     splitting into folds, not after.
     """
-    from src.usage import ROLLING_SOURCE_COLUMNS, add_context_features, add_rolling_features
+    from src.usage import (
+        ROLLING_SOURCE_COLUMNS, add_context_features, add_rolling_features, add_trend_features,
+    )
 
     stub = candidates.copy()
     stub["season"] = target_season
@@ -217,6 +239,10 @@ def build_target_week_features(
     combined = pd.concat([historical_features, stub], ignore_index=True, sort=False)
     combined = add_context_features(combined, schedule)
     combined = add_rolling_features(combined)
+    # Phase 3' trend signal -- downstream of the model's own feature set
+    # (add_trend_features's outputs are never added to FEATURE_COLUMNS), so
+    # running it here doesn't change what predict_target_week trains on.
+    combined = add_trend_features(combined)
     combined = _cast_categoricals(combined, FEATURE_COLUMNS)
     return combined
 
@@ -303,6 +329,46 @@ def build_usage_snapshot(combined_features: pd.DataFrame, target_season: int, ta
     return combined_features.loc[test_mask, cols].reset_index(drop=True)
 
 
+def build_trend_snapshot(combined_features: pd.DataFrame, target_season: int, target_week: int) -> pd.DataFrame:
+    """
+    Phase 3' trend block, one row per player: for each of
+    TREND_SOURCE_FEATURES, the current (recent, ewm3) opportunity share
+    stated plainly, the normalized trend signal, and its direction label.
+    Same "this IS the model's own input, not a separate computation" note
+    as build_usage_snapshot -- combined_features already has
+    add_trend_features applied (see build_target_week_features).
+
+    "Current" reuses the SAME <feat>_ewm3 column already exposed under
+    USAGE_EXPORT_COLUMNS (e.g. target_share_ewm3) -- there's no raw
+    this-week value to show for a not-yet-played target week, so "current"
+    honestly means "most recent known," the same recency estimate the
+    signal itself is built from. Null at week 1 of a season for the same
+    reason every other in-season rolling column is null there (nothing
+    played yet this season) -- not a bug, see add_rolling_features's
+    season-boundary docstring note.
+
+    The <feat>_ewm3 columns are renamed to trend_<feat>_current on the way
+    out -- target_share_ewm3 and offense_pct_ewm3 are ALSO already columns
+    on the separate `usage` frame (USAGE_EXPORT_COLUMNS), and
+    assemble_player_advanced_stats merges both onto the same row. Returning
+    them under the same name would collide on that merge and silently
+    become target_share_ewm3_x/_y instead of raising -- renamed here so
+    there's nothing to collide with, rather than relying on callers to get
+    the merge order right forever.
+    """
+    from src.usage import TREND_SOURCE_FEATURES
+
+    test_mask = (combined_features["season"] == target_season) & (combined_features["week"] == target_week)
+    cols = (
+        ["player_id"]
+        + [f"{f}_ewm3" for f in TREND_SOURCE_FEATURES]
+        + [f"{f}_trend_signal" for f in TREND_SOURCE_FEATURES]
+        + [f"{f}_trend_direction" for f in TREND_SOURCE_FEATURES]
+    )
+    out = combined_features.loc[test_mask, cols].reset_index(drop=True)
+    return out.rename(columns={f"{f}_ewm3": f"trend_{f}_current" for f in TREND_SOURCE_FEATURES})
+
+
 def build_xfp_summary(historical_features: pd.DataFrame, xfp_season: int) -> pd.DataFrame:
     """
     Real, completed-season xFP vs. actual custom_points, summed over
@@ -351,6 +417,7 @@ def get_export_scope(
 def assemble_player_advanced_stats(
     scoped_predictions: pd.DataFrame,
     usage: pd.DataFrame,
+    trend: pd.DataFrame,
     xfp_summary: pd.DataFrame,
     crosswalk: pd.DataFrame,
     target_season: int,
@@ -367,8 +434,11 @@ def assemble_player_advanced_stats(
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
     not just assumed.
     """
+    from src.usage import TREND_SOURCE_FEATURES
+
     cw = crosswalk.dropna(subset=["gsis_id", "sleeper_id"]).drop_duplicates(subset=["gsis_id"])
     merged = scoped_predictions.merge(usage, on="player_id", how="left")
+    merged = merged.merge(trend, on="player_id", how="left")
     merged = merged.merge(xfp_summary, on="player_id", how="left")
     n_scoped = len(merged)
     merged = merged.merge(cw[["gsis_id", "sleeper_id"]], left_on="player_id", right_on="gsis_id", how="inner")
@@ -385,6 +455,17 @@ def assemble_player_advanced_stats(
             "usage": {
                 col: (None if pd.isna(row[col]) else round(float(row[col]), 4))
                 for col in USAGE_EXPORT_COLUMNS
+            },
+            "trend": {
+                TREND_FEATURE_LABELS[feat]: {
+                    "current": (
+                        None if pd.isna(row[f"trend_{feat}_current"])
+                        else round(float(row[f"trend_{feat}_current"]), 4)
+                    ),
+                    "signal": None if pd.isna(row[f"{feat}_trend_signal"]) else round(float(row[f"{feat}_trend_signal"]), 3),
+                    "direction": None if pd.isna(row[f"{feat}_trend_direction"]) else row[f"{feat}_trend_direction"],
+                }
+                for feat in TREND_SOURCE_FEATURES
             },
             "xfp": {
                 "season_xfp": None if pd.isna(row.get("season_xfp")) else round(float(row["season_xfp"]), 2),

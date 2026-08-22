@@ -27,9 +27,16 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > Rho sensitivity for season-long playoff odds is small (~0.7pt mean
 > across rho 0.2-0.5) — smaller than the compounding intuition alone
 > would suggest, for a reason documented there. Championship/bracket-
-> round odds are a separate, not-yet-started piece of work — see
-> **Verification status** near the end before treating any pipeline
-> claim as settled.
+> round odds are a separate, not-yet-started piece of work. Phase 3'
+> (usage trend signal — `src/usage.py` Family 7) is done, replacing the
+> original Phase 3 role-classification idea in `NOTEBOOK_OUTLINE.md`
+> outright rather than deferring it: a role label forces every player into
+> one bucket of a fixed set and says nothing about whether that role is
+> changing, which is what a trend signal is for. The 3-week EWM window
+> (already `EWM_HALFLIFE`, reused rather than re-derived) was validated
+> empirically against 4- and 5-week alternatives before being kept — see
+> **Phase 3' findings** below. See **Verification status** near the end
+> before treating any pipeline claim as settled.
 
 ---
 
@@ -80,7 +87,7 @@ These are non-negotiable — they've shaped every decision we've made:
 - **pandas** — tabular data
 - **pyarrow** — required twice over: `to_parquet()` for the local cache, and
   Polars `.to_pandas()` for the conversion boundary
-- **Later phases**: scikit-learn (role clustering), XGBoost/LightGBM (projections), SHAP (explainability), Optuna (hyperparameter tuning), MLflow (experiment tracking)
+- **Later phases**: LightGBM (projections, plus its own sklearn wrapper — `scikit-learn` is a direct dependency of that, not a role-clustering tool; role classification was dropped, see `NOTEBOOK_OUTLINE.md`'s Phase 3'), SHAP (explainability, done), Optuna (hyperparameter tuning, not used — no model in this pipeline is tuned), MLflow (experiment tracking, not used)
 - **Explicitly avoiding**: LLMs, RAG, agents — these are the wrong tools for tabular fantasy regression. Following industry-relevant patterns, not hype.
 
 > **Migration note (Aug 2026):** this project originally specified `nfl_data_py`.
@@ -221,12 +228,12 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 | 1 | Data ingestion — `src/ingest.py` + `01_data_ingestion.ipynb` | **Done** — runs clean, all sources cached to `data/raw/` |
 | 2a | Custom scoring — `src/features.py` + `02_custom_scoring.ipynb` | **Done** — 100% validated against Sleeper's actual results |
 | 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 6-10 (Phase 6 model A/B + quantile/SHAP/CQR, Phase 6.5 game-environment + season simulation) are all done — see **Phase 6 findings** and **Phase 6.5 findings**. Remaining work is Phase 7 (JSON export) and Phase 8 (automation), plus anything beyond this spec's original 10-step list (e.g. championship/bracket odds). |
-| 3 | Role classification — rule-based Pocket Passer / 3-Down Back / Slot / etc. | Not started |
+| 3' | Usage trend signal — replaces role classification (see `NOTEBOOK_OUTLINE.md`'s Phase 3') | **Done** — `src/usage.py` Family 7 (`add_trend_features`, `get_usage_trend_leaders`) + `04_usage_trends.ipynb`. Window (3-week EWM half-life) and direction threshold (z > 0.25) both validated against real hold-vs-revert data, not assumed — see **Phase 3' findings** below. Wired into Phase 7's export as a new `trend` key. |
 | 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
 | 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. Step 8 (quantile floor/ceiling models + SHAP) is done: coverage is measured and honestly overconfident (67-75% actual vs. 80% target for the 10th-90th interval), and SHAP shows nothing that looks like a leak. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
 | 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Steps 9-10 **done** (`src/simulate.py` — game-environment sampling, matchup + season simulation, playoff-qualification odds) — see **Phase 6.5 findings**. Validated against 204 real historical matchups and 8 season-snapshot combinations: calibration is reasonable where there's enough data to judge it in both. Untuned rho=0.35 sensitivity for playoff odds is small (~0.7pt mean, ~3pt max across rho 0.2-0.5). Championship/bracket-round odds are a separate, not-yet-started piece of work. |
-| 7 | JSON export — assemble `player_advanced_stats.json` | **Done** — `src/export.py` + `07_export_json.ipynb`. Predicts the real upcoming week (2026 Wk1) by reusing the existing point-in-time-safe feature pipeline on a stub row, not new future-facing logic. 300 players (2026 league is `pre_draft` as of this run, so scope is top-300 by projection until the real draft happens — picks up real rosters automatically on a re-run, no code change needed), 132 KB, crosswalk match rate 98.99%. `role`/`radar`/`heatmap` (Phases 3-5) can slot in as new per-player keys later without restructuring anything. |
+| 7 | JSON export — assemble `player_advanced_stats.json` | **Done** — `src/export.py` + `07_export_json.ipynb`. Predicts the real upcoming week (2026 Wk1) by reusing the existing point-in-time-safe feature pipeline on a stub row, not new future-facing logic. 300 players (2026 league is `pre_draft` as of this run, so scope is top-300 by projection until the real draft happens — picks up real rosters automatically on a re-run, no code change needed), 219 KB (grew from 132 KB after Phase 3''s `trend` key was added), crosswalk match rate 98.99%. `trend` (Phase 3') is now a real per-player key, entirely null in the current pre-draft/Wk1 export by construction (no in-season games yet) — will populate from week 6 onward once real games exist. `radar`/`heatmap` (Phases 4-5) can still slot in as new per-player keys later without restructuring anything. |
 | 8 | GitHub Actions weekly automation | Not started |
 
 Notebooks are kept single-purpose: `01_data_ingestion.ipynb` does ingestion only,
@@ -260,6 +267,104 @@ The dashboard already has integration hooks waiting. Search `state.advancedStats
 - `prev_season_*` holds last season's full-season average for a core subset of role/opportunity features and does **not** reset at the season boundary the way in-season rolling features do — an entire prior season can't leak forward.
 
 Step 5 (`03_usage_features.ipynb`, exercising the full table) is also done. Phase 6 (projection model) was picked up next, investigated, and concluded rather than shipped — see **Phase 6 findings** below. Steps 8-10 (quantile floor/ceiling, `src/simulate.py`, calibration/playoff-odds) remain open, contingent on what happens with Phase 6 next.
+
+---
+
+## Phase 3' findings
+
+Replaces `NOTEBOOK_OUTLINE.md`'s original Phase 3 (rule-based role
+classification) outright, not just reorders it — see that doc's Phase 3'
+section for why a role label was the wrong shape for this problem. Built
+as `src/usage.py` Family 7 (`add_trend_features`, `get_usage_trend_leaders`),
+validated in `04_usage_trends.ipynb`.
+
+**The window question, settled with data.** Before writing any production
+code: does a usage rise measured over a 3-week EWM half-life actually
+predict the FOLLOWING game's usage staying above season baseline
+("holds"), rather than reverting? Checked against 4- and 5-week windows
+too, for `target_share`, `carry_share`, `offense_pct` (snap share), and a
+new combined `rz_opportunity_share`, on 21,000+ real player-weeks per
+feature (2018-2025, `games_played >= 5` eligibility so 3/4/5 are compared
+on identical rows):
+
+| feature | window | hold-rate | corr with next-week usage |
+|---|---|---|---|
+| target_share | 3 | 0.498 | 0.102 |
+| target_share | 4 | 0.497 | 0.100 |
+| target_share | 5 | 0.496 | 0.099 |
+| carry_share | 3 | 0.412 | 0.212 |
+| carry_share | 4 | 0.410 | 0.207 |
+| carry_share | 5 | 0.408 | 0.204 |
+| offense_pct | 3 | 0.619 | 0.279 |
+| offense_pct | 4 | 0.616 | 0.273 |
+| offense_pct | 5 | 0.615 | 0.270 |
+| rz_opportunity_share | 3 | 0.389 | 0.049 |
+| rz_opportunity_share | 4 | 0.388 | 0.049 |
+| rz_opportunity_share | 5 | 0.387 | 0.048 |
+
+3 wins on **every** feature, on **both** metrics, monotonically (3 > 4 > 5
+throughout) — not a close call decided by cherry-picking a per-feature
+winner. This is also exactly the already-existing `EWM_HALFLIFE` used
+throughout Family 6, so the trend signal reuses the existing `_ewm3`/`_s2d`
+columns for target_share/carry_share/offense_pct directly, with no second,
+competing half-life constant introduced.
+
+**Comparability across players required normalizing by volatility, not
+just picking a window.** The raw `ewm3 − s2d` gap isn't comparable across
+players — a bell-cow RB's `target_share` swings more in absolute
+percentage points than a committee back's, so a fixed raw-gap threshold
+would flag high-volume players more often for no informative reason.
+Dividing by the player's own season-to-date volatility (the already-
+existing `<feat>_vol` expanding-std column) into `signal = gap / vol`
+turned out to matter empirically, not just conceptually: at `z > 0.5`,
+hold-rate reaches 0.71 (target_share) / 0.60 (carry_share) / 0.79
+(offense_pct) — well above the ~0.39-0.62 hold-rate a loose "any positive
+gap" (`z > 0`) threshold gets on the same features. `z > 0.25` was kept as
+`TREND_DIRECTION_THRESHOLD` over `z > 0.5` specifically because `z > 0.5`
+only flags ~1-2% of eligible weeks (too sparse for a riser/faller list
+anyone would actually check weekly), while `z > 0.25` still meaningfully
+beats the `z > 0` baseline and flags a workable ~13-20% of weeks per
+direction.
+
+**Minimum games played: 5, not picked arbitrarily.** Raising the
+eligibility floor from 2 to 8 prior in-season games monotonically improved
+correlation with next-week usage (target_share: 0.085 at ≥2 games vs.
+0.123 at ≥8) — the season-to-date mean/vol a thin-sample player's signal
+divides by are themselves noisy early. 8 games would exclude nearly half
+of every season from ever appearing on a riser/faller list, though, so 5
+was kept as the floor — the same one the window/threshold study above was
+run under, not a second, separately-justified number.
+
+**Honesty note: `rz_opportunity_share` is real but clearly noisier than
+the other three.** Even at the validated window and threshold, its
+hold-rate stays under 50% (0.42 at `z > 0.25`) — a "rise" reverts more
+often than it holds, and averaging the next TWO games instead of one only
+brings it to 0.47. Red-zone opportunities are a low-volume, high-variance
+event category; this wasn't hidden or dropped (it was explicitly asked
+for) but is shipped with an explicit caveat in `src/export.py`'s
+`CAVEATS`, the same honesty pattern already used for "Sleeper's
+projections are more accurate than this model."
+
+**`rz_opportunity_share` itself is new** — Family 4 has `rz_target_share`
+and `rz_carry_share` separately, with different denominators (team RZ
+targets vs. team RZ carries), so they can't be summed into one honest
+combined share directly. Built as `(rz_targets + rz_carries) /
+(team_rz_targets + team_rz_carries)`, rolled with the same halflife=3
+mechanics as `add_rolling_features` — but deliberately kept OUT of
+`ROLLING_SOURCE_COLUMNS`/`FEATURE_COLUMNS`. Adding it there would silently
+make it a new `src/model.py` training feature and retroactively change the
+already-published, already-validated Phase 6 model without anyone asking
+for that — this family is a display/export-layer derived feature,
+downstream of the model, not a new model input.
+
+**Current export state**: the committed `player_advanced_stats.json`'s
+`trend` block is entirely null for every player — expected, not a bug.
+2026 is `pre_draft` and this is Week 1: `games_played == 0` for every stub
+row (nothing has been played yet THIS season), the same reason
+`usage.target_share_ewm3` is already null at week 1 today. Will populate
+naturally from week 6 onward (once real players clear the
+`MIN_GAMES_FOR_TREND` floor) with no code change needed — same pattern as
+Phase 7's own rostered-players note above.
 
 ---
 
@@ -496,6 +601,8 @@ assumptions as facts.
 | `src/simulate.py` matchup win probability is calibrated in the populated range | **Verified** — tested against 204 real Sleeper matchups (2024 Wk5-17, 2025 Wk1-17). The well-populated 0.2-0.8 probability decile bins (385/408 observations) track the actual rate within ~2-4 points; simulation and naive point-estimate comparison agree on the favorite in 191/204 matchups (93.6%, expected by construction — correlation/variance affect a total's spread, not its mean), so the two are not distinguishable on win-pick accuracy at this sample size, which isn't what this check was revised to test for. See **Phase 6.5 findings**. |
 | `simulate_season()` playoff-qualification probability is calibrated | **Partly verified** — tested on 8 (season, snapshot-week) combinations across the 2 completed seasons available (2024, 2025), 112 nominal team-observations. The best-populated bins (0-10% and 90-100% predicted, 45% of the sample) track the actual rate almost exactly; the middle bins scatter more but every one has only 5-10 observations, where that's expected noise, not a demonstrated bias. The 4 snapshots per season aren't independent of each other (same 14 teams, one realized season), so the true independent sample size is closer to 2 than 112 — suggestive, not a confident confirmation. See **Phase 6.5 findings**. |
 | `rho=0.35` sensitivity for season-long playoff odds | **Verified small** — re-ran every validation snapshot at rho ∈ {0.2, 0.35, 0.5}; mean \|P(rho=0.5) − P(rho=0.2)\| across all 112 (season, snapshot, roster) combinations is 0.0065, max 0.0327. Smaller than the "correlation compounds across weeks" intuition alone would suggest — a season's cumulative win total averages many largely-independent weekly outcomes, which damps how much one shared weekly correlation parameter can move a season-long summary statistic, except for teams sitting on the playoff bubble across most of the remaining schedule. See **Phase 6.5 findings**. |
+| Phase 3' trend window (3 vs. 4 vs. 5-week EWM half-life) | **Verified** — 3 beats 4 and 5 on both hold-rate and correlation with next-week usage, for every one of target_share/carry_share/offense_pct/rz_opportunity_share, over 21,000+ real player-weeks per feature (2018-2025). See **Phase 3' findings**. |
+| Phase 3' trend leakage (`add_trend_features`) | **Verified** — future-truncation and same-week-perturbation tests both pass (`tests/test_no_leakage.py`), same two-pronged pattern used for Family 6's rolling aggregates. |
 
 ## What's outstanding
 

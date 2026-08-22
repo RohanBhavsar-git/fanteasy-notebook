@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.export import (  # noqa: E402
     assemble_player_advanced_stats,
     build_target_week_features,
+    build_trend_snapshot,
     build_xfp_summary,
     get_export_candidates,
     get_export_scope,
@@ -129,6 +130,46 @@ def test_build_target_week_features_new_season_row_is_null_in_season_and_carries
     assert stub_row["spread"] == pytest.approx(3.0)  # KC's own signed spread (favored, home spread_line=-3)
 
 
+def test_build_trend_snapshot_renames_ewm3_columns_to_avoid_usage_collision():
+    """
+    target_share_ewm3/offense_pct_ewm3 are ALSO columns on the separate
+    `usage` frame (USAGE_EXPORT_COLUMNS) -- if build_trend_snapshot
+    returned them under that same name, merging both onto the same row in
+    assemble_player_advanced_stats would silently suffix them to _x/_y
+    instead of raising. This checks the rename that prevents it, and that
+    only the target week's rows come back.
+    """
+    combined = pd.DataFrame({
+        "player_id": ["p1", "p1", "p2"],
+        "season": [2025, 2026, 2026],
+        "week": [17, 1, 1],
+        "target_share_ewm3": [0.30, np.nan, 0.25],
+        "carry_share_ewm3": [np.nan, np.nan, 0.10],
+        "offense_pct_ewm3": [0.80, np.nan, 0.60],
+        "rz_opportunity_share_ewm3": [0.05, np.nan, np.nan],
+        "target_share_trend_signal": [0.2, np.nan, -0.1],
+        "carry_share_trend_signal": [np.nan, np.nan, np.nan],
+        "offense_pct_trend_signal": [0.1, np.nan, 0.3],
+        "rz_opportunity_share_trend_signal": [np.nan, np.nan, np.nan],
+        "target_share_trend_direction": ["stable", None, "falling"],
+        "carry_share_trend_direction": [None, None, None],
+        "offense_pct_trend_direction": ["stable", None, "rising"],
+        "rz_opportunity_share_trend_direction": [None, None, None],
+    })
+
+    out = build_trend_snapshot(combined, target_season=2026, target_week=1)
+
+    assert set(out["player_id"]) == {"p1", "p2"}  # only the target week
+    assert "target_share_ewm3" not in out.columns  # renamed, not passed through verbatim
+    assert "offense_pct_ewm3" not in out.columns
+    assert {"trend_target_share_current", "trend_carry_share_current",
+            "trend_offense_pct_current", "trend_rz_opportunity_share_current"}.issubset(out.columns)
+
+    p2 = out[out["player_id"] == "p2"].iloc[0]
+    assert p2["trend_target_share_current"] == pytest.approx(0.25)
+    assert p2["target_share_trend_direction"] == "falling"
+
+
 def test_assemble_and_validate_export_round_trip():
     scoped_predictions = pd.DataFrame({
         "player_id": ["00-0001", "00-0002"],
@@ -149,6 +190,21 @@ def test_assemble_and_validate_export_round_trip():
         "prev_season_touch_share": [np.nan, 0.45],
         "prev_season_offense_pct": [0.9, 0.65],
     })
+    trend = pd.DataFrame({
+        "player_id": ["00-0001", "00-0002"],
+        "trend_target_share_current": [np.nan, 0.2],
+        "trend_carry_share_current": [np.nan, np.nan],
+        "trend_offense_pct_current": [0.95, 0.7],
+        "trend_rz_opportunity_share_current": [np.nan, 0.15],
+        "target_share_trend_signal": [np.nan, 0.4],
+        "carry_share_trend_signal": [np.nan, np.nan],
+        "offense_pct_trend_signal": [np.nan, -0.6],
+        "rz_opportunity_share_trend_signal": [np.nan, 0.1],
+        "target_share_trend_direction": [None, "rising"],
+        "carry_share_trend_direction": [None, None],
+        "offense_pct_trend_direction": [None, "falling"],
+        "rz_opportunity_share_trend_direction": [None, "stable"],
+    })
     xfp_summary = pd.DataFrame({
         "player_id": ["00-0002"],
         "season_xfp": [180.0], "season_actual": [200.0], "fp_over_expected": [20.0],
@@ -159,7 +215,7 @@ def test_assemble_and_validate_export_round_trip():
     })
 
     payload, report = assemble_player_advanced_stats(
-        scoped_predictions, usage, xfp_summary, crosswalk,
+        scoped_predictions, usage, trend, xfp_summary, crosswalk,
         target_season=2026, target_week=1, seasons_trained=list(range(2018, 2026)),
         model_version="test-version",
     )
@@ -170,6 +226,18 @@ def test_assemble_and_validate_export_round_trip():
     assert payload["players"]["5001"]["xfp"]["season_xfp"] == pytest.approx(180.0)
     assert payload["meta"]["season"] == 2026
     assert payload["meta"]["week"] == 1
+
+    # Phase 3' trend block: renamed to human-readable keys, null-safe,
+    # direction strings pass through untouched.
+    assert payload["players"]["4984"]["trend"]["snap_share"] == {
+        "current": 0.95, "signal": None, "direction": None,
+    }
+    assert payload["players"]["5001"]["trend"] == {
+        "snap_share": {"current": 0.7, "signal": -0.6, "direction": "falling"},
+        "target_share": {"current": 0.2, "signal": 0.4, "direction": "rising"},
+        "carry_share": {"current": None, "signal": None, "direction": None},
+        "red_zone_share": {"current": 0.15, "signal": 0.1, "direction": "stable"},
+    }
 
     validation = validate_export(payload, crosswalk)
     assert validation["n_players"] == 2

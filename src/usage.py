@@ -118,7 +118,8 @@ Usage:
     from src.usage import (
         add_volume_features, add_snap_features, add_efficiency_features,
         add_situational_features, add_context_features,
-        add_xfp_features, add_rolling_features,
+        add_xfp_features, add_rolling_features, add_trend_features,
+        get_usage_trend_leaders,
     )
     df = add_volume_features(weekly_scored, pbp)
     df = add_snap_features(df, snaps, crosswalk)
@@ -127,6 +128,8 @@ Usage:
     df = add_context_features(df, schedule)
     df = add_xfp_features(df, pbp, scoring_settings)
     df = add_rolling_features(df)
+    df = add_trend_features(df)  # Phase 3' -- usage trend signal, not a model feature
+    risers, fallers = get_usage_trend_leaders(df, season, week, feature="target_share")
 """
 
 from __future__ import annotations
@@ -1361,3 +1364,239 @@ def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     out = out.merge(season_avg, on=["player_id", "season"], how="left")
 
     return out
+
+
+# ==========================================================================
+# FAMILY 7 — TREND SIGNAL (Phase 3')
+# ==========================================================================
+# Replaces NOTEBOOK_OUTLINE.md's old Phase 3 ("role classification" --
+# Pocket Passer / 3-Down Back / Slot WR, etc.). A role label is a category:
+# it forces a player into one bucket of a fixed set using thresholds picked
+# by eye, and says nothing about whether that role is CHANGING right now,
+# which is the thing a manager actually needs to know week to week. A trend
+# signal is a continuous, honestly-uncertain read on exactly that, with no
+# bucket to half-fit a player into.
+#
+# Window choice, settled empirically rather than assumed -- see
+# notebooks/04_usage_trends.ipynb section 1 for the full study and
+# PROJECT_CONTEXT.md's "Phase 3' findings" for the summary. The question:
+# does a usage rise measured over a 3-week half-life actually predict the
+# NEXT game's usage staying elevated ("holds") rather than falling back to
+# the season baseline ("reverts"), compared to a 4- or 5-week half-life?
+# 3 won for every one of target_share/carry_share/offense_pct/
+# rz_opportunity_share, on both hold-rate and correlation with next-game
+# usage, monotonically (3 > 4 > 5 in every single case, out of 21k+ real
+# player-weeks per feature). So this reuses add_rolling_features's EXISTING
+# <feat>_ewm3/<feat>_s2d columns for target_share/carry_share/offense_pct
+# directly -- no second, competing half-life constant.
+#
+# rz_opportunity_share is new: Family 4 has rz_target_share and
+# rz_carry_share separately, with DIFFERENT denominators (team RZ targets
+# vs. team RZ carries), so they can't just be added together into one
+# honest combined share the way their raw counts can. Computed here with
+# the SAME shift(1)-after-window mechanics as add_rolling_features, at the
+# same validated halflife=3 -- but deliberately NOT added to
+# ROLLING_SOURCE_COLUMNS. Doing so would silently turn it into a new
+# src/model.py training feature (FEATURE_COLUMNS is derived FROM
+# ROLLING_OUTPUT_COLUMNS) and retroactively change the already-published,
+# already-validated Phase 6 model without anyone asking for that. This
+# family is a display/export-layer derived feature, downstream of the
+# model, not a new model input.
+#
+# Comparability across players: the raw ewm3-minus-s2d GAP isn't
+# comparable across players on its own -- a bell-cow RB's season-long
+# target_share naturally swings more, in raw percentage points, than a
+# committee back's. Dividing by the player's own season-to-date volatility
+# (the already-existing <feat>_vol column -- expanding std) turned out to
+# matter empirically, not just conceptually: at a fixed
+# z = gap / vol threshold, hold-rate clearly improves over a raw
+# top-quartile-gap threshold at a comparable sample size (see the
+# notebook). The z > 0.25 boundary for "rising"/"falling" below was picked
+# by checking 0.0/0.25/0.5/0.75/1.0 against real hold-rates: 0.25 keeps a
+# workable ~13-20% of eligible weeks flagged per direction while clearly
+# beating a 0.0 (any positive gap) cutoff; higher thresholds cut the
+# flagged sample down to near-nothing (well under 2% of weeks) for a
+# marginal further hold-rate gain, too thin a list to be useful. 0/0 (a
+# player with zero within-season variance so far, e.g. exactly one game)
+# divides to null, not a spurious signal.
+#
+# Honesty note on rz_opportunity_share specifically: even at the validated
+# window and threshold, its hold-rate stays below 50% in the historical
+# check (a "rise" reverts more often than it holds), clearly weaker than
+# the other three -- red-zone opportunities are a low-volume, high-variance
+# event category, and this signal is real but noisier. Shipped anyway
+# because it was explicitly asked for, not suppressed -- but callers
+# (the Phase 7 export, any future dashboard panel) should not present it
+# with the same confidence as the other three without repeating that
+# caveat.
+TREND_SOURCE_FEATURES = ["target_share", "carry_share", "offense_pct", "rz_opportunity_share"]
+TREND_DIRECTION_THRESHOLD = 0.25
+
+# Below this many prior in-season games, the season-to-date mean/vol this
+# signal divides by are themselves too thin to trust -- validated directly:
+# raising the eligibility floor from 2 to 8 games monotonically improved
+# the signal's correlation with next-game usage (e.g. target_share: 0.085
+# at >=2 games vs. 0.123 at >=8), but 8 would exclude nearly half of every
+# season from ever appearing on a riser/faller list. 5 is the floor this
+# module's own validation study was run under, not a separate, unjustified
+# number chosen after the fact.
+MIN_GAMES_FOR_TREND = 5
+
+TREND_OUTPUT_COLUMNS = (
+    ["rz_opportunity_share", "rz_opportunity_share_ewm3",
+     "rz_opportunity_share_s2d", "rz_opportunity_share_vol"]
+    + [f"{c}_trend_signal" for c in TREND_SOURCE_FEATURES]
+    + [f"{c}_trend_direction" for c in TREND_SOURCE_FEATURES]
+)
+
+
+def add_trend_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a normalized usage-trend signal and a rising/falling/stable
+    direction label for snap share (offense_pct), target_share,
+    carry_share, and the new rz_opportunity_share -- see this section's
+    module-level comment for the window/threshold choices and why they're
+    each backed by a real historical check, not a guess.
+
+    rz_opportunity_share = (rz_targets + rz_carries) / (team_rz_targets +
+    team_rz_carries) -- a single share spanning both a rusher's and a
+    receiver's red-zone touches. Null when the team recorded zero RZ plays
+    all week (0/0), the same convention as every other share in this
+    module -- a real absence of data, not this player getting shut out.
+
+    trend_signal = (<feat>_ewm3 - <feat>_s2d) / <feat>_vol -- how many of
+    the player's OWN season-to-date standard deviations above/below
+    baseline their recent (3-game half-life) usage is running. Null before
+    MIN_GAMES_FOR_TREND prior in-season games, or wherever the underlying
+    ewm3/s2d/vol inputs are themselves null (e.g. every rolling column for
+    a QB's carry_share-adjacent fields where the concept doesn't apply --
+    inherited, not re-derived here).
+
+    trend_direction is "rising" (signal > TREND_DIRECTION_THRESHOLD),
+    "falling" (signal < -TREND_DIRECTION_THRESHOLD), "stable" (between), or
+    null (signal itself null).
+
+    Idempotent: existing output columns are dropped before recomputing.
+
+    Args:
+        df: player-week frame with player_id, season, week, games_played,
+            rz_targets, team_rz_targets, rz_carries, team_rz_carries, and
+            every <feat>/<feat>_ewm3/<feat>_s2d/<feat>_vol column for
+            target_share/carry_share/offense_pct (i.e. df after
+            add_situational_features and add_rolling_features have both
+            already run).
+
+    Returns:
+        Copy of df with TREND_OUTPUT_COLUMNS added.
+    """
+    required = (
+        ["player_id", "season", "week", "games_played",
+         "rz_targets", "team_rz_targets", "rz_carries", "team_rz_carries"]
+        + [f"{c}{suffix}" for c in ("target_share", "carry_share", "offense_pct")
+           for suffix in ("", "_ewm3", "_s2d", "_vol")]
+    )
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"add_trend_features: df is missing columns {missing}")
+
+    out = df.drop(columns=[c for c in TREND_OUTPUT_COLUMNS if c in df.columns])
+
+    rz_opportunity_share = (
+        (out["rz_targets"] + out["rz_carries"])
+        / (out["team_rz_targets"] + out["team_rz_carries"])
+    ).rename("rz_opportunity_share")
+    out = pd.concat([out, rz_opportunity_share], axis=1)
+
+    sorted_df = out.sort_values(["player_id", "season", "week"])
+    group_keys = [sorted_df["player_id"], sorted_df["season"]]
+    grouped = sorted_df.groupby(["player_id", "season"], sort=False)
+
+    def _shift_within_group(s: pd.Series) -> pd.Series:
+        return s.groupby(group_keys, sort=False).shift(1)
+
+    # Same recipe as add_rolling_features: window the RAW column, then
+    # shift(1) the whole result within each (player, season) group -- week
+    # N's rz_opportunity_share_ewm3/_s2d/_vol never see week N's own row.
+    ewm_raw = grouped["rz_opportunity_share"].ewm(halflife=EWM_HALFLIFE, min_periods=1).mean().droplevel([0, 1])
+    s2d_raw = grouped["rz_opportunity_share"].expanding().mean().droplevel([0, 1])
+    vol_raw = grouped["rz_opportunity_share"].expanding().std().droplevel([0, 1])
+
+    rz_cols = pd.DataFrame({
+        "rz_opportunity_share_ewm3": _shift_within_group(ewm_raw),
+        "rz_opportunity_share_s2d": _shift_within_group(s2d_raw),
+        "rz_opportunity_share_vol": _shift_within_group(vol_raw),
+    }).reindex(out.index)
+    out = pd.concat([out, rz_cols], axis=1)
+
+    # Single concat rather than 8 sequential out[name] = ... assignments --
+    # same reasoning as add_rolling_features's own concat (the latter
+    # re-fragments the frame on every insert; pandas warns about exactly
+    # this).
+    eligible = out["games_played"] >= MIN_GAMES_FOR_TREND
+    signal_cols: dict[str, pd.Series] = {}
+    for feat in TREND_SOURCE_FEATURES:
+        gap = out[f"{feat}_ewm3"] - out[f"{feat}_s2d"]
+        signal = (gap / out[f"{feat}_vol"]).where(eligible)
+        signal_cols[f"{feat}_trend_signal"] = signal
+
+        direction = pd.Series("stable", index=out.index, dtype="string")
+        direction = direction.mask(signal > TREND_DIRECTION_THRESHOLD, "rising")
+        direction = direction.mask(signal < -TREND_DIRECTION_THRESHOLD, "falling")
+        direction = direction.mask(signal.isna())
+        signal_cols[f"{feat}_trend_direction"] = direction
+
+    out = pd.concat([out, pd.DataFrame(signal_cols, index=out.index)], axis=1)
+    return out
+
+
+def get_usage_trend_leaders(
+    df: pd.DataFrame,
+    season: int,
+    week: int,
+    feature: str,
+    position: str | None = None,
+    top_n: int = 10,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Riser/faller lists: the top `top_n` players by `<feature>_trend_signal`
+    for one (season, week), highest first (risers) and lowest first
+    (fallers), optionally restricted to one position.
+
+    Only rows with a non-null signal are eligible -- add_trend_features
+    already nulls the signal below MIN_GAMES_FOR_TREND prior games, so this
+    is what keeps a two-game small-sample player from topping the list on
+    noise (a null wouldn't reliably sort to either extreme on its own, so
+    it's filtered explicitly here rather than relying on sort order).
+
+    Args:
+        df: player-week frame after add_trend_features has run.
+        season, week: the week to rank.
+        feature: one of TREND_SOURCE_FEATURES.
+        position: restrict to one position (QB/RB/WR/TE), or None for all.
+        top_n: how many players per list.
+
+    Returns:
+        (risers, fallers) -- each a DataFrame with player_id,
+        player_display_name, position, team, the feature's raw value,
+        <feature>_ewm3, <feature>_trend_signal, and <feature>_trend_direction,
+        sorted by signal (risers descending, fallers ascending).
+    """
+    if feature not in TREND_SOURCE_FEATURES:
+        raise ValueError(
+            f"get_usage_trend_leaders: unknown feature {feature!r}, "
+            f"expected one of {TREND_SOURCE_FEATURES}"
+        )
+    signal_col = f"{feature}_trend_signal"
+
+    week_df = df[
+        (df["season"] == season) & (df["week"] == week) & df[signal_col].notna()
+    ]
+    if position is not None:
+        week_df = week_df[week_df["position"] == position]
+
+    id_cols = [c for c in ["player_id", "player_display_name", "position", "team"] if c in week_df.columns]
+    cols = id_cols + [feature, f"{feature}_ewm3", signal_col, f"{feature}_trend_direction"]
+
+    risers = week_df.sort_values(signal_col, ascending=False).head(top_n)[cols].reset_index(drop=True)
+    fallers = week_df.sort_values(signal_col, ascending=True).head(top_n)[cols].reset_index(drop=True)
+    return risers, fallers

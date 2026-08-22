@@ -41,6 +41,7 @@ from src.usage import (  # noqa: E402
     ROLLING_OUTPUT_COLUMNS,
     SITUATIONAL_OUTPUT_COLUMNS,
     SNAP_OUTPUT_COLUMNS,
+    TREND_OUTPUT_COLUMNS,
     VOLUME_OUTPUT_COLUMNS,
     XFP_OUTPUT_COLUMNS,
     add_context_features,
@@ -48,6 +49,7 @@ from src.usage import (  # noqa: E402
     add_rolling_features,
     add_situational_features,
     add_snap_features,
+    add_trend_features,
     add_volume_features,
     add_xfp_features,
     _bucket_rate_table,
@@ -447,4 +449,104 @@ def test_prev_season_columns(featured_df):
 def test_rolling_features_idempotent(featured_df):
     once = add_rolling_features(featured_df)
     twice = add_rolling_features(once)
+    pd.testing.assert_frame_equal(once, twice)
+
+
+# ==========================================================================
+# FAMILY 7 — TREND SIGNAL (Phase 3')
+# ==========================================================================
+@pytest.fixture(scope="module")
+def rolled_df(featured_df) -> pd.DataFrame:
+    """featured_df + add_rolling_features -- the input add_trend_features expects."""
+    return add_rolling_features(featured_df)
+
+
+def test_trend_features_shift_excludes_own_week(rolled_df):
+    """
+    Same perturbation strategy as test_rolling_features_shift_excludes_own_week,
+    aimed at add_trend_features specifically: a black-box truncate-and-compare
+    test can't prove week N's OWN trend_signal excludes week N's own row,
+    because removing week N's row also destroys real same-week information a
+    later week legitimately needs. Perturbing target_share to an extreme
+    outlier at one week must leave that SAME week's trend_signal unchanged
+    (it's derived from ewm3/s2d, which are already shift(1)-safe upstream)
+    while changing the FOLLOWING week's trend_signal (proving the perturbed
+    value does reach the next week, one step later).
+    """
+    counts = rolled_df.groupby(["player_id", "season"]).size()
+    pid, season = counts[counts >= 4].index[0]
+    weeks = sorted(
+        rolled_df.loc[
+            (rolled_df["player_id"] == pid) & (rolled_df["season"] == season), "week"
+        ].tolist()
+    )
+    target_week, next_week = weeks[1], weeks[2]
+
+    def _row(result, week):
+        m = (result["player_id"] == pid) & (result["season"] == season) & (result["week"] == week)
+        return result.loc[m].iloc[0]
+
+    baseline = add_trend_features(rolled_df)
+    baseline_target = _row(baseline, target_week)
+    baseline_next = _row(baseline, next_week)
+
+    perturbed_df = rolled_df.copy()
+    mask = (
+        (perturbed_df["player_id"] == pid) & (perturbed_df["season"] == season)
+        & (perturbed_df["week"] == target_week)
+    )
+    perturbed_df.loc[mask, "target_share"] = 999.0
+    perturbed = add_trend_features(perturbed_df)
+    perturbed_target = _row(perturbed, target_week)
+    perturbed_next = _row(perturbed, next_week)
+
+    if pd.notna(baseline_target["target_share_trend_signal"]):
+        assert baseline_target["target_share_trend_signal"] == pytest.approx(
+            perturbed_target["target_share_trend_signal"]
+        )
+    if pd.notna(baseline_next["target_share_trend_signal"]) or pd.notna(perturbed_next["target_share_trend_signal"]):
+        assert baseline_next["target_share_trend_signal"] != pytest.approx(
+            perturbed_next["target_share_trend_signal"]
+        )
+
+
+@pytest.mark.parametrize("season,boundary_week", BOUNDARIES)
+def test_trend_features_no_future_leakage(rolled_df, season, boundary_week):
+    """
+    Removing rows for weeks AFTER boundary_week must not change trend
+    features for any week <= boundary_week -- catches a future row leaking
+    backward (e.g. an unsorted groupby), the same bug class
+    test_rolling_features_no_future_leakage guards against for Family 6.
+    """
+    df_truncated = _truncate_after(rolled_df, season, boundary_week)
+
+    full = add_trend_features(rolled_df)
+    truncated = add_trend_features(df_truncated)
+
+    mask = (full["season"] == season) & (full["week"] <= boundary_week)
+    cols = ["player_id", "season", "week"] + TREND_OUTPUT_COLUMNS
+    left = full.loc[mask, cols].reset_index(drop=True)
+    right = truncated.loc[mask, cols].reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(left, right)
+
+
+def test_trend_signal_null_below_min_games(rolled_df):
+    """games_played < MIN_GAMES_FOR_TREND must null every trend_signal/
+    trend_direction column -- the noise floor that keeps a two-game player
+    off a riser/faller list, checked directly rather than just trusted."""
+    from src.usage import MIN_GAMES_FOR_TREND, TREND_SOURCE_FEATURES
+
+    result = add_trend_features(rolled_df)
+    thin = result[result["games_played"] < MIN_GAMES_FOR_TREND]
+    assert len(thin) > 0, "expected at least one player-week below the min-games floor"
+
+    for feat in TREND_SOURCE_FEATURES:
+        assert thin[f"{feat}_trend_signal"].isna().all()
+        assert thin[f"{feat}_trend_direction"].isna().all()
+
+
+def test_trend_features_idempotent(rolled_df):
+    once = add_trend_features(rolled_df)
+    twice = add_trend_features(once)
     pd.testing.assert_frame_equal(once, twice)

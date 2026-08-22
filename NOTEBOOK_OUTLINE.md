@@ -15,7 +15,9 @@ A rubric for building the data pipeline that feeds the dashboard's "advanced ana
 ## Goal
 
 Produce one stable, versioned JSON file per week that contains per-player:
-1. **Role classification** (Pocket Passer, 3-Down Back, Slot WR, etc.)
+1. **Usage trend signal** (Phase 3' — current opportunity share, a
+   normalized trend signal, and a rising/falling/stable direction label;
+   replaces the original role-classification idea below, see Phase 3')
 2. **Position-profile radar metrics** (0-100 scaled)
 3. **Field heatmap zones** (target/run/pass location frequencies)
 4. **Your custom projection** for the upcoming week
@@ -32,7 +34,7 @@ The dashboard already has hooks waiting to consume this file — search `// Hook
 | **`polars`** | What `nflreadpy` returns. `src/ingest.py` calls `.to_pandas()` at the boundary so downstream code stays pandas — but you could go Polars end-to-end later if you want the speed. |
 | **`pandas`** | Standard for tabular work. Everything after ingestion is pandas. |
 | **`pyarrow`** | Needed for both the local parquet cache and Polars → pandas conversion. Easy to forget; nothing works without it. |
-| **`scikit-learn`** | For role classification (K-Means or rule-based + DecisionTree). |
+| **`scikit-learn`** | Pulled in as `lightgbm`'s sklearn-wrapper dependency (`LGBMRegressor`), not for role classification — that idea was dropped, see Phase 3'. |
 | **`xgboost`** or **`lightgbm`** | For the custom projection model. Tree-based handles tabular fantasy data well. |
 | **`matplotlib` / `seaborn`** | Only for your own EDA — the dashboard renders everything client-side. |
 | **GitHub Actions** | Schedule the notebook to run weekly (Tuesday morning after MNF stats post) and commit the JSON. |
@@ -138,7 +140,7 @@ fanteasy-notebook/
 ├── notebooks/
 │   ├── 01_data_ingestion.ipynb       # Pull nflverse + Sleeper data
 │   ├── 02_feature_engineering.ipynb  # Compute per-player aggregates
-│   ├── 03_role_classification.ipynb  # Cluster/classify player roles
+│   ├── 03_usage_trends.ipynb         # Usage trend signal (Phase 3' -- role classification was dropped)
 │   ├── 04_radar_metrics.ipynb        # Build 0-100 radar values
 │   ├── 05_heatmap_zones.ipynb        # Field-zone frequency tables
 │   ├── 06_projection_model.ipynb     # Train + predict your custom model
@@ -146,7 +148,7 @@ fanteasy-notebook/
 ├── src/
 │   ├── ingest.py        # Reusable data-pull functions
 │   ├── features.py      # Feature computation
-│   ├── roles.py         # Role classification logic
+│   ├── usage.py         # Usage/efficiency features + trend signal (Family 7 -- replaces role classification)
 │   ├── radar.py         # Radar metric normalization
 │   ├── heatmap.py       # Heatmap zone builders
 │   ├── projection.py    # Model training + inference
@@ -191,7 +193,7 @@ pbp = nfl.load_pbp([2024, 2025])
 # Weekly aggregated stats (easier than aggregating pbp yourself)
 weekly = nfl.load_player_stats([2025], summary_level="week")
 
-# Snap counts (critical for role classification)
+# Snap counts (critical for snap share / usage trend)
 snaps = nfl.load_snap_counts([2025])
 
 # NextGenStats (aDOT, separation, target separation)
@@ -321,66 +323,44 @@ Mostly derivable from weekly stat aggregation directly — no pbp needed.
 
 ---
 
-## Phase 3 — Role classification
+## Phase 3' — Usage trends
 
-Two approaches; I'd start with rule-based and add clustering only if it gives you better separation.
+**Replaces the original Phase 3 (role classification) below this point —
+role labels were dropped, not deferred.** A role label ("Pocket Passer",
+"3-Down Back", "Slot") is a category: it forces every player into one
+bucket of a fixed set, using thresholds picked by eye against a histogram,
+and it says nothing about whether that role is CHANGING right now — which
+is the thing a manager actually needs to know week to week. Half the
+players in any real distribution sit near a bucket boundary and get
+half-fit into whichever side the threshold happens to land on. A trend
+signal is continuous and honestly uncertain instead: how much a player's
+recent usage is running above or below their own season baseline, with no
+bucket to force them into.
 
-### Rule-based (start here)
+Built in `src/usage.py`'s Family 7 (`add_trend_features`,
+`get_usage_trend_leaders`) and validated in
+`notebooks/04_usage_trends.ipynb`. For snap share (`offense_pct`),
+`target_share`, `carry_share`, and a new combined `rz_opportunity_share`
+(red-zone targets + carries over the team's red-zone plays — Family 4's
+`rz_target_share`/`rz_carry_share` have different denominators and can't be
+summed into one share directly):
 
-```python
-def classify_qb(features):
-    if features['rush_yards_per_game'] >= 30:
-        return ('Dual Threat', 'High-volume passer with significant rushing upside.')
-    elif features['pass_attempts_per_game'] >= 35:
-        return ('Pocket Passer', 'High-volume passer reliant on dropbacks.')
-    else:
-        return ('Game Manager', 'Lower volume, efficiency-driven.')
-
-def classify_rb(features):
-    if features['snap_share'] >= 0.65 and features['receptions_per_game'] >= 3:
-        return ('3-Down Back', 'Workhorse with receiving upside.')
-    elif features['goal_line_share'] >= 0.5:
-        return ('Goal Line', 'Short-yardage / red-zone specialist.')
-    elif features['receptions_per_game'] >= 4:
-        return ('Pass Catcher', 'Pass-down specialist; receiving-heavy usage.')
-    else:
-        return ('Committee', 'Shared backfield.')
-
-def classify_wr(features):
-    if features['adot'] >= 15:
-        return ('Deep Threat', 'High aDOT, downfield specialist.')
-    elif features['adot'] <= 8 and features['yac_per_rec'] >= 5:
-        return ('Slot', 'Underneath, YAC-focused alignment.')
-    elif features['rz_target_share'] >= 0.20:
-        return ('Red Zone', 'High RZ usage; scoring specialist.')
-    elif features['target_share'] >= 0.20:
-        return ('X-Receiver', 'Primary outside option.')
-    else:
-        return ('Possession', 'Complementary role; lower volume.')
-```
-
-Adjust thresholds against the actual distribution of your data — check histograms before locking them in.
-
-### K-Means (optional, more nuanced)
-
-If you want roles derived empirically:
-
-```python
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-
-wr_features = ['target_share', 'adot', 'yac_per_rec', 'rz_target_share', 'snap_share']
-X = wr_df[wr_features].fillna(0)
-X_scaled = StandardScaler().fit_transform(X)
-kmeans = KMeans(n_clusters=5, random_state=42, n_init=10).fit(X_scaled)
-wr_df['cluster'] = kmeans.labels_
-
-# Interpret each cluster's centroid to name the role
-centroids = pd.DataFrame(scaler.inverse_transform(kmeans.cluster_centers_), columns=wr_features)
-print(centroids)
-```
-
-Then map cluster index → human-readable name based on the centroid profile.
+- **Trend signal** = `(<feat>_ewm3 − <feat>_s2d) / <feat>_vol` — the recent
+  (3-week half-life) value minus the season-to-date baseline, divided by
+  the player's own season-to-date volatility so the number is comparable
+  across a bell-cow and a committee back. The 3-week window is the
+  existing `EWM_HALFLIFE` from Family 6, reused rather than re-derived —
+  validated empirically (not assumed) by checking whether a usage rise
+  measured over 3 weeks predicts the following week's usage holding above
+  baseline, against 4- and 5-week windows too; 3 won on every feature
+  tested, monotonically. See `PROJECT_CONTEXT.md`'s **Phase 3' findings**
+  for the numbers.
+- **Direction label** — `rising` / `falling` / `stable`, from the signal
+  crossing a data-picked threshold (not sign alone — see the findings for
+  why).
+- **Riser/faller lists** — top N by trend signal, per position, for a
+  given week, gated by a minimum-games-played floor so a two-game sample
+  can't top the list on noise.
 
 ---
 
@@ -656,7 +636,7 @@ jobs:
 | Week | Milestone |
 |---|---|
 | 1 | Phase 1 (ingestion) + Phase 2 (basic features for QB/RB/WR) |
-| 2 | Phase 3 (rule-based role classification) + Phase 7 (export skeleton with roles only) — wire into dashboard, ship visible progress |
+| 2 | Phase 3' (usage trend signal) + Phase 7 (export skeleton with trend only) — wire into dashboard, ship visible progress |
 | 3 | Phase 4 (radar metrics) — dashboard radar charts come alive |
 | 4 | Phase 5 (heatmaps) — heatmap panels light up |
 | 5 | Phase 6 (baseline projection model with last-4-week avg) |
@@ -671,7 +651,7 @@ Wire incrementally. Don't wait until everything's perfect to push it live — th
 
 - [ ] JSON validates as well-formed JSON (`python -m json.tool`)
 - [ ] `players` dict has at least 800 entries (sanity check — NFL has ~1700 active players)
-- [ ] Every player has `role`, `radar` (with all expected keys for their position), and `projections.week_N`
+- [ ] Every player has `trend` (Phase 3' — replaces the old `role` idea), `radar` (with all expected keys for their position), and `projections.week_N`
 - [ ] No `NaN` values (replace with `null`) — JSON doesn't support NaN
 - [ ] All Sleeper IDs in the file actually exist in the current `/players/nfl` response
 - [ ] Spot-check 3 players you know well — does the radar profile match your intuition?
