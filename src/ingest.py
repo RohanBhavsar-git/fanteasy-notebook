@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -109,6 +110,44 @@ def _normalize_id_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
     return df
 
 
+def _retry_transient(fn, *args, max_attempts: int = 3, backoff_seconds: float = 2.0, **kwargs):
+    """
+    Retry a `nflreadpy` fetch call on a TRANSIENT connection failure --
+    "Connection reset by peer" and similar, downloading from nflverse-data's
+    GitHub-releases CDN, has been observed in practice to intermittently
+    reset a fetch that succeeds on the very next attempt (a fresh CI
+    checkout runs every fetch cold, with no cache to fall back to). Does
+    NOT retry an HTTP 404 -- that's nflreadpy's real signal that a season
+    hasn't been published yet (see src/pipeline.py's
+    _is_unpublished_season_error, same distinction), and retrying a
+    resource that doesn't exist just wastes time before failing anyway.
+
+    Re-raises the LAST exception once max_attempts is exhausted -- this
+    absorbs a single blip, it does not hide a persistent problem. Matches
+    this module's "fail loudly" convention: loud after real, repeated
+    failure, not loud on the first transient hiccup.
+    """
+    delay = backoff_seconds
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except ConnectionError as e:
+            cause = e.__cause__
+            is_404 = (
+                isinstance(cause, requests.exceptions.HTTPError)
+                and cause.response is not None
+                and cause.response.status_code == 404
+            )
+            if is_404 or attempt == max_attempts:
+                raise
+            logger.warning(
+                f"Transient fetch error (attempt {attempt}/{max_attempts}), "
+                f"retrying in {delay:.0f}s: {e}"
+            )
+            time.sleep(delay)
+            delay *= 2
+
+
 # ==========================================================================
 # CACHING HELPERS
 # ==========================================================================
@@ -180,7 +219,7 @@ def get_pbp(
         if cached is not None:
             return cached
     logger.info(f"Fetching play-by-play for {seasons}...")
-    df = _to_pandas(nfl.load_pbp(seasons), columns)
+    df = _to_pandas(_retry_transient(nfl.load_pbp, seasons), columns)
     _write_cache_parquet(df, cache_name)
     return df
 
@@ -205,7 +244,7 @@ def get_weekly_stats(seasons: Iterable[int], refresh: bool = False) -> pd.DataFr
         if cached is not None:
             return cached
     logger.info(f"Fetching weekly stats for {seasons}...")
-    df = _to_pandas(nfl.load_player_stats(seasons, summary_level="week"))
+    df = _to_pandas(_retry_transient(nfl.load_player_stats, seasons, summary_level="week"))
     _write_cache_parquet(df, cache_name)
     return df
 
@@ -230,7 +269,7 @@ def get_snap_counts(seasons: Iterable[int], refresh: bool = False) -> pd.DataFra
         if cached is not None:
             return cached
     logger.info(f"Fetching snap counts for {seasons}...")
-    df = _to_pandas(nfl.load_snap_counts(seasons))
+    df = _to_pandas(_retry_transient(nfl.load_snap_counts, seasons))
     _write_cache_parquet(df, cache_name)
     return df
 
@@ -263,7 +302,7 @@ def get_ngs_data(
         if cached is not None:
             return cached
     logger.info(f"Fetching NGS {stat_type} for {seasons}...")
-    df = _to_pandas(nfl.load_nextgen_stats(seasons=seasons, stat_type=stat_type))
+    df = _to_pandas(_retry_transient(nfl.load_nextgen_stats, seasons=seasons, stat_type=stat_type))
     _write_cache_parquet(df, cache_name)
     return df
 
@@ -282,7 +321,7 @@ def get_schedule(seasons: Iterable[int], refresh: bool = False) -> pd.DataFrame:
         if cached is not None:
             return cached
     logger.info(f"Fetching schedule for {seasons}...")
-    df = _to_pandas(nfl.load_schedules(seasons))
+    df = _to_pandas(_retry_transient(nfl.load_schedules, seasons))
     _write_cache_parquet(df, cache_name)
     return df
 
@@ -301,7 +340,7 @@ def get_seasonal_rosters(seasons: Iterable[int], refresh: bool = False) -> pd.Da
         if cached is not None:
             return cached
     logger.info(f"Fetching rosters for {seasons}...")
-    df = _to_pandas(nfl.load_rosters(seasons))
+    df = _to_pandas(_retry_transient(nfl.load_rosters, seasons))
     _write_cache_parquet(df, cache_name)
     return df
 
@@ -326,7 +365,7 @@ def get_id_crosswalk(refresh: bool = False) -> pd.DataFrame:
         if cached is not None:
             return cached
     logger.info("Fetching player ID crosswalk...")
-    df = _to_pandas(nfl.load_ff_playerids())
+    df = _to_pandas(_retry_transient(nfl.load_ff_playerids))
     for col in ("sleeper_id", "gsis_id", "pfr_id", "espn_id", "yahoo_id", "mfl_id"):
         df = _normalize_id_column(df, col)
     _write_cache_parquet(df, "id_crosswalk")

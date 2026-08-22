@@ -692,6 +692,31 @@ retrains a year adding ~7-8 MB each is a trivial cost to git history;
 revisit only if retrain frequency ever becomes routine/scheduled (it
 deliberately isn't).
 
+**First real GitHub Actions runs: `retrain.yml` succeeded outright,
+`weekly-update.yml` caught a genuine flakiness gap in the fetch layer.**
+`retrain.yml`'s first real `workflow_dispatch` run completed in ~5 minutes
+and committed the 7.57 MB artifact (`models/fanteasy_model.joblib`,
+`model_version` = the commit that fixed `test_no_leakage.py`'s local-cache
+dependency, see below) — its walk-forward performance numbers match the
+local run almost exactly (QB/RB/WR model MAE identical to two decimal
+places; TE `sleeper_mae` 2.85 vs. 2.86, expected variance from a fresh
+Sleeper API snapshot). `weekly-update.yml`'s first run then failed at
+`pytest` with 45 `ConnectionError`s, all tracing to ONE download —
+`stats_player_week_2024.parquet` from nflverse-data's GitHub-releases
+CDN resetting mid-transfer — not a code bug (the identical test suite had
+just passed inside `retrain.yml` minutes earlier; a `scope="module"`
+fixture meant one failed fetch cascaded into 45 dependent test failures in
+`tests/test_no_leakage.py`). Since this same flakiness risk sits in the
+PRODUCTION fetchers too, not just the test's fixture, and `weekly-
+update.yml` runs unattended on a cron with nobody there to click retry:
+added `src/ingest.py::_retry_transient()` (3 attempts, exponential
+backoff starting at 2s) around every `nflreadpy` `load_*` call site.
+Deliberately does NOT retry an HTTP 404 — that's `_is_unpublished_season_error`'s
+"this season genuinely isn't published yet" signal, and retrying a
+resource that doesn't exist just delays the same failure. Covered by
+`tests/test_ingest.py` (4 tests: retry-then-succeed, exhausts-then-raises,
+never-retries-a-404, args/kwargs pass through cleanly).
+
 ---
 
 ## Design decisions worth preserving (the "why")
