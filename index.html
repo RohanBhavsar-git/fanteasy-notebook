@@ -1781,6 +1781,7 @@
   </nav>
 
   <div class="layout">
+    <div id="season-fallback-banner" class="info-banner" style="grid-column: 1 / -1; display: none;"></div>
     <aside class="sidebar">
       <div class="sidebar-title">
         <span>NFL Schedule</span>
@@ -2562,6 +2563,15 @@
       Object.assign(state, realData);
       document.getElementById('league-info-text').innerHTML =
         `<strong>${state.league.name}</strong>`;
+      const banner = document.getElementById('season-fallback-banner');
+      if (state.usingFallbackSeason) {
+        banner.innerHTML =
+          `ℹ️ <span>Showing the <strong>${state.league.season}</strong> season — the ` +
+          `${state.notYetDraftedSeason} league hasn't drafted yet.</span>`;
+        banner.style.display = 'flex';
+      } else {
+        banner.style.display = 'none';
+      }
       renderSidebar();
       renderView();
     } catch (err) {
@@ -2597,6 +2607,11 @@
     ]);
     let league = leagueResp, users = usersResp, rosters = rostersResp;
 
+    // Set once, here, rather than inferred later from state -- so the
+    // fallback banner can never drift out of sync with what actually loaded.
+    let usingFallbackSeason = false;
+    const notYetDraftedSeason = leagueResp.season;
+
     const hasGames = rosters.some(r =>
       (r.settings?.wins || 0) + (r.settings?.losses || 0) + (r.settings?.ties || 0) > 0
     );
@@ -2608,6 +2623,7 @@
           fetchJSON(`${API}/league/${league.previous_league_id}/rosters`)
         ]);
         league = pl; users = pu; rosters = pr;
+        usingFallbackSeason = true;
       } catch (e) { console.warn('Prior season fetch failed, using current:', e); }
     }
 
@@ -2758,7 +2774,9 @@
       currentWeek,
       availableWeeks,
       selectedWeek: currentWeek,
-      advancedStats
+      advancedStats,
+      usingFallbackSeason,
+      notYetDraftedSeason
     };
   }
 
