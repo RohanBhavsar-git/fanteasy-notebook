@@ -3,10 +3,11 @@
 A rubric for building the data pipeline that feeds the dashboard's "advanced analytics" panels. The deliverable is a single JSON file (`player_advanced_stats.json`) that the dashboard fetches on load.
 
 > **Updated August 2026.** The nflverse client changed from `nfl_data_py` (deprecated)
-> to `nflreadpy`. Phases 1, 2a, 2b, 3', 6, 6.5, 7, and 8 are complete and verified
+> to `nflreadpy`. Phases 1, 2a, 2b, 3', 4, 5, 6, 6.5, 7, and 8 are complete and verified
 > (Phase 6 investigated and deliberately not shipped as a model — see its section).
-> Phases 4-5 (radar/heatmap) are still design sketches written before anything ran —
-> treat those two sections' snippets as intent, not tested code. Check
+> Phases 4 and 5's OWN sections below are still the original design sketches written
+> before anything ran, though — each carries a note at its top pointing to what
+> actually shipped and how it differs, rather than being rewritten in place. Check
 > `PROJECT_CONTEXT.md`'s Verification status table before treating any other claim
 > in this file as settled either.
 >
@@ -21,8 +22,8 @@ Produce one stable, versioned JSON file per week that contains per-player:
 1. **Usage trend signal** (Phase 3' — current opportunity share, a
    normalized trend signal, and a rising/falling/stable direction label;
    replaces the original role-classification idea below, see Phase 3')
-2. **Position-profile radar metrics** (0-100 scaled)
-3. **Field heatmap zones** (target/run/pass location frequencies)
+2. **Position-profile radar metrics** (0-100 scaled) — done, Phase 4
+3. **Field heatmap zones** (target/run/pass location frequencies) — done, Phase 5
 4. **Your custom projection** for the upcoming week
 
 The dashboard already has hooks waiting to consume this file — search `// Hook for your custom model` and `state.advancedStats` in `index.html` to see where it slots in.
@@ -162,7 +163,8 @@ fanteasy-notebook/
 │   ├── pipeline.py        # Phase 8 -- shared fetch/score/feature orchestration
 │   └── artifacts.py       # Phase 8 -- model artifact save/load
 │   # Phase 4 (radar) lives in export.py, not a separate radar.py -- see Phase 4 findings
-│   # heatmap.py (Phase 5) not built yet -- see the phase table above
+│   # Phase 5 (heatmap) zone-bucketing lives in usage.py, aggregation in export.py --
+│   # not a separate heatmap.py either -- see Phase 5 findings
 ├── scripts/                # Phase 8 -- CI entry points, no notebook execution in CI
 │   ├── retrain.py          # .github/workflows/retrain.yml calls this
 │   └── weekly_update.py    # .github/workflows/weekly-update.yml calls this
@@ -431,7 +433,37 @@ For each position's radar axes (defined below), compute the percentile for every
 
 ## Phase 5 — Heatmap zones
 
-Three heatmap types depending on position. Output as a 2D array of frequencies normalized to sum to 1.
+**Done — implemented in `src/usage.py` (`receiving_zone_plays()`/
+`passing_zone_plays()`/`rushing_zone_plays()`) and `src/export.py`
+(`build_heatmap_snapshot()`), see `PROJECT_CONTEXT.md`'s Phase 5 findings
+for the full picture.** The three-grids-by-position shape below is close
+to what shipped, but several real gaps in this sketch got resolved
+differently once built against real pbp:
+- This sketch's QB example buckets `qb_pbp` directly by `air_yards`/
+  `pass_location` with no sack filter -- a sack has neither a real
+  `air_yards` nor `pass_location` value (see the pass-attempt-shaped-
+  denominator note elsewhere in this doc), so bucketing it directly would
+  either crash or silently miscount. The real implementation builds from
+  the same real-target population (`pass_attempt==1`, a recorded
+  receiver) xFP already established, which excludes sacks and spikes
+  automatically.
+- RB rushing was left as a comment ("typically not very informative...")
+  with no real code. It shipped as direction (`run_location`) x field
+  position, and RB gets a SECOND, independent receiving grid alongside it
+  (matching `getHeatmapTitle()`'s already-live "Rushing Direction &
+  Receiving" title) -- a target and a carry don't share a denominator, so
+  they're never combined into one grid or one set of frequencies.
+- "Normalized to sum to ~1.0" undersells a real question this sketch
+  doesn't address: what happens to a zone with only 1-2 real plays? The
+  shipped version reports real play counts per zone and flags anything
+  below `HEATMAP_SPARSE_THRESHOLD` as `sparse` (shown, not hidden or
+  merged) rather than letting a thin sample read as a confident tendency.
+- Field position (this sketch's QB grid has no red-zone/backfield
+  dimension at all) is a second axis for receivers and runners, crossed
+  with depth or direction respectively -- closer to xFP's own two-
+  ingredient bucket shape (see Phase 4's xFP notes) than a pure depth x
+  location grid, though QB itself stays location x depth only, no field
+  position, matching this sketch's own instinct there.
 
 ### QB passing heatmap (3×3 grid)
 

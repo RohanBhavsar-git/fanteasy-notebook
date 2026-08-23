@@ -797,6 +797,10 @@
       width: 80px; height: 8px; border-radius: 4px;
       background: linear-gradient(to right, rgba(255,255,255,0.1), #fbbf24, #ef4444);
     }
+    .heatmap-group-title {
+      font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+      color: var(--text-secondary); margin-bottom: 6px;
+    }
 
     .heatmap-stats {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
@@ -3108,6 +3112,15 @@
     `;
   }
 
+  // 1st/2nd/3rd/4th... English ordinal suffix, used for radar percentile
+  // labels ("62nd pctl") -- the 11th/12th/13th special case (not "11st"
+  // etc.) is why this needs the two-digit check before the last-digit one.
+  function ordinal(n) {
+    const rem100 = n % 100;
+    if (rem100 >= 11 && rem100 <= 13) return `${n}th`;
+    return `${n}${['th', 'st', 'nd', 'rd'][n % 10] || 'th'}`;
+  }
+
   // Phase 4: Position Profile radar. Three states, same honesty pattern
   // as every other new-field rollout in this export -- an entirely
   // missing `radar` key (an old export predating this feature) reads the
@@ -3179,9 +3192,182 @@
             <div class="radar-axis-row">
               <span class="radar-axis-label">${ax.label}</span>
               <span class="radar-axis-raw">${ax.raw != null ? ax.raw + ax.unit : '—'}</span>
-              <span class="radar-axis-pct">${ax.percentile != null ? ax.percentile + 'th pctl' : '—'}</span>
+              <span class="radar-axis-pct">${ax.percentile != null ? ordinal(ax.percentile) + ' pctl' : '—'}</span>
             </div>
           `).join('')}
+        </div>
+      </div>
+    `;
+  }
+
+  // Phase 5: Field Heatmap. Axis label text for the grid's row/column
+  // headers -- duplicated from src/usage.py's HEATMAP_ZONE_LABELS the same
+  // way TREND_FEATURE_LABELS above is duplicated from its Python
+  // counterpart: this is fixed, cosmetic display text, not business logic
+  // that could silently drift into a wrong number.
+  const HEATMAP_AXIS_LABELS = {
+    behind_los: 'Behind LOS', short: 'Short', intermediate: 'Intermediate', deep: 'Deep',
+    red_zone: 'Red Zone', midfield: 'Midfield', backfield: 'Backfield',
+    left: 'Left', middle: 'Middle', right: 'Right',
+  };
+
+  // Row/column order per zone kind. Rows run shallow/near-LOS at the
+  // bottom to downfield/deep at the top, matching real field orientation;
+  // columns run left-to-right. MUST match src/usage.py's zone_a/zone_b
+  // order for that kind (receiving: depth|field_pos; passing:
+  // location|depth; rushing: direction|field_pos) -- every zone.id from
+  // the export is exactly `${col}|${row}` as a result, so no
+  // reformatting is needed to look one up.
+  const HEATMAP_GRID_AXES = {
+    receiving: { cols: ['behind_los', 'short', 'intermediate', 'deep'], rows: ['red_zone', 'midfield', 'backfield'] },
+    passing: { cols: ['left', 'middle', 'right'], rows: ['deep', 'intermediate', 'short', 'behind_los'] },
+    rushing: { cols: ['left', 'middle', 'right'], rows: ['red_zone', 'midfield', 'backfield'] },
+  };
+
+  // 3-stop lerp matching the .legend-bar gradient (rgba(255,255,255,0.1)
+  // -> #fbbf24 -> #ef4444) exactly, so the legend swatch and the cells it
+  // describes always mean the same thing. t is a zone's share relative to
+  // its group's OWN highest share (not an absolute scale) -- the most-used
+  // zone for THIS player is always the hottest cell, the same way a real
+  // usage map should read regardless of whether this player is high- or
+  // low-volume overall.
+  function heatCellColor(t) {
+    const stops = [[255, 255, 255, 0.12], [251, 191, 36, 0.55], [239, 68, 68, 0.85]];
+    const seg = t < 0.5 ? 0 : 1;
+    const localT = t < 0.5 ? t / 0.5 : (t - 0.5) / 0.5;
+    const a = stops[seg], b = stops[seg + 1];
+    const lerp = i => a[i] + (b[i] - a[i]) * localT;
+    return `rgba(${Math.round(lerp(0))}, ${Math.round(lerp(1))}, ${Math.round(lerp(2))}, ${lerp(3).toFixed(2)})`;
+  }
+
+  // Builds the inner SVG markup for one heatmap group (one of "receiving"/
+  // "rushing"/"passing") as a FIXED-size grid -- every player shows the
+  // same row/column shape for a given kind, with a cell left as a faint
+  // outline (no fill, no label) when this player has zero real plays
+  // there, so a real, populated cell always stands out and two players'
+  // charts stay visually comparable at a glance. A real cell's tooltip
+  // (native SVG <title>, no JS needed) states the exact play count and
+  // share; sparse cells (< HEATMAP_SPARSE_THRESHOLD plays, per the
+  // export) get a dashed border and a small "~" mark instead of being
+  // rendered as solidly as a real trend.
+  function heatmapGroupSvg(group) {
+    const axes = HEATMAP_GRID_AXES[group.kind];
+    const zoneByKey = {};
+    group.zones.forEach(z => { zoneByKey[z.id] = z; });
+    const maxShare = Math.max(...group.zones.map(z => z.share), 0.0001);
+
+    const marginLeft = 78, marginTop = 22, marginRight = 8, marginBottom = 8;
+    const gridW = 400 - marginLeft - marginRight;
+    const gridH = 280 - marginTop - marginBottom;
+    const cellW = gridW / axes.cols.length, cellH = gridH / axes.rows.length;
+    const pad = 2;
+
+    let svg = `<rect width="400" height="280" fill="#0d4f1c"/>`;
+
+    axes.cols.forEach((col, j) => {
+      const cx = marginLeft + j * cellW + cellW / 2;
+      svg += `<text x="${cx}" y="14" fill="rgba(255,255,255,0.75)" font-size="9" font-weight="700" text-anchor="middle">${HEATMAP_AXIS_LABELS[col]}</text>`;
+    });
+    axes.rows.forEach((row, i) => {
+      const cy = marginTop + i * cellH + cellH / 2 + 3;
+      svg += `<text x="${marginLeft - 8}" y="${cy}" fill="rgba(255,255,255,0.75)" font-size="9" font-weight="700" text-anchor="end">${HEATMAP_AXIS_LABELS[row]}</text>`;
+    });
+
+    axes.rows.forEach((row, i) => {
+      axes.cols.forEach((col, j) => {
+        const x = marginLeft + j * cellW, y = marginTop + i * cellH;
+        const zone = zoneByKey[`${col}|${row}`];
+        if (!zone) {
+          svg += `<rect x="${x + pad}" y="${y + pad}" width="${cellW - pad * 2}" height="${cellH - pad * 2}" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.08)" stroke-width="1" rx="4"/>`;
+          return;
+        }
+        const fill = heatCellColor(zone.share / maxShare);
+        const dash = zone.sparse ? ' stroke-dasharray="3,3"' : '';
+        const tooltip = `${zone.label}: ${zone.count} play${zone.count === 1 ? '' : 's'} (${(zone.share * 100).toFixed(0)}% of this player's ${group.kind})${zone.sparse ? ' -- thin sample' : ''}`;
+        svg += `<rect x="${x + pad}" y="${y + pad}" width="${cellW - pad * 2}" height="${cellH - pad * 2}" fill="${fill}" stroke="rgba(255,255,255,0.4)" stroke-width="1"${dash} rx="4"><title>${tooltip}</title></rect>`;
+        svg += `<text x="${x + cellW / 2}" y="${y + cellH / 2 + 4}" fill="white" font-size="12" font-weight="800" text-anchor="middle" pointer-events="none">${Math.round(zone.share * 100)}%</text>`;
+        if (zone.sparse) {
+          svg += `<text x="${x + cellW - 7}" y="${y + 13}" fill="rgba(255,255,255,0.85)" font-size="10" font-weight="800" text-anchor="end" pointer-events="none">~</text>`;
+        }
+      });
+    });
+
+    return svg;
+  }
+
+  // Three states, same honesty pattern as renderPositionProfilePanel: a
+  // missing `heatmap` key (an old export predating this feature) reads as
+  // a generic placeholder; `heatmap.eligible === false` (too few games
+  // this season) states the exact games_played/min_games the export
+  // itself used; `heatmap.eligible === true` renders the real thing.
+  // getHeatmapTitle() is unchanged -- already live, gives the per-position
+  // title ("Route Tree", "Rushing Direction & Receiving", etc.).
+  function renderFieldHeatmapPanel(p) {
+    const advanced = getAdvancedPlayer(p.player_id);
+    const heatmap = advanced?.heatmap;
+
+    if (!heatmap) {
+      return `
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">${getHeatmapTitle(p.position)}</div>
+            <div class="panel-note">Real target/carry zones from play-by-play</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">🔥</div>
+            <div class="pd-placeholder-title">Awaiting field data</div>
+            <div class="pd-placeholder-text">
+              Once <code>player_advanced_stats.json</code> covers this player, this panel will show real
+              target/carry frequency by field zone, derived from play-by-play.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (!heatmap.eligible) {
+      return `
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">${getHeatmapTitle(p.position)}</div>
+            <div class="panel-note">Real target/carry zones from play-by-play</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">🔥</div>
+            <div class="pd-placeholder-title">Not enough games yet</div>
+            <div class="pd-placeholder-text">
+              ${heatmap.games_played} of ${heatmap.min_games} games played this season -- too few real plays yet
+              to show a usage pattern rather than noise. Check back in a few weeks.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    const GROUP_TITLES = { receiving: 'Receiving', rushing: 'Rushing', passing: 'Passing' };
+    const multiGroup = heatmap.groups.length > 1;
+
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">${getHeatmapTitle(p.position)}</div>
+          <div class="panel-note">Real target/carry zones from play-by-play</div>
+        </div>
+        ${heatmap.groups.map(g => `
+          ${multiGroup ? `<div class="heatmap-group-title">${GROUP_TITLES[g.kind] || g.kind} · ${g.total_plays} plays</div>` : ''}
+          <div class="field-container" style="margin-bottom: 10px;">
+            <svg class="field-svg" viewBox="0 0 400 280" xmlns="http://www.w3.org/2000/svg">${heatmapGroupSvg(g)}</svg>
+          </div>
+        `).join('')}
+        <div class="field-legend">
+          <span>Share of this player's ${multiGroup ? 'plays in each category' : heatmap.groups[0].kind}</span>
+          <div class="legend-gradient">
+            <span>Fewer</span><div class="legend-bar"></div><span>More</span>
+          </div>
+        </div>
+        <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 8px;">
+          ~ marks a zone with fewer than ${heatmap.sparse_threshold} real plays this season -- shown, not hidden,
+          but too thin a sample to read as a real tendency yet.
         </div>
       </div>
     `;
@@ -5406,21 +5592,7 @@
 
       <div class="pd-analytics-grid">
         ${renderPositionProfilePanel(p)}
-
-        <div class="panel">
-          <div class="panel-header">
-            <div class="panel-title">${getHeatmapTitle(p.position)}</div>
-            <div class="panel-note">Coming from your custom analytics</div>
-          </div>
-          <div class="pd-placeholder">
-            <div class="pd-placeholder-icon">🔥</div>
-            <div class="pd-placeholder-title">Awaiting field data</div>
-            <div class="pd-placeholder-text">
-              Field heatmap will render once your notebook outputs zone-level usage data from
-              <code>nflverse</code> play-by-play (pass / target / rush location frequencies).
-            </div>
-          </div>
-        </div>
+        ${renderFieldHeatmapPanel(p)}
       </div>
 
       <div class="panel" style="margin-top: 16px;">
@@ -5516,7 +5688,7 @@
                 label: function(ctx) {
                   const axis = playerRadar.axes[ctx.dataIndex];
                   const raw = axis.raw != null ? `${axis.raw}${axis.unit}` : '—';
-                  return `${axis.percentile}th percentile (${raw})`;
+                  return `${ordinal(axis.percentile)} percentile (${raw})`;
                 },
               },
             },

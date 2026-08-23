@@ -614,6 +614,135 @@ def build_radar_snapshot(
     return out
 
 
+# A display judgment call, not empirically derived the way MIN_GAMES_FOR_TREND
+# was (see Phase 3' findings) -- 1-2 plays in a zone could be one broken
+# play, one scramble drill, one garbage-time snap, not a real tendency.
+# Below this, a zone is flagged `sparse` rather than dropped or merged: the
+# play genuinely happened, so hiding it would understate real (if noisy)
+# usage, but rendering it at full visual weight would overstate confidence
+# in a 1-2-play sample. The UI's job is to show it, just not as solidly.
+HEATMAP_SPARSE_THRESHOLD = 3
+
+
+def build_heatmap_snapshot(
+    combined_features: pd.DataFrame,
+    pbp: pd.DataFrame,
+    target_season: int,
+    target_week: int,
+) -> dict:
+    """
+    Phase 5: one heatmap entry per candidate player_id (gsis_id-keyed,
+    same convention as build_radar_snapshot). Same eligibility gate as
+    radar -- reuses the player's own `games_played` from combined_features
+    (point-in-time-safe, from add_rolling_features) against
+    MIN_GAMES_FOR_TREND, a single whole-player gate: a heatmap with some
+    zones plotted from a real sample and others from a 1-play fluke would
+    misrepresent the player's actual usage pattern, so a short-on-games
+    player gets the same honest ineligible object as radar, not a partial
+    picture.
+
+    `groups` is one entry per HEATMAP_POSITION_KINDS kind for this
+    player's position (QB: passing only; RB: rushing AND receiving,
+    matching getHeatmapTitle()'s "Rushing Direction & Receiving"; WR/TE:
+    receiving only) -- shares are computed WITHIN each kind (a QB's
+    passing shares sum to 1.0 on their own; an RB's rushing shares and
+    receiving shares are two separate 1.0s), never combined into one pool,
+    since a target and a carry don't share a denominator any more than
+    Family 4's rz_target_share/rz_carry_share do (see PROJECT_CONTEXT.md's
+    design decisions).
+
+    `pbp` is scoped to target_season's weeks strictly before target_week
+    (already-played weeks only -- pbp for an unplayed week doesn't exist
+    yet regardless, this is a defensive belt-and-suspenders filter, same
+    reasoning as every other point-in-time-safe cutoff in this pipeline).
+
+    Returns: {player_id: heatmap_dict}, where heatmap_dict is either
+      {"eligible": False, "games_played": int, "min_games": MIN_GAMES_FOR_TREND}
+    or
+      {"eligible": True, "games_played": int, "min_games": MIN_GAMES_FOR_TREND,
+       "sparse_threshold": HEATMAP_SPARSE_THRESHOLD,
+       "groups": [{"kind": str, "total_plays": int,
+                   "zones": [{"id", "label", "count", "share", "sparse"}, ...]}, ...]}
+    (sparse_threshold rides along per-player, redundant but simple, so
+    index.html's "~ marks a zone with fewer than N plays" copy reads N
+    from the export instead of a second, hardcoded copy of the same
+    number that could quietly drift from this constant.)
+    """
+    from src.usage import (
+        HEATMAP_POSITION_KINDS, HEATMAP_ZONE_LABELS, MIN_GAMES_FOR_TREND, passing_zone_plays,
+        receiving_zone_plays, rushing_zone_plays,
+    )
+
+    target_mask = (combined_features["season"] == target_season) & (combined_features["week"] == target_week)
+    target_rows = combined_features.loc[target_mask, ["player_id", "position", "games_played"]]
+
+    # `pbp` can legitimately arrive completely empty (zero columns, not
+    # just zero rows) -- weekly_update.py passes that when the current
+    # season hasn't started yet and get_pbp itself can't be called (see
+    # its own comment for why). Guarded here, before touching any pbp
+    # column, rather than assumed to always have the real nflverse schema
+    # -- and skipped rather than passed into the zone functions, since a
+    # season with zero real pbp can only mean games_played is 0 for every
+    # candidate anyway (5+ games played is impossible without pbp for
+    # those games existing), so every candidate is ineligible below
+    # regardless of what the zone functions would have returned.
+    season_pbp = pbp[(pbp["season"] == target_season) & (pbp["week"] < target_week)] if not pbp.empty else pbp
+    if season_pbp.empty:
+        plays_by_kind = {kind: pd.DataFrame(columns=["player_id", "zone_a", "zone_b"]) for kind in ("receiving", "passing", "rushing")}
+    else:
+        plays_by_kind = {
+            "receiving": receiving_zone_plays(season_pbp),
+            "passing": passing_zone_plays(season_pbp),
+            "rushing": rushing_zone_plays(season_pbp),
+        }
+    # Pre-grouped ONCE per kind (not per player) -- looking up a player's
+    # zone counts is then a single groupby-result lookup, not an O(plays)
+    # scan repeated for every candidate.
+    counts_by_kind = {
+        kind: {pid: g.groupby(["zone_a", "zone_b"]).size() for pid, g in frame.groupby("player_id")}
+        for kind, frame in plays_by_kind.items()
+    }
+
+    out: dict = {}
+    for _, row in target_rows.iterrows():
+        kinds = HEATMAP_POSITION_KINDS.get(row["position"])
+        if kinds is None:
+            continue
+        player_id = row["player_id"]
+        games_played = int(row["games_played"])
+
+        if games_played < MIN_GAMES_FOR_TREND:
+            out[player_id] = {
+                "eligible": False, "games_played": games_played, "min_games": MIN_GAMES_FOR_TREND,
+            }
+            continue
+
+        groups = []
+        for kind in kinds:
+            counts = counts_by_kind[kind].get(player_id)
+            if counts is None or counts.empty:
+                continue
+            total = int(counts.sum())
+            zones = [
+                {
+                    "id": f"{zone_a}|{zone_b}",
+                    "label": f"{HEATMAP_ZONE_LABELS[zone_a]} · {HEATMAP_ZONE_LABELS[zone_b]}",
+                    "count": int(count),
+                    "share": round(int(count) / total, 3),
+                    "sparse": count < HEATMAP_SPARSE_THRESHOLD,
+                }
+                for (zone_a, zone_b), count in counts.sort_values(ascending=False).items()
+            ]
+            groups.append({"kind": kind, "total_plays": total, "zones": zones})
+
+        out[player_id] = {
+            "eligible": True, "games_played": games_played, "min_games": MIN_GAMES_FOR_TREND,
+            "sparse_threshold": HEATMAP_SPARSE_THRESHOLD, "groups": groups,
+        }
+
+    return out
+
+
 def build_xfp_summary(historical_features: pd.DataFrame, xfp_season: int) -> pd.DataFrame:
     """
     Real, completed-season xFP vs. actual custom_points, summed over
@@ -695,6 +824,7 @@ def assemble_player_advanced_stats(
     xfp_summary: pd.DataFrame,
     weekly_xfp: pd.DataFrame,
     radar: dict,
+    heatmap: dict,
     crosswalk: pd.DataFrame,
     target_season: int,
     target_week: int,
@@ -731,6 +861,9 @@ def assemble_player_advanced_stats(
     covers every RADAR_METRICS position for every target-week candidate,
     this is defensive, not expected) falls back to an honest "not
     eligible, 0 games" object rather than a KeyError.
+
+    `heatmap` (build_heatmap_snapshot's output) is the same shape of
+    {player_id: dict} mapping as `radar`, same fallback reasoning.
 
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
@@ -785,6 +918,9 @@ def assemble_player_advanced_stats(
             },
             "weekly_xfp": weekly_xfp_by_player.get(row["player_id"], {}),
             "radar": radar.get(
+                row["player_id"], {"eligible": False, "games_played": 0, "min_games": MIN_GAMES_FOR_TREND}
+            ),
+            "heatmap": heatmap.get(
                 row["player_id"], {"eligible": False, "games_played": 0, "min_games": MIN_GAMES_FOR_TREND}
             ),
         }
@@ -850,12 +986,26 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         f"{len(bad_radar_percentiles)} players have an out-of-range radar percentile: {bad_radar_percentiles[:5]}"
     )
 
+    bad_heatmap_shares = [
+        pid for pid, p in players.items()
+        if p["heatmap"]["eligible"]
+        and any(
+            abs(sum(z["share"] for z in g["zones"]) - 1.0) > 0.01 or any(z["count"] < 0 for z in g["zones"])
+            for g in p["heatmap"]["groups"]
+        )
+    ]
+    assert not bad_heatmap_shares, (
+        f"{len(bad_heatmap_shares)} players have a heatmap group whose zone shares don't sum to ~1.0 "
+        f"or contain a negative count: {bad_heatmap_shares[:5]}"
+    )
+
     return {
         "n_players": len(players),
         "all_keys_real_sleeper_ids": True,
         "no_null_projections": True,
         "floor_le_point_le_ceiling": True,
         "radar_percentiles_in_range": True,
+        "heatmap_shares_sum_to_one": True,
     }
 
 

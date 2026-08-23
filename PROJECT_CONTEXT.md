@@ -54,7 +54,14 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > against a real startable-player pool ported from `index.html`'s own
 > `positionStarterCount()`, with an honest ineligible state below a
 > games-played floor rather than a misleading shape — see **Phase 4
-> findings** below. See **Verification status** near the end before
+> findings** below. Phase 5 (field heatmap zones) is also done — real
+> target/carry zones derived directly from play-by-play (never from a
+> pre-aggregated feature column), a fixed-shape SVG grid per zone kind so
+> two players stay visually comparable, and thin zones shown as `sparse`
+> rather than dropped or merged — see **Phase 5 findings** below, which
+> also documents a real `nflreadpy.load_pbp()` bug this phase's own
+> verification run caught and fixed before it reached a committed export.
+> See **Verification status** near the end before
 > treating any pipeline claim as settled.
 
 ---
@@ -182,7 +189,7 @@ These are non-negotiable — they've shaped every decision we've made:
 - 4 KPI cards in icon-tile style: Season Pts, Avg/Game (with position rank like "QB7 overall"), Sleeper Proj, Best Week
 - **Opportunity Shares panel** (Phase 8 round 1) — plain snap %/target share/carry share/red-zone share, no interpretation layered on. Carry share and red-zone share are read from the export's `trend.<feature>.current` (no `usage.*` counterpart exists for those two); red-zone share specifically uses the properly-combined `trend.red_zone_share`, not the two separate `usage.rz_target_share_ewm3`/`rz_carry_share_ewm3` (different denominators, can't be summed — see design decisions below). Per-stat empty state ("— · No games yet") when a value is null, not a whole-panel placeholder.
 - **Position profile panel** (Phase 4) — a real 6-axis Chart.js percentile radar per position (QB/RB/WR/TE, each axis its own genuinely-informative mix of volume/share/efficiency/situational stats, not a forced identical template), percentiled against this league's real startable-player pool (`position_starter_counts()`, ported from the Weekly Production chart's own `positionStarterCount()`). A raw-value list below the chart shows the actual stat behind each percentile — "Nth percentile" is a rank among startable players at the position, explicitly labeled as such, not a 0-100 quality score. Honest "Not enough games yet" empty state (with the real games-played count) when a player hasn't cleared the games floor; the earlier "Awaiting model output" placeholder still shows for an export that predates this key entirely.
-- **Field heatmap panel**: Same placeholder pattern
+- **Field heatmap panel** (Phase 5) — a real SVG field-zone grid per position, derived directly from play-by-play (not from any pre-aggregated feature table): receivers (WR/TE, and RB's receiving work) zoned by air-yards depth x field position, runners by direction x field position, QBs by pass location x depth. A fixed-shape grid per zone kind so two players' charts stay visually comparable — an empty cell means zero real plays there, a solidly-colored cell is a real, well-sampled tendency, and a dashed/`~`-marked cell is real but thin (below `HEATMAP_SPARSE_THRESHOLD` plays) so it's shown, not hidden, without being read as confidently as a solid one. RB gets two independent grids (rushing and receiving, matching `getHeatmapTitle()`'s "Rushing Direction & Receiving") since a carry and a target don't share a denominator. Same games-played eligibility floor and honest empty states as the radar panel above.
 - **Weekly Production chart** — real bars, 3 reference lines toggleable via legend:
   - **Season Avg** (dashed gray, on by default) — this player's own avg
   - **Sleeper Proj** (orange line, on by default) — Sleeper's projection per week
@@ -255,7 +262,7 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 | 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 6-10 (Phase 6 model A/B + quantile/SHAP/CQR, Phase 6.5 game-environment + season simulation) are all done — see **Phase 6 findings** and **Phase 6.5 findings**. Remaining work is Phase 7 (JSON export) and Phase 8 (automation), plus anything beyond this spec's original 10-step list (e.g. championship/bracket odds). |
 | 3' | Usage trend signal — replaces role classification (see `NOTEBOOK_OUTLINE.md`'s Phase 3') | **Done** — `src/usage.py` Family 7 (`add_trend_features`, `get_usage_trend_leaders`) + `04_usage_trends.ipynb`. Window (3-week EWM half-life) and direction threshold (z > 0.25) both validated against real hold-vs-revert data, not assumed — see **Phase 3' findings** below. Wired into Phase 7's export as a new `trend` key. |
 | 4 | Radar metrics — 0-100 percentile normalization within position | **Done** — `src/export.py`'s `RADAR_METRICS`/`position_starter_counts()`/`build_radar_snapshot()`, wired into the export as a new `radar` key and rendered as a real Chart.js radar on Player Detail. See **Phase 4 findings** below. |
-| 5 | Heatmap zones — field-location frequency tables | Not started |
+| 5 | Heatmap zones — field-location frequency tables | **Done** — `src/usage.py`'s `receiving_zone_plays`/`passing_zone_plays`/`rushing_zone_plays` (real pbp bucketing) plus `src/export.py`'s `build_heatmap_snapshot()`, wired into the export as a new `heatmap` key and rendered as a real SVG field-zone grid on Player Detail. See **Phase 5 findings** below. |
 | 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. Step 8 (quantile floor/ceiling models + SHAP) is done: coverage is measured and honestly overconfident (67-75% actual vs. 80% target for the 10th-90th interval), and SHAP shows nothing that looks like a leak. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
 | 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Steps 9-10 **done** (`src/simulate.py` — game-environment sampling, matchup + season simulation, playoff-qualification odds) — see **Phase 6.5 findings**. Validated against 204 real historical matchups and 8 season-snapshot combinations: calibration is reasonable where there's enough data to judge it in both. Untuned rho=0.35 sensitivity for playoff odds is small (~0.7pt mean, ~3pt max across rho 0.2-0.5). Championship/bracket-round odds are a separate, not-yet-started piece of work. |
 | 7 | JSON export — assemble `player_advanced_stats.json` | **Done** — `src/export.py` + `07_export_json.ipynb`. Predicts the real upcoming week (2026 Wk1) by reusing the existing point-in-time-safe feature pipeline on a stub row, not new future-facing logic. 300 players (2026 league is `pre_draft` as of this run, so scope is top-300 by projection until the real draft happens — picks up real rosters automatically on a re-run, no code change needed), 219 KB (grew from 132 KB after Phase 3''s `trend` key was added), crosswalk match rate 98.99%. `trend` (Phase 3') is now a real per-player key, entirely null in the current pre-draft/Wk1 export by construction (no in-season games yet) — will populate from week 6 onward once real games exist. `radar`/`heatmap` (Phases 4-5) can still slot in as new per-player keys later without restructuring anything. |
@@ -518,6 +525,160 @@ Profile specifically; overlaying multiple players' radars on one chart is
 a distinct UI problem (Chart.js's `radar` type supports multiple datasets,
 so the data is already there whenever this is picked up) left for later,
 not silently dropped.
+
+---
+
+## Phase 5 findings
+
+`src/usage.py`'s `receiving_zone_plays()`/`passing_zone_plays()`/
+`rushing_zone_plays()` (real pbp bucketing) and `src/export.py`'s
+`build_heatmap_snapshot()` (per-player aggregation into eligible/groups/
+zones) — a `heatmap` sibling key alongside `projection`/`usage`/`trend`/
+`xfp`/`radar`, wired through the same two callers (`scripts/
+weekly_update.py`, `07_export_json.ipynb`) the same way. `index.html`'s
+Field Heatmap panel now renders a real SVG field-zone grid instead of the
+placeholder card.
+
+**Zones are derived straight from play-by-play, not from any
+pre-aggregated feature column** — the one explicit ask this phase's
+request called out, and the one place a fabricated PRNG shape used to
+live before it was deleted (see the dashboard cleanup pass that removed
+~525 lines of dead `getRadarStats`/`renderFieldHeatmap` code). Every zone
+count in the export traces to a real `pass_attempt`/`rush_attempt` row.
+
+**Bin definitions are deliberately SEPARATE from xFP's, despite sharing
+the same two raw ingredients (air-yards depth, yardline_100 field
+position).** xFP's buckets (`TARGET_AIR_YARDS_BINS`/`TARGET_FIELD_POS_BINS`
+in `src/usage.py`) are shaped for a league-average RATE ESTIMATE that
+needs enough plays per bucket to be reliable across every player at once
+(hence xFP's thin-bucket MERGE step, `_TARGET_BUCKET_MERGES`). A heatmap
+zone's reliability is about one player's OWN sample, a different problem
+solved a different way (the per-zone `sparse` flag, not a global bucket
+merge) — see the eligibility section below. New `HEATMAP_DEPTH_BINS`
+(behind_los / short / intermediate / deep) and `HEATMAP_FIELD_POS_BINS`
+(red_zone / midfield / backfield) exist for exactly this reason: fewer,
+display-shaped bands, not xFP's rate-estimation-shaped ones.
+
+**Three zone kinds, one per real usage type, not six axes forced onto
+every position the way the radar's axes are picked per position.**
+Receivers (WR/TE, and RB's receiving work): depth x field position, same
+shape as the xFP target bucket's two ingredients. Runners (RB only —
+matching `getHeatmapTitle()`'s already-live "Rushing Direction &
+Receiving" title, which doesn't promise QB rushing): direction
+(`run_location`: left/middle/right) x field position. QBs: pass location
+(`pass_location`: left/middle/right) x depth — matching `getHeatmapTitle()`'s
+"Pass Distribution" title, no rushing zones for QBs even though they do
+carry the ball, the same scope choice the title already made before this
+phase started. `HEATMAP_POSITION_KINDS` in `src/usage.py` is the single
+place this mapping lives.
+
+**A real pbp gotcha caught before it reached the export, the same class
+already documented for `pass_attempt`:** `pass_attempt==1` fires on sack
+rows too (see PROJECT_CONTEXT.md's existing note on pass-attempt-shaped
+denominators), which have no real `pass_location`/`air_yards` (verified
+directly: 1,287 of 1,367 real-2025 rows missing `pass_location` on a
+`pass_attempt==1` frame were sacks, the rest spikes). `passing_zone_plays`
+and `receiving_zone_plays` both build from the exact same "real target"
+population `_target_play_frame` already established for xFP (a recorded
+receiver, not just `pass_attempt==1`), which excludes sacks and spikes
+automatically — no separate `sack` filter needed, confirmed with a
+dedicated test (`tests/test_heatmap.py::test_passing_zone_plays_groups_by_passer_and_excludes_sacks`)
+rather than assumed. `run_location` coverage on real 2025 carries is
+99.3% (14,074/14,168) — the small remainder drops rather than guesses a
+direction.
+
+**Eligibility reuses radar's exact gate, per the request — one whole-player
+decision, not a per-zone one.** `games_played >= MIN_GAMES_FOR_TREND` (the
+same Phase 3'-validated floor radar already reuses, not a third
+separately-justified number) gates the ENTIRE heatmap: a player short on
+games gets `{"eligible": false, "games_played": N, "min_games": 5}`, never
+a chart with some zones from a real sample and others from a 1-play
+fluke, which would draw a misleading shape.
+
+**Thin zones are shown, not hidden or merged — `HEATMAP_SPARSE_THRESHOLD =
+3`, an explicitly-labeled DISPLAY judgment call, not an empirically
+derived number like `MIN_GAMES_FOR_TREND` was.** A zone below 3 real plays
+this season gets `sparse: true` (a dashed border and a `~` mark in the
+UI) rather than being dropped: the play genuinely happened, so hiding it
+would understate real (if noisy) usage, but drawing it at full visual
+weight would overstate confidence in a 1-2-play sample. This is a
+per-PLAYER, per-ZONE decision, deliberately different from xFP's
+per-LEAGUE bucket merge — the two solve different reliability problems
+(one player's own small sample vs. a league-wide rate table's sample),
+so they use different fixes.
+
+**Real bug caught before either reached a committed export, same root
+cause in two places (`scripts/weekly_update.py` and
+`07_export_json.ipynb`):** `nflreadpy.load_pbp()` raises a bare
+`ValueError("Season must be between 1999 and <n>")` for a season that
+hasn't started yet — a client-side range check, not the ConnectionError/404
+shape `_is_unpublished_season_error` already handles for
+`get_weekly_stats`. Running the real weekly-update script locally against
+the live pre-draft 2026 league surfaced this immediately (it's the exact
+real condition, not a hypothetical): `build_raw_features`'s own
+`if weekly_scored.empty: return weekly_scored` early-out means it never
+even calls `get_pbp` when nothing's been played yet, so the heatmap step
+was the FIRST caller in this run to actually try fetching 2026 pbp. Fixed
+with the same architectural choice `build_weekly_scored`'s own tolerance
+already made: the "unpublished season is fine, treat as empty" leniency
+lives at this ONE caller, not inside `get_pbp` itself, so every other
+`get_pbp` caller (which requests seasons known to be published) still
+fails loudly on a real bug. `build_heatmap_snapshot` treats a completely
+empty `pbp` (zero columns, not just zero rows) as "nothing to zone" before
+touching any column, which is provably correct in this exact scenario:
+5+ games played is impossible without pbp for those games existing, so
+every candidate is already ineligible via the games-played gate regardless
+of what the zone functions would have returned.
+
+**Verified against the real, completed 2025 season (league
+`1250182471429931008`), replayed point-in-time-safe at week 10 the same
+way Phase 4's did.** Real play counts reported before trusting any
+number, per the request: 391/555 candidates eligible, real per-zone counts
+ranging from single-digit (correctly flagged `sparse`) to 141 real carries
+for a workhorse back. Four real players spot-checked specifically for the
+requested archetype contrasts, selected from real, already-verified radar
+percentiles (highest/lowest aDOT among real 20+-target WRs; highest
+goal-line share / highest target share among real RBs) rather than
+hand-picked:
+- **Tyquan Thornton (WR, KC) vs. Khalil Shakir (WR, BUF)** — a genuine
+  deep-threat/possession-receiver contrast. Thornton: 60.7% of his 28 real
+  targets in the two "Deep" zones combined (32.1% Deep|Backfield, 28.6%
+  Deep|Midfield), nothing in the Red Zone. Shakir: 75%+ of his 49 real
+  targets in Short/Behind-LOS zones, a single sparse Deep zone (4.1%, one
+  play). The two players' grids light up on opposite sides of the depth
+  axis with zero overlap in their dominant zones — exactly the "should
+  look different" the request asked to confirm, on real 2025 usage, not
+  a designed example.
+- **Josh Jacobs (RB, GB) vs. Christian McCaffrey (RB, SF)** — a genuine
+  goal-line-back/passing-down-back contrast. Jacobs: 141 real carries
+  spread fairly evenly across all 9 direction x field-position cells
+  (real red-zone volume: Left/Middle/Right x Red Zone sum to 27.1% of his
+  carries) but only 28 real targets, concentrated almost entirely in
+  Behind-LOS/Short x Backfield (checkdown-shaped, not real route-running).
+  McCaffrey: 168 real carries in a similar rushing shape, but 80 real
+  targets spread across 10 different zones including real (if sparse)
+  Deep and Intermediate receiving work and real red-zone targets — a
+  materially fuller receiving profile than Jacobs' on the same real
+  season. Both real backs' RADAR profiles already told part of this story
+  (Jacobs 97th percentile Goal-Line Share; McCaffrey 98th percentile
+  Target Share) — the heatmap grids make the underlying real usage
+  visible rather than just ranked.
+
+Frontend verified via Playwright against the same real week-10 export:
+correct panel titles and grid counts per position (`Route Tree` / 1 grid
+for WR, `Rushing Direction & Receiving` / 2 grids for RB), the ineligible
+state (Joe Burrow, 4 of 5 games) rendering its specific reason rather than
+a generic placeholder, and zero new console errors across a full
+click-through of every dashboard view. `data/output/player_advanced_stats.json`
+regenerated for real against the live 2026 pre-draft league — the same
+`ValueError` bug above was caught and fixed via this exact run, not
+discovered later.
+
+**Also fixed while here, unrelated to Phase 5 itself but directly visible
+in these verification screenshots:** the radar panel's percentile text
+used a naive `+ 'th'` suffix (e.g. "3th pctl", "51th pctl"). Added a small
+`ordinal()` helper (`index.html`) handling the 11th/12th/13th special
+case, used by both the radar axis list and its Chart.js tooltip.
 
 ---
 
@@ -1158,6 +1319,7 @@ assumptions as facts.
 | Round 2 dashboard panels (win probability, playoff odds) render correctly and null-safely | **Verified** — Playwright + a UTF-8-aware local server, both against the populated case (index.html temporarily pointed at the real 2025 league so matchup roster_ids matched the test export — never committed) and the null case (the real, pre-simulation-key 2026 export, a stricter test than an explicit `null`). Zero new console errors either way; see **Phase 8 findings** for what each screenshot showed. |
 | `getMatchupWinProb()`/`getPlayoffOdds()` gate on `meta.season` matching the displayed league's season, not just week | **Verified — a real gap found in a full-dashboard audit, since fixed.** Neither getter checked `meta.season` (`getPlayoffOdds` checked nothing at all — not season, not week — just whether a `playoff_odds` entry existed for the roster id). This mattered specifically because of `fetchAllRealData()`'s `previous_league_id` fallback: right after a new season's draft, before any of that season's games are played, the dashboard still displays the PRIOR season (`hasGames` still false) while `weekly-update.yml` may already have written a `simulation` block for the NEW season's week 1 — unguarded, that block's week-1 win probabilities/playoff odds would silently attach to the prior season's already-decided week-1 matchups and standings just because the week numbers happen to collide. `getPlayoffOdds` had a second, same-season risk too: `roster_id` isn't guaranteed to mean the same team across two different seasons' leagues. Fixed with a shared `simulationMatchesCurrentView()` gate (`index.html`) requiring both `meta.season === league.season` and `simulation.week === selectedWeek`, applied to both getters and to the three inline caveat-footer conditions that previously only checked week (so a caveat could show with no data behind it). This is a deliberate behavior change for `getPlayoffOdds` specifically: it now reads `—` for any week other than the one the export covers, not only for a season mismatch, trading the previous "always show the latest known odds" behavior for the same never-show-a-stale-number rule `getMyProj()` already followed. Verified against the real, completed 2025 season (league `1250182471429931008`): a real week-10 simulation block was rebuilt the same way Round 2's did (point-in-time-safe history truncated to weeks < 10, real model artifact, real Sleeper matchups/rosters) and served two ways — with `meta.season: 2025` (matching the displayed league), all 14 win-probability badges (7 real matchups) and all 14 rosters' playoff-odds percentages rendered, with both caveat footers visible; with the identical export relabeled `meta.season: 2026` (season mismatch only, week held constant at 10 in both), every badge and every Playoff Odds cell blanked to `—` and both caveat footers disappeared. Confirmed via Playwright against a local server, zero unexplained console errors in either case (the only console noise was the ESPN scoreboard sidebar's CORS failure, a known artifact of serving off of GitHub Pages' origin, unrelated to this change). |
 | Phase 4 radar percentiles (`position_starter_counts()`, `build_radar_snapshot()`) are correct and match `index.html`'s startable-count logic | **Verified** — `position_starter_counts()` pinned against this league's real `roster_positions` (14 teams) reproduces QB=14/RB=33/WR=35/TE=16, matching the Weekly Production chart's own already-published "~35" WR footnote. Replayed against the real, completed 2025 season at week 10 (point-in-time-safe history, real model artifact): 391/555 candidates eligible, and 5 real, well-known players (Christian McCaffrey, James Cook, Justin Jefferson, Puka Nacua, Travis Kelce) each produced a percentile profile matching their real-world reputation on inspection, plus Joe Burrow correctly came back ineligible (4 of 5 games) for his real, injury-shortened 2025 season. Frontend verified via Playwright: the eligible case renders a real Chart.js radar whose `Chart.getChart(canvas).data` matches the Python-computed percentiles exactly; the ineligible case renders the specific games-played empty state. Zero new console errors. See **Phase 4 findings**. |
+| Phase 5 heatmap zones (`receiving_zone_plays()`/`passing_zone_plays()`/`rushing_zone_plays()`, `build_heatmap_snapshot()`) derive real zones from real pbp and read correctly per position | **Verified** — replayed against the real, completed 2025 season at week 10 (point-in-time-safe history, real model artifact, real pbp): 391/555 candidates eligible, real play counts reported and spot-checked (single digits up to 168 real carries for a workhorse back). Two archetype contrasts specifically requested were confirmed on real, not hand-picked, players — Tyquan Thornton (60.7% of real targets in the two Deep zones) vs. Khalil Shakir (75%+ in Short/Behind-LOS zones, near-zero deep usage) for deep-threat-vs-slot; Josh Jacobs (real red-zone-heavy rushing, checkdown-only receiving on 28 real targets) vs. Christian McCaffrey (a similar rushing shape but 80 real targets spread across 10 zones including real intermediate/deep work) for goal-line-vs-passing-down. A real production bug was caught and fixed in the process: `nflreadpy.load_pbp()` raises `ValueError` (not the already-handled ConnectionError/404 shape) for a season with no pbp published yet, surfaced by running `scripts/weekly_update.py` for real against the live pre-draft 2026 league — fixed at that one caller (and the notebook's equivalent cell), matching where `build_weekly_scored`'s own analogous tolerance already lives, not pushed into `get_pbp` itself. Frontend verified via Playwright: correct panel titles/grid counts per position, the ineligible state renders its specific games-played reason, zero new console errors across a full click-through. See **Phase 5 findings**. |
 
 ## What's outstanding
 
@@ -1171,8 +1333,9 @@ assumptions as facts.
 - Push the latest `index.html` changes to GitHub Pages (all recent work is local)
 - **Activity feed panel** sizing vs matchups panel — layout issue, minor
 - **NFL sidebar** currently shows preseason week labels; should default to last completed regular-season week
-- **Build out the Python notebook pipeline** — Phase 4 (radar) is done; Phase 5 (heatmap) still not started
-- **Comparison tab's "Profile Overlay" placeholder** still needs wiring — Phase 4's `radar` key has the data, but overlaying multiple players' radars on one Chart.js chart (vs. Player Detail's single-player radar) wasn't part of this round; see **Phase 4 findings**
+- **Build out the Python notebook pipeline** — Phases 4 (radar) and 5 (heatmap) are both done; the outline's remaining phases (6 shipping a model, further iteration) are the only ones left unstarted
+- **Comparison tab's "Profile Overlay" placeholder** still needs wiring — Phase 4's `radar` key has the data, but overlaying multiple players' radars on one Chart.js chart (vs. Player Detail's single-player radar) wasn't part of that round; see **Phase 4 findings**. No equivalent multi-player heatmap overlay was requested or built for Phase 5 either.
+- **`get_pbp()` still raises a raw, unguarded `ValueError` for an unpublished season in the general case** — only `scripts/weekly_update.py`'s and `07_export_json.ipynb`'s single-current-season heatmap-building callers were fixed (see **Phase 5 findings**), matching the same narrowly-scoped-fix pattern already true of `get_weekly_stats`'s equivalent 404 case (see the `src/ingest.py`-level season guard item below, which this is the same open item as, just a second exception shape).
 - **Historical champion data** — plan is to maintain a small `champions.json` file by hand for the league's history
 - **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
 

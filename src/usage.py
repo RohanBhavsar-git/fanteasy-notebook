@@ -1115,6 +1115,132 @@ def add_xfp_features(
 
 
 # ==========================================================================
+# FIELD HEATMAP ZONES (Phase 5) — display-only, never a model feature
+# ==========================================================================
+# Deliberately SEPARATE bin definitions from the xFP buckets above, built
+# from the same two raw ingredients (air_yards depth, yardline_100 field
+# position) but shaped for a human reading a chart at a glance rather than
+# for a league-average RATE ESTIMATE that needs enough plays per bucket to
+# be statistically reliable across every player at once. xFP's
+# merge-thin-buckets step (_TARGET_BUCKET_MERGES) solves a different
+# problem -- a league-wide rate table's reliability; a heatmap zone's
+# reliability is about ONE player's own sample, handled per-player by the
+# `sparse` flag in src/export.py::build_heatmap_snapshot instead of a
+# global bucket merge.
+HEATMAP_DEPTH_BINS = [-float("inf"), 0, 10, 20, float("inf")]
+HEATMAP_DEPTH_LABELS = ["behind_los", "short", "intermediate", "deep"]
+HEATMAP_FIELD_POS_BINS = [-float("inf"), 20, 50, float("inf")]
+HEATMAP_FIELD_POS_LABELS = ["red_zone", "midfield", "backfield"]
+
+HEATMAP_ZONE_LABELS = {
+    "behind_los": "Behind LOS", "short": "Short", "intermediate": "Intermediate", "deep": "Deep",
+    "red_zone": "Red Zone", "midfield": "Midfield", "backfield": "Backfield",
+    "left": "Left", "middle": "Middle", "right": "Right",
+}
+
+# Which zone kinds apply to which position -- QB gets pass location x
+# depth only (no rushing zones, even though QBs do carry -- matches
+# getHeatmapTitle()'s already-live "Pass Distribution" title, which
+# doesn't promise a rushing view). RB gets both real usage types it
+# actually has, matching getHeatmapTitle()'s "Rushing Direction &
+# Receiving".
+HEATMAP_POSITION_KINDS = {
+    "QB": ["passing"],
+    "RB": ["rushing", "receiving"],
+    "WR": ["receiving"],
+    "TE": ["receiving"],
+}
+
+
+def _real_target_plays(pbp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Every real target (pass_attempt==1, a recorded receiver, not a 2pt
+    try) -- the SAME population _target_play_frame builds for xFP, kept
+    as a separate copy here rather than imported so a change to xFP's
+    scoring-oriented frame can't silently change what a heatmap zone
+    counts. air_yards/yardline_100 are both ~100% populated on this real
+    population (verified directly against 2025 pbp: 0% null on either
+    column for real targets) -- the notna() filter below is defensive,
+    not expected to drop real rows.
+    """
+    mask = (
+        (pbp["season_type"] == "REG") & (pbp["pass_attempt"] == 1)
+        & pbp["receiver_player_id"].notna() & (pbp["two_point_attempt"] == 0)
+    )
+    src = pbp.loc[mask]
+    return src[src["air_yards"].notna() & src["yardline_100"].notna()]
+
+
+def receiving_zone_plays(pbp: pd.DataFrame) -> pd.DataFrame:
+    """One row per real target, zoned by depth x field position (both
+    HEATMAP_* bins, not xFP's). zone_a=depth, zone_b=field position."""
+    src = _real_target_plays(pbp)
+    depth = pd.cut(src["air_yards"], HEATMAP_DEPTH_BINS, labels=HEATMAP_DEPTH_LABELS, right=False).astype(str)
+    field_pos = pd.cut(src["yardline_100"], HEATMAP_FIELD_POS_BINS, labels=HEATMAP_FIELD_POS_LABELS, right=True).astype(str)
+    return pd.DataFrame({
+        "player_id": src["receiver_player_id"].to_numpy(),
+        "season": src["season"].to_numpy(),
+        "week": src["week"].to_numpy(),
+        "zone_a": depth.to_numpy(),
+        "zone_b": field_pos.to_numpy(),
+    })
+
+
+def passing_zone_plays(pbp: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per real target, zoned by pass_location x depth, attributed
+    to the PASSER rather than the receiver -- the same real-target
+    population as receiving_zone_plays, just grouped by whoever threw it.
+    zone_a=location, zone_b=depth (reversed order from receiving_zone_plays
+    on purpose -- "pass location and depth" is how a QB's own chart reads,
+    left-to-right then how deep).
+
+    pass_attempt==1 also fires on sack rows in this pbp snapshot (see
+    PROJECT_CONTEXT.md's "ID columns are strings" sibling note on
+    pass-attempt-shaped denominators) -- _real_target_plays already
+    excludes those by requiring a real receiver_player_id, which a sack
+    never has, so no separate sack filter is needed here.
+    """
+    src = _real_target_plays(pbp)
+    location = src["pass_location"].astype(str)
+    depth = pd.cut(src["air_yards"], HEATMAP_DEPTH_BINS, labels=HEATMAP_DEPTH_LABELS, right=False).astype(str)
+    valid = src["pass_location"].notna()
+    return pd.DataFrame({
+        "player_id": src.loc[valid, "passer_player_id"].to_numpy(),
+        "season": src.loc[valid, "season"].to_numpy(),
+        "week": src.loc[valid, "week"].to_numpy(),
+        "zone_a": location[valid].to_numpy(),
+        "zone_b": depth[valid].to_numpy(),
+    })
+
+
+def rushing_zone_plays(pbp: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per real carry (rush_attempt==1, a recorded rusher, not a 2pt
+    try or a kneel -- the SAME population _carry_play_frame builds for
+    xFP), zoned by run_location x field position. 99.3% of real 2025
+    carries have a known run_location (verified directly); the ~0.7%
+    without one are dropped, an honest small gap rather than a guessed
+    direction. zone_a=direction, zone_b=field position.
+    """
+    mask = (
+        (pbp["season_type"] == "REG") & (pbp["rush_attempt"] == 1)
+        & pbp["rusher_player_id"].notna() & (pbp["two_point_attempt"] == 0)
+        & (pbp["qb_kneel"] == 0)
+    )
+    src = pbp.loc[mask]
+    src = src[src["run_location"].notna() & src["yardline_100"].notna()]
+    field_pos = pd.cut(src["yardline_100"], HEATMAP_FIELD_POS_BINS, labels=HEATMAP_FIELD_POS_LABELS, right=True).astype(str)
+    return pd.DataFrame({
+        "player_id": src["rusher_player_id"].to_numpy(),
+        "season": src["season"].to_numpy(),
+        "week": src["week"].to_numpy(),
+        "zone_a": src["run_location"].to_numpy(),
+        "zone_b": field_pos.to_numpy(),
+    })
+
+
+# ==========================================================================
 # FAMILY 6 — ROLLING AGGREGATES (step 4)
 # ==========================================================================
 # Every continuous PLAYER feature from Families 1-4 and xFP (volume/share,

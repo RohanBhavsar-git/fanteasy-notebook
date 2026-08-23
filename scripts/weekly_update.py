@@ -55,13 +55,14 @@ import pandas as pd  # noqa: E402
 
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
-    CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_matchup_simulation,
-    build_playoff_odds, build_radar_snapshot, build_starter_quantile_rows, build_target_week_features,
-    build_team_game_id_lookup, build_trend_snapshot, build_usage_snapshot, build_weekly_xfp, build_xfp_summary,
-    get_export_candidates, get_export_scope, predict_target_week_from_artifact, validate_export, validate_simulation,
+    CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_heatmap_snapshot,
+    build_matchup_simulation, build_playoff_odds, build_radar_snapshot, build_starter_quantile_rows,
+    build_target_week_features, build_team_game_id_lookup, build_trend_snapshot, build_usage_snapshot,
+    build_weekly_xfp, build_xfp_summary, get_export_candidates, get_export_scope,
+    predict_target_week_from_artifact, validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
-    DATA_OUTPUT, DEFAULT_LEAGUE_ID, get_id_crosswalk, get_schedule, get_sleeper_league,
+    DATA_OUTPUT, DEFAULT_LEAGUE_ID, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
     get_sleeper_matchups, get_sleeper_players, get_sleeper_projections, get_sleeper_rosters,
 )
 from src.model import predict_quantiles_with_models, sleeper_projected_points  # noqa: E402
@@ -334,8 +335,39 @@ def main() -> None:
     n_eligible = sum(1 for r in radar.values() if r["eligible"])
     print(f"    radar: {n_eligible}/{len(radar)} candidates eligible (>= games played floor)")
 
+    # Phase 5: field heatmap zones -- needs raw pbp for current_season.
+    # build_raw_features (Step 3 above) does NOT already have this cached:
+    # its `if weekly_scored.empty: return weekly_scored` early-out means it
+    # never calls get_pbp at all when raw_current is empty (a not-yet-
+    # started season, this run's real case) -- so this is a genuine first
+    # fetch, not a cache read.
+    #
+    # nflreadpy.load_pbp() raises ValueError("Season must be between 1999
+    # and <its own current-season guess>") for a season that hasn't
+    # started yet -- a client-side check, before any network call, so it's
+    # not the ConnectionError/404 shape _is_unpublished_season_error
+    # already handles for get_weekly_stats. Same real condition
+    # (build_weekly_scored's own current_season fetch above already logged
+    # "0 real rows played so far this season"), so it gets the same
+    # tolerance, scoped to just this call -- not pushed into get_pbp
+    # itself, matching why build_weekly_scored's own tolerance lives at
+    # its caller and not inside get_weekly_stats (see that function's
+    # docstring): every OTHER get_pbp caller in this pipeline requests
+    # seasons known to be published, where this error would be a real bug
+    # that should still fail loudly.
+    try:
+        pbp_current = get_pbp([current_season])
+    except ValueError as e:
+        if "must be between" not in str(e):
+            raise
+        print(f"    pbp: season {current_season} has no published play-by-play yet -- heatmap zones will be empty.")
+        pbp_current = pd.DataFrame()  # build_heatmap_snapshot treats an empty pbp as "nothing to zone" -- see its own comment
+    heatmap = build_heatmap_snapshot(combined_features, pbp_current, current_season, target_week)
+    n_heatmap_eligible = sum(1 for h in heatmap.values() if h["eligible"])
+    print(f"    heatmap: {n_heatmap_eligible}/{len(heatmap)} candidates eligible (>= games played floor)")
+
     payload, crosswalk_report = assemble_player_advanced_stats(
-        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, crosswalk,
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, heatmap, crosswalk,
         current_season, target_week, artifact["seasons_trained"], artifact["model_version"],
         performance=artifact["performance"],
         caveats=CAVEATS + WEEKLY_EXTRA_CAVEATS,

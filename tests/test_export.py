@@ -16,6 +16,7 @@ import src.export as export_module  # noqa: E402
 from src.export import (  # noqa: E402
     assemble_player_advanced_stats,
     assemble_simulation_block,
+    build_heatmap_snapshot,
     build_matchup_simulation,
     build_playoff_odds,
     build_radar_snapshot,
@@ -295,6 +296,144 @@ def test_build_radar_snapshot_all_ineligible_when_nobody_clears_games_floor():
     assert radar["w1"] == {"eligible": False, "games_played": 1, "min_games": 5}
 
 
+# ==========================================================================
+# PHASE 5: field heatmap zones
+# ==========================================================================
+def _pbp_row(**overrides):
+    """
+    build_heatmap_snapshot runs receiving_zone_plays/passing_zone_plays/
+    rushing_zone_plays over the SAME full pbp frame regardless of which
+    kinds a given test cares about (real nflverse pbp always has every
+    column, just null where a play type doesn't apply) -- so every
+    synthetic row here carries the full neutral schema all three
+    functions read, with only the fields relevant to one play type
+    actually set to something real. _pbp_target_row/_pbp_carry_row below
+    just override the ones that matter for their play type.
+    """
+    row = {
+        "season_type": "REG", "season": 2025, "week": 5, "two_point_attempt": 0,
+        "pass_attempt": 0, "receiver_player_id": np.nan, "passer_player_id": np.nan,
+        "air_yards": np.nan, "pass_location": np.nan, "sack": 0.0,
+        "rush_attempt": 0, "qb_kneel": 0, "rusher_player_id": np.nan, "run_location": np.nan,
+        "yardline_100": 60.0,
+    }
+    row.update(overrides)
+    return row
+
+
+def _pbp_target_row(**overrides):
+    return _pbp_row(**{
+        "pass_attempt": 1, "receiver_player_id": "w1", "passer_player_id": "qb1",
+        "air_yards": 8.0, "pass_location": "right",
+        **overrides,
+    })
+
+
+def _pbp_carry_row(**overrides):
+    return _pbp_row(**{
+        "rush_attempt": 1, "rusher_player_id": "rb1", "run_location": "left",
+        **overrides,
+    })
+
+
+def test_build_heatmap_snapshot_handles_completely_empty_pbp_without_crashing():
+    """
+    Real scenario: a not-yet-started season where get_pbp() itself can't
+    even be called (nflreadpy's own season-range validation), so
+    scripts/weekly_update.py passes pd.DataFrame() -- zero rows AND zero
+    columns, not the real nflverse schema. games_played is necessarily 0
+    for every candidate in this scenario (5+ games played is impossible
+    without pbp for those games existing), so this must come back
+    ineligible for everyone rather than a KeyError on a missing column.
+    """
+    combined = pd.DataFrame([
+        {"player_id": "w1", "position": "WR", "season": 2026, "week": 1, "games_played": 0},
+    ])
+    heatmap = build_heatmap_snapshot(combined, pd.DataFrame(), target_season=2026, target_week=1)
+    assert heatmap["w1"] == {"eligible": False, "games_played": 0, "min_games": 5}
+
+
+def test_build_heatmap_snapshot_ineligible_below_games_floor():
+    combined = pd.DataFrame([
+        {"player_id": "w1", "position": "WR", "season": 2025, "week": 10, "games_played": 3},
+    ])
+    pbp = pd.DataFrame([_pbp_target_row(receiver_player_id="w1", week=9)])
+    heatmap = build_heatmap_snapshot(combined, pbp, target_season=2025, target_week=10)
+    assert heatmap["w1"] == {"eligible": False, "games_played": 3, "min_games": 5}
+
+
+def test_build_heatmap_snapshot_receiving_shares_sum_to_one_and_flags_sparse():
+    combined = pd.DataFrame([
+        {"player_id": "w1", "position": "WR", "season": 2025, "week": 10, "games_played": 9},
+    ])
+    pbp = pd.DataFrame(
+        [_pbp_target_row(receiver_player_id="w1", air_yards=8.0, yardline_100=15.0, week=w) for w in range(1, 6)]
+        + [_pbp_target_row(receiver_player_id="w1", air_yards=25.0, yardline_100=70.0, week=1)]  # 1 play -- sparse
+        + [_pbp_target_row(receiver_player_id="w1", week=10)]  # target week itself -- not yet played, excluded
+    )
+    heatmap = build_heatmap_snapshot(combined, pbp, target_season=2025, target_week=10)
+
+    h = heatmap["w1"]
+    assert h["eligible"] is True
+    assert len(h["groups"]) == 1
+    group = h["groups"][0]
+    assert group["kind"] == "receiving"
+    assert group["total_plays"] == 6  # 5 short|red_zone + 1 deep|backfield -- NOT the week-10 row
+    assert abs(sum(z["share"] for z in group["zones"]) - 1.0) < 1e-9
+
+    solid = next(z for z in group["zones"] if z["id"] == "short|red_zone")
+    assert solid["count"] == 5 and solid["sparse"] is False
+    thin = next(z for z in group["zones"] if z["id"] == "deep|backfield")
+    assert thin["count"] == 1 and thin["sparse"] is True
+    assert group["zones"][0]["id"] == "short|red_zone"  # sorted by count descending
+
+
+def test_build_heatmap_snapshot_rb_gets_independent_rushing_and_receiving_groups():
+    combined = pd.DataFrame([
+        {"player_id": "rb1", "position": "RB", "season": 2025, "week": 10, "games_played": 9},
+    ])
+    pbp = pd.DataFrame(
+        [_pbp_carry_row(rusher_player_id="rb1", run_location="left", yardline_100=15.0) for _ in range(3)]
+        + [_pbp_carry_row(rusher_player_id="rb1", run_location="right", yardline_100=70.0)]
+        + [_pbp_target_row(receiver_player_id="rb1", air_yards=-2.0, yardline_100=40.0)]
+    )
+    heatmap = build_heatmap_snapshot(combined, pbp, target_season=2025, target_week=10)
+
+    h = heatmap["rb1"]
+    kinds = {g["kind"]: g for g in h["groups"]}
+    assert set(kinds) == {"rushing", "receiving"}
+    assert kinds["rushing"]["total_plays"] == 4
+    assert kinds["receiving"]["total_plays"] == 1
+    # Each kind's shares sum to 1.0 independently -- a target and a carry
+    # don't share a denominator, so they're never pooled into one 1.0.
+    assert abs(sum(z["share"] for z in kinds["rushing"]["zones"]) - 1.0) < 1e-9
+    assert abs(sum(z["share"] for z in kinds["receiving"]["zones"]) - 1.0) < 1e-9
+
+
+def test_build_heatmap_snapshot_qb_gets_passing_only_never_rushing():
+    combined = pd.DataFrame([
+        {"player_id": "qb1", "position": "QB", "season": 2025, "week": 10, "games_played": 9},
+    ])
+    pbp = pd.DataFrame([
+        _pbp_target_row(passer_player_id="qb1", receiver_player_id="w9", pass_location="middle", air_yards=15.0),
+        _pbp_carry_row(rusher_player_id="qb1"),  # a real QB scramble -- must not appear (QB is passing-only)
+    ])
+    heatmap = build_heatmap_snapshot(combined, pbp, target_season=2025, target_week=10)
+    assert [g["kind"] for g in heatmap["qb1"]["groups"]] == ["passing"]
+
+
+def test_build_heatmap_snapshot_omits_a_kind_with_zero_real_plays():
+    """A rostered RB who genuinely never touched the ball as a receiver
+    (real, if rare) gets a rushing-only groups list, not a receiving
+    group padded with zero zones."""
+    combined = pd.DataFrame([
+        {"player_id": "rb1", "position": "RB", "season": 2025, "week": 10, "games_played": 9},
+    ])
+    pbp = pd.DataFrame([_pbp_carry_row(rusher_player_id="rb1")])
+    heatmap = build_heatmap_snapshot(combined, pbp, target_season=2025, target_week=10)
+    assert [g["kind"] for g in heatmap["rb1"]["groups"]] == ["rushing"]
+
+
 def test_assemble_and_validate_export_round_trip():
     scoped_predictions = pd.DataFrame({
         "player_id": ["00-0001", "00-0002"],
@@ -352,9 +491,16 @@ def test_assemble_and_validate_export_round_trip():
             "axes": [{"label": "Touch Volume", "unit": " touches/gm", "percentile": 62, "raw": 14.3}],
         },
     }
+    heatmap = {
+        "00-0002": {
+            "eligible": True, "games_played": 8, "min_games": 5,
+            "groups": [{"kind": "rushing", "total_plays": 40,
+                        "zones": [{"id": "left|midfield", "label": "Left · Midfield", "count": 40, "share": 1.0, "sparse": False}]}],
+        },
+    }
 
     payload, report = assemble_player_advanced_stats(
-        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, crosswalk,
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, heatmap, crosswalk,
         target_season=2026, target_week=1, seasons_trained=list(range(2018, 2026)),
         model_version="test-version",
     )
@@ -395,6 +541,11 @@ def test_assemble_and_validate_export_round_trip():
     assert payload["players"]["5001"]["radar"]["eligible"] is True
     assert payload["players"]["5001"]["radar"]["pool_size"] == 33
     assert payload["players"]["5001"]["radar"]["axes"][0]["label"] == "Touch Volume"
+
+    # heatmap: same absent-entry fallback and pass-through shape as radar.
+    assert payload["players"]["4984"]["heatmap"] == {"eligible": False, "games_played": 0, "min_games": 5}
+    assert payload["players"]["5001"]["heatmap"]["eligible"] is True
+    assert payload["players"]["5001"]["heatmap"]["groups"][0]["kind"] == "rushing"
 
     validation = validate_export(payload, crosswalk)
     assert validation["n_players"] == 2
