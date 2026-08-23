@@ -3071,6 +3071,56 @@
     `;
   }
 
+  // ---- Phase 8 round 2: win probability + playoff odds (src/simulate.py) ----
+  // Both numbers are rounded to whole percent by the export itself (see
+  // src/export.py's build_matchup_simulation/build_playoff_odds) -- a
+  // decimal would imply precision the underlying validation doesn't
+  // support. The caveat text is read from the export's own
+  // meta.simulation.*_caveat fields (falling back to the same wording if
+  // an older export predates them) so this UI can never say something
+  // the pipeline itself doesn't also say.
+  function simulationCaveatText() {
+    const sim = state.advancedStats?.simulation;
+    const calibration = sim?.calibration_caveat
+      || "Calibration was checked on ~2 independent seasons of historical matchups and playoff snapshots -- enough to catch a broken simulator, not enough to certify these exact numbers.";
+    const accuracy = sim?.accuracy_caveat
+      || "This does not out-pick a simple 'higher projected total wins' rule -- it agrees with that rule 93.6% of the time by construction. What it adds is the probability itself, not better picks.";
+    return `${calibration} ${accuracy}`;
+  }
+
+  // {home: pct, away: pct} for one matchup, or null. Only returns a value
+  // when the export's simulation covers the CURRENTLY VIEWED week -- the
+  // export only ever holds one week's simulation at a time (whichever
+  // week was upcoming when weekly-update.yml last ran), same "never show
+  // a stale number under a different week" rule getMyProj() follows.
+  function getMatchupWinProb(homeRosterId, awayRosterId) {
+    const sim = state.advancedStats?.simulation;
+    if (!sim || sim.week !== state.selectedWeek) return null;
+    const m = sim.matchups.find(x =>
+      (x.roster_a === homeRosterId && x.roster_b === awayRosterId) ||
+      (x.roster_a === awayRosterId && x.roster_b === homeRosterId)
+    );
+    if (!m) return null;
+    const homeIsA = m.roster_a === homeRosterId;
+    return { home: homeIsA ? m.win_prob_a : m.win_prob_b, away: homeIsA ? m.win_prob_b : m.win_prob_a };
+  }
+
+  // Whole-percent playoff-qualification odds for one roster, or null.
+  // Unlike win probability this isn't week-scoped -- it's a season-long
+  // forecast computed once per export and valid regardless of which
+  // week's standings the table happens to be showing.
+  function getPlayoffOdds(rosterId) {
+    const pct = state.advancedStats?.simulation?.playoff_odds?.[String(rosterId)];
+    return pct == null ? null : pct;
+  }
+
+  // Small always-visible win-probability readout for a matchup card --
+  // used by both the Dashboard and Matchups view so the two can't drift.
+  function winProbBadgeHtml(pct) {
+    if (pct == null) return '';
+    return `<span style="font-size: 11px; color: var(--text-muted); font-weight: 700; margin-left: 6px;" title="${simulationCaveatText()}">${pct}% sim</span>`;
+  }
+
   // Cache player database in memory (5MB JSON) — too big for localStorage in some browsers
   let _playerDbCache = null;
   async function fetchPlayerDatabase() {
@@ -4494,6 +4544,7 @@
               const homeWin = m.homePts > m.awayPts;
               const awayWin = m.awayPts > m.homePts;
               const diff = Math.abs(m.homePts - m.awayPts);
+              const winProb = getMatchupWinProb(m.home, m.away);
               let metaText, metaClass = '';
               if (diff < 5)       { metaText = '😬 Nail Biter'; metaClass = 'tight'; }
               else if (diff > 50) { metaText = '💥 Blowout';    metaClass = 'blowout'; }
@@ -4504,6 +4555,7 @@
                     <div class="matchup-team-inner">
                       ${awayWin ? '<span class="matchup-winner-badge">🏆</span>' : ''}
                       <span class="matchup-team ${homeWin ? 'losing' : ''}">${getTeamName(m.away)}</span>
+                      ${winProbBadgeHtml(winProb?.away)}
                     </div>
                     <span class="matchup-score ${homeWin ? 'losing' : ''}">${m.awayPts.toFixed(1)}</span>
                   </div>
@@ -4512,6 +4564,7 @@
                     <div class="matchup-team-inner">
                       ${homeWin ? '<span class="matchup-winner-badge">🏆</span>' : ''}
                       <span class="matchup-team ${awayWin ? 'losing' : ''}">${getTeamName(m.home)}</span>
+                      ${winProbBadgeHtml(winProb?.home)}
                     </div>
                     <span class="matchup-score ${awayWin ? 'losing' : ''}">${m.homePts.toFixed(1)}</span>
                   </div>
@@ -4520,6 +4573,11 @@
               `;
             }).join('')}
           </div>
+          ${state.advancedStats?.simulation?.week === state.selectedWeek ? `
+            <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);">
+              "sim" win probabilities: ${simulationCaveatText()}
+            </div>
+          ` : ''}
         </div>
         <div class="panel">
           <div class="panel-header">
@@ -4546,7 +4604,10 @@
           </div>
           <table class="standings-table">
             <thead>
-              <tr><th>#</th><th>Team</th><th class="right">Record</th><th class="right">PF</th><th class="right">PA</th><th class="right">Diff</th></tr>
+              <tr>
+                <th>#</th><th>Team</th><th class="right">Record</th><th class="right">PF</th><th class="right">PA</th><th class="right">Diff</th>
+                <th class="right" title="${simulationCaveatText()}">Playoff Odds (sim)</th>
+              </tr>
             </thead>
             <tbody>
               ${standings.map((t, i) => {
@@ -4554,6 +4615,7 @@
                 const diff = t.pf - t.pa;
                 const diffColor = diff >= 0 ? 'var(--success)' : 'var(--danger)';
                 const recordStr = t.ties > 0 ? `${t.wins}-${t.losses}-${t.ties}` : `${t.wins}-${t.losses}`;
+                const playoffOdds = getPlayoffOdds(t.rosterId);
                 return `
                   <tr data-team-id="${t.rosterId}">
                     <td><span class="rank ${rankClass}">${i + 1}</span></td>
@@ -4565,11 +4627,19 @@
                     <td class="right">${t.pf.toFixed(1)}</td>
                     <td class="right">${t.pa.toFixed(1)}</td>
                     <td class="right" style="color: ${diffColor}; font-weight: 700;">${diff >= 0 ? '+' : ''}${diff.toFixed(1)}</td>
+                    <td class="right" style="font-weight: 700; ${playoffOdds == null ? 'color: var(--text-muted);' : ''}" title="${simulationCaveatText()}">
+                      ${playoffOdds == null ? '—' : `${playoffOdds}%`}
+                    </td>
                   </tr>
                 `;
               }).join('')}
             </tbody>
           </table>
+          ${state.advancedStats?.simulation?.playoff_odds && Object.keys(state.advancedStats.simulation.playoff_odds).length ? `
+            <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);">
+              Playoff odds are simulated: ${simulationCaveatText()}
+            </div>
+          ` : ''}
         </div>
         <div class="panel">
           <div class="panel-header">
@@ -4711,6 +4781,7 @@
           // Time-correct records: W/L going INTO this week, not end-of-season
           const homeForm = computeTeamForm(m.home, state.selectedWeek);
           const awayForm = computeTeamForm(m.away, state.selectedWeek);
+          const winProb = getMatchupWinProb(m.home, m.away);
           let metaText, metaClass = '';
           if (diff < 5)       { metaText = '😬 Nail Biter'; metaClass = 'tight'; }
           else if (diff > 50) { metaText = '💥 Blowout';    metaClass = 'blowout'; }
@@ -4720,7 +4791,7 @@
               <div class="mo-team-row">
                 <div class="mo-team-info">
                   <span class="mo-team-name ${homeWin ? 'losing' : ''}">${awayWin ? '🏆 ' : ''}${getTeamName(m.away)}</span>
-                  <span class="mo-team-record">@${getOwnerHandle(m.away)} · ${awayForm.wins}-${awayForm.losses}${awayForm.ties ? '-' + awayForm.ties : ''}</span>
+                  <span class="mo-team-record">@${getOwnerHandle(m.away)} · ${awayForm.wins}-${awayForm.losses}${awayForm.ties ? '-' + awayForm.ties : ''}${winProbBadgeHtml(winProb?.away)}</span>
                 </div>
                 <span class="mo-team-score ${homeWin ? 'losing' : ''}">${m.awayPts.toFixed(1)}</span>
               </div>
@@ -4728,7 +4799,7 @@
               <div class="mo-team-row">
                 <div class="mo-team-info">
                   <span class="mo-team-name ${awayWin ? 'losing' : ''}">${homeWin ? '🏆 ' : ''}${getTeamName(m.home)}</span>
-                  <span class="mo-team-record">@${getOwnerHandle(m.home)} · ${homeForm.wins}-${homeForm.losses}${homeForm.ties ? '-' + homeForm.ties : ''}</span>
+                  <span class="mo-team-record">@${getOwnerHandle(m.home)} · ${homeForm.wins}-${homeForm.losses}${homeForm.ties ? '-' + homeForm.ties : ''}${winProbBadgeHtml(winProb?.home)}</span>
                 </div>
                 <span class="mo-team-score ${awayWin ? 'losing' : ''}">${m.homePts.toFixed(1)}</span>
               </div>
@@ -4740,6 +4811,11 @@
           `;
         }).join('')}
       </div>
+      ${state.advancedStats?.simulation?.week === state.selectedWeek ? `
+        <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin: 12px 0;">
+          "sim" win probabilities: ${simulationCaveatText()}
+        </div>
+      ` : ''}
 
       <div class="bracket-wrap">
         ${renderBracket(state.winnersBracket, 'Winners Bracket', '🏆', false)}

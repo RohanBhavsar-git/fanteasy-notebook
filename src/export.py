@@ -69,6 +69,7 @@ import numpy as np
 import pandas as pd
 
 from src.model import FEATURE_COLUMNS, _cast_categoricals, predict_with_models, train_final_models
+from src.simulate import simulate_matchup, simulate_season
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,22 @@ SLEEPER_TO_NFLVERSE_TEAM = {"LAR": "LA"}
 # findings (derived from a calibration split of 2018 Wk5-2024 Wk4, strictly
 # before any locked evaluation fold). Not re-derived here.
 CQR_WIDEN_BY_10_90 = {"QB": 2.309, "RB": 0.730, "WR": 0.606, "TE": 0.467}
+
+# CQR widening for the 25th-75th interval -- src/simulate.py's per-player
+# distributions need this pair too (pred_q25_cqr/pred_q75_cqr), which
+# nothing before Phase 8 (Round 2) ever consumed, so no export.py constant
+# for it existed yet. Derived from PROJECT_CONTEXT.md's already-published
+# Phase 6 CQR table (same calibration run as CQR_WIDEN_BY_10_90 above, same
+# split) rather than re-run: that table reports width BEFORE/AFTER
+# widening for both interval pairs, and widen_by = (width_after -
+# width_before) / 2 since the constant is added to each side. Verified
+# against the table's own 10-90 row before trusting this on the 25-75 row:
+# recomputing CQR_WIDEN_BY_10_90 this same way from the table's rounded
+# before/after widths reproduces QB 2.31 / RB 0.73 / WR 0.605 / TE 0.47 --
+# matching the hardcoded constants above to within the table's own
+# 2-decimal rounding. Not re-derived on every retrain, same reasoning as
+# CQR_WIDEN_BY_10_90 -- see scripts/retrain.py's module docstring.
+CQR_WIDEN_BY_25_75 = {"QB": 1.265, "RB": 0.465, "WR": 0.380, "TE": 0.355}
 
 # Formulation A's already-published 8-season MAE per position, against
 # Sleeper's projection and the season-to-date-average baseline -- from
@@ -538,4 +555,257 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         "all_keys_real_sleeper_ids": True,
         "no_null_projections": True,
         "floor_le_point_le_ceiling": True,
+    }
+
+
+# ==========================================================================
+# STEP 7: simulation wiring (Phase 8 round 2) -- src/simulate.py was
+# computed but never written anywhere; this is that wiring.
+# ==========================================================================
+# Validated on 204 real historical matchups (win probability) and 8
+# (season, snapshot-week) combinations across 2 completed seasons (playoff
+# odds) -- 112 nominal team-observations, but the 4 snapshots per season
+# follow the SAME 14 teams through ONE realized season, so the true
+# independent sample is closer to 2 than 112. See PROJECT_CONTEXT.md's
+# Phase 6.5 findings for the full calibration report. Enough to catch a
+# broken simulator (garbage in, garbage probabilities out would show up
+# immediately), not enough to certify these exact numbers -- every UI
+# surface that shows a probability from this block must show this caveat
+# alongside it, not bury it in a tooltip only.
+SIMULATION_CALIBRATION_CAVEAT = (
+    "Calibration was checked on ~2 independent seasons of historical matchups and "
+    "playoff snapshots -- enough to catch a broken simulator, not enough to certify "
+    "these exact numbers."
+)
+# The simulator's win-probability favorite matches a naive "higher projected
+# total wins" rule in 191/204 (93.6%) of validated matchups -- BY
+# CONSTRUCTION, not because the simulator out-picks the naive rule.
+# Correlation/variance change a simulated total's SPREAD, not its MEAN, so
+# the two methods can only possibly disagree on genuine toss-up games. What
+# simulation adds over the naive rule is the probability itself (and
+# playoff odds, which the naive rule has no equivalent of at all) -- not
+# better picks. See PROJECT_CONTEXT.md's Phase 6.5 findings.
+SIMULATION_ACCURACY_CAVEAT = (
+    "This does not out-pick a simple 'higher projected total wins' rule -- it agrees "
+    "with that rule 93.6% of the time by construction. What it adds is the probability "
+    "itself, not better picks."
+)
+SIMULATION_N_SIMS_MATCHUP = 10_000  # matches Phase 6.5's own validated setting
+SIMULATION_N_SIMS_SEASON = 3_000    # matches Phase 6.5's own validated setting
+
+
+def build_team_game_id_lookup(schedule: pd.DataFrame) -> pd.DataFrame:
+    """
+    (season, week, team) -> game_id, REG only, stacking each schedule row's
+    home and away perspective. src/simulate.py's sample_player_week needs
+    game_id for its game-environment correlation mechanism; nothing in
+    src/usage.py's CONTEXT_OUTPUT_COLUMNS carries it through (that family
+    strips the schedule down to spread/total/weather, not the raw game
+    identifier) -- this is the one piece of schedule data this pipeline
+    needed for the first time in Phase 8 round 2.
+    """
+    reg = schedule[schedule["game_type"] == "REG"]
+    home = reg[["season", "week", "home_team", "game_id"]].rename(columns={"home_team": "team"})
+    away = reg[["season", "week", "away_team", "game_id"]].rename(columns={"away_team": "team"})
+    return pd.concat([home, away], ignore_index=True)
+
+
+def build_starter_quantile_rows(
+    starter_sleeper_ids: list,
+    season: int,
+    week: int,
+    quantiles_by_gsis: pd.DataFrame,
+    sleeper_proj_points: dict,
+    sleeper_to_gsis: dict,
+    team_by_sleeper: dict,
+    game_id_by_team_week: dict,
+) -> pd.DataFrame:
+    """
+    One roster's real starters (Sleeper player_ids, K/DST included) -> the
+    game_id + 5-quantile-column frame src/simulate.py's
+    sample_player_week/simulate_matchup/simulate_season all need.
+
+    Per starter:
+      - model-covered (QB/RB/WR/TE with a row in quantiles_by_gsis, found
+        via the crosswalk): that player's own 5 CQR-calibrated quantile
+        points (predict_quantiles_with_models's output for this exact
+        week -- callers predicting multiple weeks, e.g. simulate_season's
+        remaining schedule, must pass THAT week's own quantiles_by_gsis,
+        not one week's reused for every week).
+      - everyone else (K/DST, or a skill player missing model coverage --
+        e.g. not in this week's candidate pool): src/simulate.py's own
+        documented convention -- all 5 quantile columns set to Sleeper's
+        OWN point projection for that player, so interpolating always
+        returns that constant. Falls back to 0.0 (not dropped) if Sleeper
+        has no projection either -- the same "unprojected means 0, not
+        missing" convention index.html's own resolvePts(...) ?? 0 uses.
+
+    game_id comes from the starter's CURRENT team (Sleeper's own team
+    field, normalized to nflverse's code) joined against
+    game_id_by_team_week for (season, week). A starter on a bye that week,
+    or with no resolvable team, is dropped -- there's no real game to
+    attach them to, so nothing to simulate for that one slot. This makes
+    a simulated roster total a slight underestimate on a bye week for one
+    of its players, same direction of bias as any other "can't score
+    without a game" convention.
+
+    Returns: game_id, pred_q10_cqr, pred_q25_cqr, pred_q50, pred_q75_cqr,
+    pred_q90_cqr -- one row per resolvable starter. Can be empty (e.g.
+    every starter unresolvable) -- callers must treat that as "nothing to
+    simulate for this roster," not fail.
+    """
+    quantiles_indexed = (
+        quantiles_by_gsis.drop_duplicates(subset=["player_id"]).set_index("player_id")
+        if not quantiles_by_gsis.empty else quantiles_by_gsis
+    )
+    quantile_cols = ["pred_q10_cqr", "pred_q25_cqr", "pred_q50", "pred_q75_cqr", "pred_q90_cqr"]
+
+    rows = []
+    for sleeper_id in starter_sleeper_ids or []:
+        if not sleeper_id or sleeper_id == "0":
+            continue  # Sleeper uses "0" to mark an empty lineup slot
+        team = normalize_team_code(team_by_sleeper.get(sleeper_id) or "")
+        game_id = game_id_by_team_week.get((season, week, team))
+        if game_id is None:
+            continue
+
+        gsis_id = sleeper_to_gsis.get(sleeper_id)
+        if gsis_id is not None and not quantiles_by_gsis.empty and gsis_id in quantiles_indexed.index:
+            q = quantiles_indexed.loc[gsis_id]
+            row = {"game_id": game_id, **{c: float(q[c]) for c in quantile_cols}}
+        else:
+            constant = float(sleeper_proj_points.get(sleeper_id, 0.0))
+            row = {"game_id": game_id, **{c: constant for c in quantile_cols}}
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=["game_id"] + quantile_cols)
+
+
+def build_matchup_simulation(matchups: pd.DataFrame, lineup_fn, n_sims: int = SIMULATION_N_SIMS_MATCHUP) -> list:
+    """
+    Per-matchup win probability for one week, via src.simulate.simulate_matchup.
+
+    Args:
+        matchups: Sleeper's own matchups frame for the target week
+            (get_sleeper_matchups's output) -- roster_id, matchup_id.
+        lineup_fn: callable roster_id -> DataFrame (build_starter_quantile_rows's
+            output) for THIS week. Kept as an injected callback, same
+            reasoning as simulate_season's own lineup_builder parameter.
+        n_sims: passed through to simulate_matchup.
+
+    Skips (not fails) a matchup that can't be simulated -- an odd-sized
+    group (shouldn't happen for a real fantasy week, but malformed data
+    shouldn't abort the whole export) or a lineup with zero resolvable
+    starters -- rather than raising over one team's data gap.
+
+    Win probabilities are rounded to WHOLE percent -- see
+    SIMULATION_CALIBRATION_CAVEAT's own precision note; a decimal implies
+    precision this validation doesn't support.
+
+    Returns: list of {matchup_id, roster_a, roster_b, win_prob_a,
+    win_prob_b, n_sims}, one entry per simulatable matchup.
+    """
+    results = []
+    for matchup_id, group in matchups.groupby("matchup_id"):
+        roster_ids = group["roster_id"].tolist()
+        if len(roster_ids) != 2:
+            continue
+        roster_a, roster_b = roster_ids
+        lineup_a, lineup_b = lineup_fn(roster_a), lineup_fn(roster_b)
+        if lineup_a.empty or lineup_b.empty:
+            continue
+        sim = simulate_matchup(lineup_a, lineup_b, n_sims=n_sims)
+        results.append({
+            "matchup_id": int(matchup_id),
+            "roster_a": int(roster_a),
+            "roster_b": int(roster_b),
+            "win_prob_a": round(sim["team_a_win_prob"] * 100),
+            "win_prob_b": round(sim["team_b_win_prob"] * 100),
+            "n_sims": n_sims,
+        })
+    return results
+
+
+def build_playoff_odds(
+    remaining_weeks: list,
+    starting_standings: pd.DataFrame,
+    lineup_builder,
+    playoff_teams: int,
+    n_sims: int = SIMULATION_N_SIMS_SEASON,
+) -> dict:
+    """
+    Per-roster playoff-qualification odds via src.simulate.simulate_season,
+    rounded to whole percent (see build_matchup_simulation's docstring for
+    why). Thin wrapper -- simulate_season already does the real work; this
+    just reshapes its output into the {roster_id: pct} JSON-key shape the
+    export needs (JSON object keys are always strings, so roster_id is
+    stringified here, not left as simulate_season's own int).
+
+    Returns {} if starting_standings is empty (nothing to simulate) --
+    callers should treat an empty dict as "no odds available," same as
+    build_matchup_simulation returning an empty list.
+    """
+    if starting_standings.empty:
+        return {}
+    result_df = simulate_season(remaining_weeks, starting_standings, lineup_builder, playoff_teams, n_sims=n_sims)
+    return {str(int(row.roster_id)): round(row.playoff_prob * 100) for row in result_df.itertuples()}
+
+
+def assemble_simulation_block(matchups: list, playoff_odds: dict, week: int) -> dict | None:
+    """
+    Packages build_matchup_simulation/build_playoff_odds's output into the
+    payload's top-level `simulation` key (a sibling of `meta`/`players`,
+    not nested under either -- these are per-MATCHUP and per-ROSTER
+    numbers, not per-player, so they don't fit the players[] schema).
+
+    Returns None (not an empty dict) when there is truly nothing to show --
+    no matchups AND no playoff odds, e.g. the 2026 pre-draft league before
+    a real schedule exists -- so the dashboard's null-safe path is a single
+    `if (!advanced.simulation)` check, not "is every sub-field also empty."
+    """
+    if not matchups and not playoff_odds:
+        return None
+    return {
+        "week": week,
+        "matchups": matchups,
+        "playoff_odds": playoff_odds,
+        "matchup_n_sims": SIMULATION_N_SIMS_MATCHUP,
+        "season_n_sims": SIMULATION_N_SIMS_SEASON,
+        "calibration_caveat": SIMULATION_CALIBRATION_CAVEAT,
+        "accuracy_caveat": SIMULATION_ACCURACY_CAVEAT,
+    }
+
+
+def validate_simulation(simulation: dict | None) -> dict:
+    """
+    Lightweight sanity check for the simulation block -- deliberately
+    looser than validate_export's hard per-player assertions, since this
+    block is allowed to be partially populated (matchups without playoff
+    odds once the regular season ends, or vice versa is never expected but
+    isn't fatal either) or entirely None. Still fails loudly on genuinely
+    nonsensical output -- a probability outside [0, 100], or a matchup's
+    two win probabilities not summing to ~100 -- since that would mean the
+    simulation math itself is broken, not just sparse.
+    """
+    if simulation is None:
+        return {"present": False}
+
+    for m in simulation["matchups"]:
+        total = m["win_prob_a"] + m["win_prob_b"]
+        assert 0 <= m["win_prob_a"] <= 100 and 0 <= m["win_prob_b"] <= 100, (
+            f"matchup {m['matchup_id']}: win probabilities out of [0, 100] range: {m}"
+        )
+        # Whole-percent rounding of two complementary probabilities can
+        # legitimately land one point off 100 (e.g. 50/50 rounds fine, but
+        # 33.4/66.6 rounds to 33/67 = 100 while 50.5/49.5 rounds to 51/50 =
+        # 101) -- allow a small tolerance rather than demanding exact 100.
+        assert 99 <= total <= 101, f"matchup {m['matchup_id']}: win probabilities sum to {total}, not ~100: {m}"
+
+    for roster_id, pct in simulation["playoff_odds"].items():
+        assert 0 <= pct <= 100, f"roster {roster_id}: playoff_prob {pct} out of [0, 100] range"
+
+    return {
+        "present": True,
+        "n_matchups": len(simulation["matchups"]),
+        "n_rosters_with_playoff_odds": len(simulation["playoff_odds"]),
     }

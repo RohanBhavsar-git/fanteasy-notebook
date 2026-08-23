@@ -127,9 +127,12 @@ These are non-negotiable — they've shaped every decision we've made:
 - Season Leaders panel (pending replacement per outstanding item)
 - **Usage Trending panel** (Phase 8 round 1) — biggest risers/fallers by target/carry/snap-share trend signal, one row per player showing current share + direction. `red_zone_share` deliberately excluded (hold-rate under 50%, see Phase 3' findings). Honest empty state ("No trend signal yet... populate from Week 6 onward") when `player_advanced_stats.json` hasn't accumulated 5 games this season yet — this is what actually renders as of the 2026 pre-season export.
 - **xFP Regression panel** (Phase 8 round 1) — season `fp_over_expected` leaders/laggards, RB/WR/TE only, explicitly labeled "luck indicator, not a prediction." Pulls from the most recently COMPLETED season, so unlike Usage Trending it already shows real 2025 numbers even in the 2026 pre-season export, not an empty state.
+- **Win probability on matchup cards** (Phase 8 round 2) — "N% sim" badge next to each team, from `src/simulate.py`'s `simulate_matchup` via the export's new `simulation` block. Only shown when the export's `simulation.week` matches the currently viewed week (same "don't show a stale number" rule `getMyProj()` already follows) — null on the 2026 pre-draft export (no real matchups exist yet), which is what actually renders today. A visible caption (not tooltip-only) beneath the matchup list states both the calibration limitation and that this doesn't out-pick "higher projection wins."
+- **Playoff Odds column in the standings table** (Phase 8 round 2) — from `simulate_season`, whole-percent, with the same visible caveat caption beneath the table. Column always renders; shows `—` per row (not hidden) when there's no simulation to show.
 
 ### Matchups tab
 - Weekly matchup cards with 🏆 winner badge, blowout/nail-biter emoji markers
+- **Win probability badges** (Phase 8 round 2) — same mechanism and caveat caption as the Dashboard's matchup cards, shown next to each team's W-L record line
 - Real Sleeper starter/bench data with position-color-coded slots
 - Team superlatives (🔥 streaks, ❄️ cold streaks, 🎢 boom-or-bust)
 - Icon KPI cards: ⚖️ Margin, 🔥 Top Performer, 💎 Bench High
@@ -745,6 +748,126 @@ player's `usage`/`trend` blocks show the expected pattern for week 1 of a
 new season — every in-season `_ewm3` value null, `prev_season_*` populated
 from real 2025 data, `floor <= point <= ceiling` holding.
 
+### Round 2: wiring src/simulate.py into the export (win probability + playoff odds)
+
+`src/simulate.py` (matchup win probability, playoff-qualification odds)
+was computed and validated back in Phase 6.5 but never written into
+`player_advanced_stats.json` — the dashboard had no way to show it. Round
+2 adds a `simulation` block (sibling to `meta`/`players`, not per-player)
+via `src/export.py`'s new `build_team_game_id_lookup`/
+`build_starter_quantile_rows`/`build_matchup_simulation`/
+`build_playoff_odds`/`assemble_simulation_block`/`validate_simulation`,
+orchestrated by `scripts/weekly_update.py::build_simulation_block`, and
+surfaced in `index.html` as win probability on matchup cards (Dashboard +
+Matchups view) and a Playoff Odds column in the standings table.
+
+**The blocking problem: the simulator needs 5 calibrated quantile points
+per player, and the Phase 8 artifact only ever trained 2.** `sample_player_week`
+needs `pred_q10_cqr`/`pred_q25_cqr`/`pred_q50`/`pred_q75_cqr`/`pred_q90_cqr`
+— both the 10-90 AND 25-75 CQR-widened interval pairs, not just the 10-90
+pair `predict_target_week`'s floor/ceiling already used. Fixed by:
+extending `train_final_models`'s `quantile_alphas` to the full
+`SIMULATION_QUANTILE_ALPHAS = (0.10, 0.25, 0.50, 0.75, 0.90)` (backward
+compatible — `predict_with_models`'s floor/ceiling logic only ever reads
+the 0.10/0.90 keys out of whatever's trained, so it doesn't care that
+more keys now exist); adding `src/model.py::predict_quantiles_with_models`
+as the parallel prediction path (mirrors `predict_with_models`'s shape,
+same per-position loop, same artifact); and deriving
+`CQR_WIDEN_BY_25_75 = {"QB": 1.265, "RB": 0.465, "WR": 0.380, "TE": 0.355}`
+in `src/export.py` from the ALREADY-PUBLISHED Phase 6 CQR before/after-width
+table above (`widen_by = (width_after − width_before) / 2`) rather than
+re-running the expensive calibration pass — verified by reproducing the
+already-known 10-90 constants the same way first (matched to within the
+source table's own 2-decimal rounding) before trusting the method on the
+25-75 row. `scripts/retrain.py` now trains the full 5-quantile set and the
+artifact carries both CQR dicts; the local artifact grew from 7.57 MB to
+**11.16 MB** as a result (still a manual, infrequent commit — not a
+git-bloat concern at that cadence).
+
+**Predicting a real matchup needs a real starting lineup, and Sleeper's
+`starters` field is Sleeper IDs, K/DST included, with no model coverage
+guarantee.** `build_starter_quantile_rows` resolves each starter to either
+its own 5 model-predicted quantile points (QB/RB/WR/TE with crosswalk +
+candidate coverage) or Sleeper's own point projection as a fixed,
+zero-variance fallback (K/DST, or a skill player missing coverage) —
+`sleeper_projected_points()` scored via the league's real
+`scoring_settings`, same convention `src/simulate.py`'s own module
+docstring documents. A starter on a bye (no resolvable `game_id` for their
+team that week) is dropped, not zeroed — there's no real game to attach
+them to.
+
+**Playoff odds need every remaining week's matchups predicted, not just
+the upcoming one — and that reuses `build_target_week_features` completely
+unmodified.** Nothing new has actually happened between the upcoming week
+and a later one either (both are unplayed), so Family 6's rolling/
+`prev_season_*` features come out IDENTICAL across every remaining week's
+stub-row prediction; only Family 5's per-week schedule context (opponent,
+home/away, spread) legitimately differs, and `build_target_week_features`
+already recomputes that fresh per call. Two disclosed simplifications this
+accepts rather than hides: (1) each remaining week's starters are whatever
+`get_sleeper_matchups` reports for that week — for a real forward-looking
+run that's effectively "today's lineup, held constant" (Sleeper carries
+the current default forward until a manager changes it; there's no honest
+way to predict a future lineup change), while a *historical* week
+(verification below) gets that week's own real, different lineup, since
+the season already happened; (2) K/DST/uncovered players contribute a
+fixed Sleeper-projection amount with zero simulated variance.
+
+**Two real bugs caught during this build, both before they reached a
+committed export:**
+1. `predict_quantiles_with_models` was initially called on
+   `build_target_week_features`'s FULL combined output (every historical
+   row plus the one stub week), not just that week's stub rows — with
+   `build_starter_quantile_rows`'s later `drop_duplicates(subset=["player_id"])`
+   silently keeping an ARBITRARY past week's prediction per player instead
+   of the intended future one. Fixed by applying the same
+   `(season == X) & (week == week)` mask `predict_target_week_from_artifact`
+   already uses for the single-target-week path, inside the per-remaining-week
+   `week_quantiles()` closure.
+2. `build_simulation_block` hardcoded the module-level `DEFAULT_LEAGUE_ID`
+   inside two `get_sleeper_matchups` calls instead of taking a `league_id`
+   parameter — invisible in the real flow (weekly_update.py always predicts
+   the live league anyway) but made the function impossible to verify
+   against a different, real historical league, and surfaced immediately
+   as a silently-empty simulation the moment verification tried to point it
+   at 2025's real league instead of 2026's pre-draft one. Fixed by adding
+   `league_id` as an explicit parameter, threaded through from `main()`.
+
+**Verified against a real, completed 2025 week (Week 10, same week Round
+1 used) before touching the live 2026 export**, using the REAL 2025
+Sleeper league (`1250182471429931008` — historical league data stays
+fetchable after a new league_id is minted for the following season): 7
+matchups simulated for a 14-team league, every pair of win probabilities
+summing to exactly 100 (46/54, 33/67, 54/46, 57/43, 98/2, 42/58, 75/25),
+and playoff odds for all 14 rosters (0-100%, sane spread given each
+team's week-10 record). Frontend verified by temporarily pointing a local
+copy of `index.html` at the real 2025 league (never committed) so the
+dashboard had real matchup/roster data whose roster_ids matched the test
+export — Playwright + a UTF-8-aware local server confirmed win-probability
+badges on matchup cards (Dashboard and Matchups view) and the Playoff Odds
+standings column, each with the mandatory calibration/accuracy caveat
+visibly captioned (not just tooltip-only) beneath the panel, whole-percent
+rounding throughout, and zero new console errors. The null-safe path was
+verified separately against the real, pre-simulation-key 2026 export (no
+`simulation` key at all, a stricter test than an explicit `null`) —
+matchup cards render with no win-probability badges or caveat caption, and
+the standings table keeps its Playoff Odds column with an honest `—` per
+row rather than hiding the column or crashing.
+
+**Honesty requirements from the request, and where each one actually
+lives, not just where it's supposed to:** whole-percent rounding happens
+once, in `src/export.py`'s `build_matchup_simulation`/`build_playoff_odds`
+(`round(x * 100)`, Python's `round()` returning a plain `int`), so no UI
+code can accidentally reintroduce a decimal. The calibration caveat
+(~2 independent seasons, not certified) and the accuracy caveat (93.6%
+agreement with "higher projection wins" is by construction, not
+out-picking) are both stored in the export itself
+(`calibration_caveat`/`accuracy_caveat`) and read from there by
+`index.html`'s `simulationCaveatText()` — with a hardcoded fallback of the
+identical wording only for the case where `state.advancedStats` predates
+this key entirely, so the caveat text has exactly one source of truth,
+not two copies that could drift.
+
 ---
 
 ## Design decisions worth preserving (the "why")
@@ -808,12 +931,16 @@ assumptions as facts.
 | `scripts/retrain.py` runs end-to-end and matches published Phase 6 numbers | **Verified** — locally against warm `data/raw/` caches, AND on real GitHub Actions infrastructure (`workflow_dispatch`, cold runner, ~5 min, committed a 7.57 MB artifact whose walk-forward performance numbers match the local run). See **Phase 8 findings**. |
 | `scripts/weekly_update.py` runs end-to-end for a real pre-season week | **Verified** — locally, AND on real GitHub Actions infrastructure (third `workflow_dispatch` attempt succeeded after two real bugs found and fixed by the first two attempts — a test-fixture network dependency and a git commit-step ordering bug, both now fixed for future runs too). Correctly detected target week 1, correctly handled the real "2026 stats not published yet" 404, committed a 300-player, 220,002-byte JSON with `meta.model_version` correctly pinned to the artifact's own trained commit. See **Phase 8 findings**. |
 | `history_seed` (2 seasons) is sufficient for Family 6 rolling/prev_season_* correctness | **Verified** — `build_feature_table([2024, 2025])`'s 2025 rolling outputs match the full 8-season build's 2025 rows exactly on every `ROLLING_OUTPUT_COLUMNS` entry except `xfp`/`fp_over_expected` and their derivatives (a disclosed, separate, self-correcting gap — see **Phase 8 findings**). |
+| `CQR_WIDEN_BY_25_75` derivation method (Phase 8 round 2) | **Verified** — reproducing the already-known, already-published `CQR_WIDEN_BY_10_90` constants from the Phase 6 CQR table's before/after-width columns via `widen_by = (width_after − width_before) / 2` matches the hardcoded values (QB 2.309, RB 0.730, WR 0.606, TE 0.467) to within the source table's own 2-decimal rounding, before trusting the same method on the 25-75 row (never independently re-run). |
+| `scripts/weekly_update.py::build_simulation_block` produces correct win probabilities and playoff odds | **Verified** — against the real, completed 2025 season (league `1250182471429931008`, week 10): 7 real matchups simulated for a 14-team league, every pair of win probabilities summing to exactly 100, playoff odds returned for all 14 rosters. See **Phase 8 findings** for the two real bugs this caught before either reached a committed export. Not yet run on real GitHub Actions infrastructure — that's the next `retrain.yml` + `weekly-update.yml` `workflow_dispatch` pair, still to happen. |
+| Round 2 dashboard panels (win probability, playoff odds) render correctly and null-safely | **Verified** — Playwright + a UTF-8-aware local server, both against the populated case (index.html temporarily pointed at the real 2025 league so matchup roster_ids matched the test export — never committed) and the null case (the real, pre-simulation-key 2026 export, a stricter test than an explicit `null`). Zero new console errors either way; see **Phase 8 findings** for what each screenshot showed. |
 
 ## What's outstanding
 
 - **`PHASE_2B_6_SPEC.md`** at the repo root is the working spec for Phases 2b, 6, and 6.5. Fold it into this doc and `NOTEBOOK_OUTLINE.md` once those phases are complete.
 - ~~Trigger the first real `retrain.yml` and `weekly-update.yml` `workflow_dispatch` runs on GitHub Actions itself.~~ **Done** — both succeeded on real GitHub Actions infrastructure; see **Phase 8 findings** for the two real bugs their first attempts caught (a test-fixture network dependency, a git commit-step ordering bug) and how they were fixed.
 - **`weekly-update.yml` hasn't yet run on its actual Tuesday cron schedule** — every verification so far is `workflow_dispatch`. The season hasn't started (2026 preseason as of this writing), so there's nothing scheduled to observe yet; worth a spot-check once the first real Tuesday during the season rolls around.
+- **Phase 8 round 2's simulation wiring hasn't run on real GitHub Actions infrastructure yet** — verified locally (real 2025 week 10 data) and in a real browser, but `retrain.yml` (now training 5 quantiles instead of 2, 11.16 MB artifact) and `weekly-update.yml` (now producing the `simulation` block) both need one more real `workflow_dispatch` pair to confirm the CI runners handle the larger artifact and the extra per-week simulation fetches within their timeouts.
 - Update `DEFAULT_LEAGUE_ID` in `src/ingest.py` each August when Sleeper rolls the league over
 - **`HISTORICAL_SEASONS` in `scripts/retrain.py`** (currently `2018-2025`, mirroring every other model in this pipeline) needs bumping by hand once nflverse publishes a new season's data — same manual-update pattern as `DEFAULT_LEAGUE_ID`, not automatic.
 - `src/ingest.py`'s fetchers still 404 with a raw traceback for an unpublished season in the general case — only `src/pipeline.py::build_weekly_scored`'s single-current-season path was fixed (see Verification status). A general `ingest.py`-level season guard is still undone, same open item as before Phase 8.

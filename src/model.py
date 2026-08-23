@@ -752,16 +752,19 @@ def train_final_models(
     feature_cols: list[str] = FEATURE_COLUMNS,
     target_col: str = "custom_points",
     positions: tuple[str, ...] = POSITIONS,
-    quantile_alphas: tuple[float, float] = (0.10, 0.90),
+    quantile_alphas: tuple[float, ...] = (0.10, 0.90),
 ) -> dict:
     """
-    One point-regression model and one pair of quantile models (default
-    q10/q90, matching src/export.py's floor/ceiling) per position, each
-    trained on EVERY row of df for that position -- no fold held out, the
-    same "nothing to hold out against a week that hasn't been played yet"
-    reasoning src/export.py::predict_target_week already uses, generalized
-    so the resulting model objects can be PERSISTED (see src/artifacts.py)
-    and reused across many weekly inference runs instead of being retrained
+    One point-regression model and one quantile model PER alpha in
+    quantile_alphas (default q10/q90, matching src/export.py's floor/
+    ceiling; scripts/retrain.py passes the full 5-point
+    0.10/0.25/0.50/0.75/0.90 set too, for src/simulate.py's per-player
+    distributions) per position, each trained on EVERY row of df for that
+    position -- no fold held out, the same "nothing to hold out against a
+    week that hasn't been played yet" reasoning
+    src/export.py::predict_target_week already uses, generalized so the
+    resulting model objects can be PERSISTED (see src/artifacts.py) and
+    reused across many weekly inference runs instead of being retrained
     inline on every single export.
 
     Returns:
@@ -842,6 +845,83 @@ def predict_with_models(
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame(
         columns=["player_id", "position", "point", "floor", "ceiling"]
     )
+
+
+SIMULATION_QUANTILE_ALPHAS = (0.10, 0.25, 0.50, 0.75, 0.90)
+
+
+def predict_quantiles_with_models(
+    test_df: pd.DataFrame,
+    models: dict,
+    cqr_widen_by_10_90: dict[str, float],
+    cqr_widen_by_25_75: dict[str, float],
+    feature_cols: list[str] = FEATURE_COLUMNS,
+) -> pd.DataFrame:
+    """
+    Predicts the full 5-point CQR-calibrated distribution
+    src/simulate.py's sample_player_week() needs (pred_q10_cqr,
+    pred_q25_cqr, pred_q50, pred_q75_cqr, pred_q90_cqr) for every row in
+    test_df, using per-position models already trained with AT LEAST
+    SIMULATION_QUANTILE_ALPHAS (train_final_models with that alpha tuple,
+    which scripts/retrain.py passes).
+
+    Mirrors predict_with_models's shape (same models dict, same
+    _cast_categoricals/per-position loop) but for the simulator's input
+    contract instead of the dashboard's floor/point/ceiling. The 10-90
+    and 25-75 pairs are CQR-widened by their OWN, separately-derived
+    constants (see PROJECT_CONTEXT.md's CQR section -- the two pairs were
+    calibrated independently and use different widening amounts); q50 is
+    returned as-is, untouched by construction (there's no interval around
+    a single point to widen). Crossing WITHIN each pair is fixed with a
+    min/max swap before widening -- src/simulate.py's own
+    _ensure_monotonic_quantiles() still re-sorts all 5 points defensively
+    afterward (crossing BETWEEN pairs, e.g. a widened q25 landing below a
+    widened q10, can still happen and is that function's job to catch,
+    not this one's).
+
+    Raises if a position's model bundle is missing any required alpha --
+    a silently-absent quantile would otherwise surface much later as a
+    confusing KeyError inside sample_player_week.
+
+    Returns: player_id, position, pred_q10_cqr, pred_q25_cqr, pred_q50,
+    pred_q75_cqr, pred_q90_cqr -- one row per (position, player) present
+    in test_df AND in `models`.
+    """
+    output_cols = ["player_id", "position", "pred_q10_cqr", "pred_q25_cqr", "pred_q50", "pred_q75_cqr", "pred_q90_cqr"]
+    pos_df = _cast_categoricals(test_df, feature_cols)
+    results = []
+    for position, bundle in models.items():
+        rows = pos_df[pos_df["position"] == position]
+        if rows.empty:
+            continue
+
+        missing = [a for a in SIMULATION_QUANTILE_ALPHAS if a not in bundle["quantiles"]]
+        if missing:
+            raise KeyError(f"predict_quantiles_with_models: {position} model is missing quantile alphas {missing}")
+
+        q10 = bundle["quantiles"][0.10].predict(rows[feature_cols])
+        q25 = bundle["quantiles"][0.25].predict(rows[feature_cols])
+        q50 = bundle["quantiles"][0.50].predict(rows[feature_cols])
+        q75 = bundle["quantiles"][0.75].predict(rows[feature_cols])
+        q90 = bundle["quantiles"][0.90].predict(rows[feature_cols])
+
+        lo_1090, hi_1090 = np.minimum(q10, q90), np.maximum(q10, q90)
+        lo_2575, hi_2575 = np.minimum(q25, q75), np.maximum(q25, q75)
+
+        widen_1090 = cqr_widen_by_10_90[position]
+        widen_2575 = cqr_widen_by_25_75[position]
+
+        results.append(pd.DataFrame({
+            "player_id": rows["player_id"].to_numpy(),
+            "position": position,
+            "pred_q10_cqr": lo_1090 - widen_1090,
+            "pred_q25_cqr": lo_2575 - widen_2575,
+            "pred_q50": q50,
+            "pred_q75_cqr": hi_2575 + widen_2575,
+            "pred_q90_cqr": hi_1090 + widen_1090,
+        }))
+
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=output_cols)
 
 
 # ==========================================================================

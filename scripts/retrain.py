@@ -5,10 +5,13 @@ workflow_dispatch only, never scheduled (see .github/workflows/retrain.yml).
 Fetches ALL historical seasons, rebuilds the full Family 1-6 feature table
 from scratch, walk-forward-validates the point model against Sleeper's
 projection and the two trailing-average baselines over the most recent
-EVAL_SEASONS_BACK seasons, trains FINAL (no-holdout) point + q10/q90
-quantile models per position on the complete history, and saves everything
-weekly_update.py needs for inference-only prediction into ONE committed
-artifact (src/artifacts.py::save_model_artifact).
+EVAL_SEASONS_BACK seasons, trains FINAL (no-holdout) point + the full
+0.10/0.25/0.50/0.75/0.90 quantile set per position on the complete
+history, and saves everything weekly_update.py needs for inference-only
+prediction into ONE committed artifact (src/artifacts.py::save_model_artifact).
+The 3 quantiles beyond q10/q90 (q25/q50/q75) exist for
+src/simulate.py's per-player distributions (Phase 8 round 2) -- the
+dashboard's own floor/point/ceiling still only ever reads q10/q90.
 
 This is deliberately the expensive job, run by hand -- weekly_update.py
 never retrains, so week-to-week output changes come from new data, not a
@@ -40,10 +43,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.artifacts import save_model_artifact  # noqa: E402
-from src.export import CQR_WIDEN_BY_10_90  # noqa: E402
+from src.export import CQR_WIDEN_BY_10_90, CQR_WIDEN_BY_25_75  # noqa: E402
 from src.ingest import DEFAULT_LEAGUE_ID, get_id_crosswalk, get_sleeper_league, get_sleeper_projections  # noqa: E402
 from src.model import (  # noqa: E402
-    FEATURE_COLUMNS, POSITIONS, add_sleeper_baseline, add_target_baselines,
+    FEATURE_COLUMNS, POSITIONS, SIMULATION_QUANTILE_ALPHAS, add_sleeper_baseline, add_target_baselines,
     evaluate_position, train_final_models, walk_forward_predict,
 )
 from src.pipeline import HISTORY_SEED_COLUMNS, build_feature_table  # noqa: E402
@@ -126,7 +129,9 @@ def main() -> None:
         print(f"    {position}: {performance[position]} (n={len(wf)})")
 
     print("[3/5] Training final (no-holdout) models on the complete history...")
-    models = train_final_models(features, feature_cols=FEATURE_COLUMNS, positions=POSITIONS)
+    models = train_final_models(
+        features, feature_cols=FEATURE_COLUMNS, positions=POSITIONS, quantile_alphas=SIMULATION_QUANTILE_ALPHAS,
+    )
     missing_positions = [p for p in POSITIONS if p not in models]
     if missing_positions:
         raise RuntimeError(f"train_final_models produced no model for {missing_positions} -- aborting.")
@@ -145,6 +150,7 @@ def main() -> None:
         models=models,
         feature_columns=FEATURE_COLUMNS,
         cqr_widen_by_10_90=CQR_WIDEN_BY_10_90,
+        cqr_widen_by_25_75=CQR_WIDEN_BY_25_75,
         performance=performance,
         seasons_trained=HISTORICAL_SEASONS,
         history_seed=history_seed,

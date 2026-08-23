@@ -27,6 +27,7 @@ from src.model import (  # noqa: E402
     conformity_scores,
     fix_quantile_crossing,
     interval_breach_by_prediction_bucket,
+    predict_quantiles_with_models,
     predict_with_models,
     quantile_coverage,
     quantile_crossing_rate,
@@ -453,3 +454,57 @@ def test_predict_with_models_skips_positions_not_present_in_test_df():
 
     result = predict_with_models(test_df, models, {"WR": 0.0, "QB": 0.0}, feature_cols=["feat_a"])
     assert set(result["position"]) == {"WR"}
+
+
+def test_predict_quantiles_with_models_widens_each_pair_by_its_own_constant_and_fixes_crossing():
+    """
+    src/simulate.py needs 5 CQR-calibrated points per player. Uses fake
+    models with fixed, deliberately-crossed predict() outputs (q10 above
+    q90, q25 above q75) to check: (1) the 10-90 and 25-75 pairs are each
+    widened by their OWN constant, not a shared one, (2) within-pair
+    crossing is resolved via min/max before widening, (3) q50 passes
+    through untouched.
+    """
+    class _FixedModel:
+        def __init__(self, value):
+            self.value = value
+
+        def predict(self, X):
+            return np.full(len(X), self.value)
+
+    models = {
+        "WR": {
+            "point": _FixedModel(99.0),  # unused by this function
+            "quantiles": {
+                0.10: _FixedModel(12.0), 0.25: _FixedModel(14.0), 0.50: _FixedModel(10.0),
+                0.75: _FixedModel(6.0), 0.90: _FixedModel(8.0),
+            },
+        },
+    }
+    cqr_10_90 = {"WR": 1.0}
+    cqr_25_75 = {"WR": 2.0}
+    test_df = pd.DataFrame({"player_id": ["p1"], "position": ["WR"], "feat_a": [0.0]})
+
+    result = predict_quantiles_with_models(test_df, models, cqr_10_90, cqr_25_75, feature_cols=["feat_a"])
+
+    row = result.iloc[0]
+    # q10=12, q90=8 -> swapped to lo=8, hi=12, widened by 1.0
+    assert row["pred_q10_cqr"] == pytest.approx(7.0)
+    assert row["pred_q90_cqr"] == pytest.approx(13.0)
+    # q25=14, q75=6 -> swapped to lo=6, hi=14, widened by 2.0
+    assert row["pred_q25_cqr"] == pytest.approx(4.0)
+    assert row["pred_q75_cqr"] == pytest.approx(16.0)
+    # q50 untouched
+    assert row["pred_q50"] == pytest.approx(10.0)
+
+
+def test_predict_quantiles_with_models_raises_on_missing_alpha():
+    class _FixedModel:
+        def predict(self, X):
+            return np.zeros(len(X))
+
+    models = {"WR": {"point": _FixedModel(), "quantiles": {0.10: _FixedModel(), 0.90: _FixedModel()}}}  # missing 0.25/0.50/0.75
+    test_df = pd.DataFrame({"player_id": ["p1"], "position": ["WR"], "feat_a": [0.0]})
+
+    with pytest.raises(KeyError):
+        predict_quantiles_with_models(test_df, models, {"WR": 0.0}, {"WR": 0.0}, feature_cols=["feat_a"])

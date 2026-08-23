@@ -5,10 +5,13 @@ Bundles everything weekly-update.yml's inference-only run needs into ONE
 committed file, so it never has to retrain or rebuild the full multi-season
 feature table:
   - the per-position final models (src/model.py::train_final_models --
-    point regressor + q10/q90 quantile models, trained on ALL history)
-  - feature_columns and cqr_widen_by_10_90, so predictions always match
-    whatever retrain.yml actually trained even if src/model.py's or
-    src/export.py's own constants drift later
+    point regressor + the 5-point 0.10/0.25/0.50/0.75/0.90 quantile set,
+    trained on ALL history -- the extra 3 quantiles beyond q10/q90 exist
+    for src/simulate.py's per-player distributions, not the dashboard's
+    floor/ceiling, which only ever reads q10/q90)
+  - feature_columns and cqr_widen_by_10_90/cqr_widen_by_25_75, so
+    predictions always match whatever retrain.yml actually trained even
+    if src/model.py's or src/export.py's own constants drift later
   - performance: the walk-forward MAE-vs-baselines table (same shape as
     src/export.py's PERFORMANCE_BY_POSITION), refreshed by every retrain
   - history_seed: a trimmed slice of the most recent
@@ -44,7 +47,8 @@ MODEL_ARTIFACT_PATH = PROJECT_ROOT / "models" / "fanteasy_model.joblib"
 # KeyError deep inside a prediction call.
 _REQUIRED_KEYS = (
     "trained_at", "model_version", "seasons_trained", "feature_columns",
-    "cqr_widen_by_10_90", "performance", "history_seed", "history_seed_seasons", "models",
+    "cqr_widen_by_10_90", "cqr_widen_by_25_75", "performance", "history_seed",
+    "history_seed_seasons", "models",
 )
 
 
@@ -52,6 +56,7 @@ def save_model_artifact(
     models: dict,
     feature_columns: list[str],
     cqr_widen_by_10_90: dict[str, float],
+    cqr_widen_by_25_75: dict[str, float],
     performance: dict,
     seasons_trained: list[int],
     history_seed,
@@ -67,6 +72,7 @@ def save_model_artifact(
         "seasons_trained": list(seasons_trained),
         "feature_columns": list(feature_columns),
         "cqr_widen_by_10_90": dict(cqr_widen_by_10_90),
+        "cqr_widen_by_25_75": dict(cqr_widen_by_25_75),
         "performance": performance,
         "history_seed": history_seed,
         "history_seed_seasons": list(history_seed_seasons),

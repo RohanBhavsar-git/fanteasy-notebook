@@ -19,6 +19,7 @@ def _sample_artifact_kwargs():
         models={"WR": {"point": "fake-model", "quantiles": {0.10: "fake-q10", 0.90: "fake-q90"}}},
         feature_columns=["feat_a", "feat_b"],
         cqr_widen_by_10_90={"WR": 1.2},
+        cqr_widen_by_25_75={"WR": 0.6},
         performance={"WR": {"model_mae": 4.0, "sleeper_mae": 3.8, "s2d_mae": 4.2}},
         seasons_trained=[2024, 2025],
         history_seed=pd.DataFrame({"player_id": ["p1"], "season": [2025]}),

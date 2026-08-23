@@ -12,15 +12,22 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import src.export as export_module  # noqa: E402
 from src.export import (  # noqa: E402
     assemble_player_advanced_stats,
+    assemble_simulation_block,
+    build_matchup_simulation,
+    build_playoff_odds,
+    build_starter_quantile_rows,
     build_target_week_features,
+    build_team_game_id_lookup,
     build_trend_snapshot,
     build_xfp_summary,
     get_export_candidates,
     get_export_scope,
     normalize_team_code,
     validate_export,
+    validate_simulation,
 )
 
 
@@ -259,3 +266,128 @@ def test_validate_export_catches_unknown_sleeper_id():
     crosswalk = pd.DataFrame({"sleeper_id": ["4984"]})
     with pytest.raises(AssertionError, match="not real Sleeper IDs"):
         validate_export(payload, crosswalk)
+
+
+# ==========================================================================
+# STEP 7: simulation wiring (Phase 8 round 2)
+# ==========================================================================
+def test_build_team_game_id_lookup_stacks_home_and_away():
+    schedule = pd.DataFrame([
+        {"season": 2025, "week": 10, "game_type": "REG", "home_team": "KC", "away_team": "BUF", "game_id": "g1"},
+        {"season": 2025, "week": 10, "game_type": "POST", "home_team": "SF", "away_team": "DAL", "game_id": "g2"},
+    ])
+    lookup = build_team_game_id_lookup(schedule)
+    pairs = set(zip(lookup["team"], lookup["game_id"]))
+    assert ("KC", "g1") in pairs
+    assert ("BUF", "g1") in pairs
+    assert not any(t in ("SF", "DAL") for t, _ in pairs)  # POST excluded
+
+
+def test_build_starter_quantile_rows_covers_model_player_kdst_fallback_and_bye_drop():
+    quantiles_by_gsis = pd.DataFrame([
+        {"player_id": "00-001", "position": "RB", "pred_q10_cqr": 5.0, "pred_q25_cqr": 8.0,
+         "pred_q50": 12.0, "pred_q75_cqr": 16.0, "pred_q90_cqr": 20.0},
+    ])
+    sleeper_proj_points = {"kdst_1": 7.5}  # no model coverage for this one at all
+    sleeper_to_gsis = {"sleeper_1": "00-001"}  # model-covered starter
+    # sleeper_2 has no crosswalk entry and no sleeper projection -> falls to 0.0
+    team_by_sleeper = {"sleeper_1": "KC", "kdst_1": "SF", "sleeper_2": "BUF", "bye_guy": "MIA"}
+    game_id_by_team_week = {(2025, 10, "KC"): "g1", (2025, 10, "SF"): "g2", (2025, 10, "BUF"): "g1"}
+    # "MIA" deliberately has no game_id entry -- simulates a bye week
+
+    rows = build_starter_quantile_rows(
+        ["sleeper_1", "kdst_1", "sleeper_2", "bye_guy", "0", None],
+        2025, 10, quantiles_by_gsis, sleeper_proj_points, sleeper_to_gsis, team_by_sleeper, game_id_by_team_week,
+    )
+
+    assert len(rows) == 3  # bye_guy dropped (no game_id), "0"/None skipped as empty slots
+    model_row = rows[rows["game_id"] == "g1"].iloc[0]
+    assert model_row["pred_q50"] == 12.0 and model_row["pred_q10_cqr"] == 5.0
+
+    kdst_row = rows[rows["game_id"] == "g2"].iloc[0]
+    assert (kdst_row[["pred_q10_cqr", "pred_q25_cqr", "pred_q50", "pred_q75_cqr", "pred_q90_cqr"]] == 7.5).all()
+
+    zero_fallback_row = rows[(rows["game_id"] == "g1") & (rows["pred_q50"] == 0.0)]
+    assert len(zero_fallback_row) == 1  # sleeper_2: no crosswalk, no sleeper projection -> 0.0 constant
+
+
+def test_build_matchup_simulation_rounds_to_whole_percent_and_skips_empty_lineups(monkeypatch):
+    matchups = pd.DataFrame([
+        {"roster_id": 1, "matchup_id": 100},
+        {"roster_id": 2, "matchup_id": 100},
+        {"roster_id": 3, "matchup_id": 101},  # no partner -- odd group, skipped
+        {"roster_id": 4, "matchup_id": 102},
+        {"roster_id": 5, "matchup_id": 102},
+    ])
+
+    def fake_simulate_matchup(lineup_a, lineup_b, n_sims):
+        return {"team_a_win_prob": 0.347, "team_b_win_prob": 0.653}
+
+    monkeypatch.setattr(export_module, "simulate_matchup", fake_simulate_matchup)
+
+    def lineup_fn(roster_id):
+        if roster_id == 4:
+            return pd.DataFrame(columns=["game_id"])  # roster 4's lineup unresolvable
+        return pd.DataFrame({"game_id": ["g1"], "pred_q50": [10.0]})
+
+    results = build_matchup_simulation(matchups, lineup_fn, n_sims=10000)
+
+    assert len(results) == 1  # only matchup 100 has both a real pair AND resolvable lineups
+    r = results[0]
+    assert r["win_prob_a"] == 35 and r["win_prob_b"] == 65  # whole-percent rounding, not 34.7/65.3
+    assert isinstance(r["win_prob_a"], int)
+
+
+def test_build_playoff_odds_rounds_and_reshapes_to_string_keyed_dict(monkeypatch):
+    def fake_simulate_season(remaining_weeks, starting_standings, lineup_builder, playoff_teams, n_sims):
+        return pd.DataFrame({"roster_id": [1, 2], "playoff_prob": [0.667, 0.128], "mean_final_wins": [9.0, 5.0], "mean_final_points_for": [1400.0, 1200.0]})
+
+    monkeypatch.setattr(export_module, "simulate_season", fake_simulate_season)
+
+    standings = pd.DataFrame({"roster_id": [1, 2], "wins": [6, 3], "points_for": [800.0, 700.0]})
+    odds = build_playoff_odds([], standings, lambda r, w: pd.DataFrame(), playoff_teams=6, n_sims=3000)
+
+    assert odds == {"1": 67, "2": 13}  # rounded to whole percent, string keys
+    for pct in odds.values():
+        assert isinstance(pct, int)
+
+
+def test_build_playoff_odds_returns_empty_dict_for_empty_standings():
+    assert build_playoff_odds([], pd.DataFrame(), lambda r, w: pd.DataFrame(), playoff_teams=6) == {}
+
+
+def test_assemble_simulation_block_returns_none_when_nothing_to_show():
+    assert assemble_simulation_block([], {}, week=1) is None
+
+
+def test_assemble_simulation_block_populates_when_either_side_has_data():
+    block = assemble_simulation_block([{"matchup_id": 1, "win_prob_a": 60, "win_prob_b": 40}], {}, week=5)
+    assert block["week"] == 5
+    assert block["matchups"][0]["matchup_id"] == 1
+    assert "calibration_caveat" in block and "accuracy_caveat" in block
+    assert "93.6%" in block["accuracy_caveat"]
+
+
+def test_validate_simulation_none_is_fine():
+    assert validate_simulation(None) == {"present": False}
+
+
+def test_validate_simulation_passes_on_sane_data():
+    simulation = {
+        "matchups": [{"matchup_id": 1, "win_prob_a": 60, "win_prob_b": 40}],
+        "playoff_odds": {"1": 75, "2": 10},
+    }
+    report = validate_simulation(simulation)
+    assert report == {"present": True, "n_matchups": 1, "n_rosters_with_playoff_odds": 2}
+
+
+def test_validate_simulation_catches_probabilities_not_summing_to_100():
+    simulation = {"matchups": [{"matchup_id": 1, "win_prob_a": 60, "win_prob_b": 60}], "playoff_odds": {}}
+    with pytest.raises(AssertionError, match="not ~100"):
+        validate_simulation(simulation)
+
+
+def test_validate_simulation_catches_out_of_range_playoff_prob():
+    simulation = {"matchups": [], "playoff_odds": {"1": 150}}
+    with pytest.raises(AssertionError, match="out of \\[0, 100\\]"):
+        validate_simulation(simulation)
