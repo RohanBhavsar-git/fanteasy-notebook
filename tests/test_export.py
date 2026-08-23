@@ -18,6 +18,7 @@ from src.export import (  # noqa: E402
     assemble_simulation_block,
     build_matchup_simulation,
     build_playoff_odds,
+    build_radar_snapshot,
     build_starter_quantile_rows,
     build_target_week_features,
     build_team_game_id_lookup,
@@ -27,6 +28,7 @@ from src.export import (  # noqa: E402
     get_export_candidates,
     get_export_scope,
     normalize_team_code,
+    position_starter_counts,
     validate_export,
     validate_simulation,
 )
@@ -197,6 +199,102 @@ def test_build_trend_snapshot_renames_ewm3_columns_to_avoid_usage_collision():
     assert p2["target_share_trend_direction"] == "falling"
 
 
+# ==========================================================================
+# PHASE 4: radar percentiles
+# ==========================================================================
+def test_position_starter_counts_matches_this_leagues_real_roster_positions():
+    """
+    Pinned against this league's REAL roster_positions (14 teams: QB, 2x RB,
+    2x WR, TE, FLEX, K, DEF, 5x BN) -- if either this function or
+    index.html's positionStarterCount() drifts from the other, this breaks
+    instead of the two silently disagreeing. WR's 35 matches the number
+    already published in the Weekly Production chart's own footnote
+    ("(2 WR + 0.5 flex share) x 14 teams ~= 35" -- see PROJECT_CONTEXT.md).
+    """
+    roster_positions = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF", "BN", "BN", "BN", "BN", "BN"]
+    counts = position_starter_counts(roster_positions, n_teams=14)
+    assert counts == {"QB": 14, "RB": 33, "WR": 35, "TE": 16}
+
+
+def test_position_starter_counts_falls_back_to_defaults_when_position_absent():
+    """A hypothetical league with no dedicated slot AND no FLEX for a
+    position falls back to _DEFAULT_STARTER_SHARE, same as the JS
+    fallback branch (raw === 0)."""
+    roster_positions = ["QB", "WR", "WR", "TE", "K", "DEF", "BN"]  # no RB slot, no FLEX
+    counts = position_starter_counts(roster_positions, n_teams=10)
+    assert counts["RB"] == round(2.5 * 10)  # default RB share (2.5) x 10 teams
+    assert counts["QB"] == 10  # real direct slot, unaffected by the fallback
+
+
+def _radar_test_frame(rows: list[dict]) -> pd.DataFrame:
+    """Fills in every RADAR_METRICS axis column not explicitly set on a
+    row with NaN -- derived from the module's own RADAR_METRICS constant
+    rather than a hardcoded column list, so this helper can't quietly
+    drift from what build_radar_snapshot actually reads."""
+    all_cols = sorted({axis["column"] for axes in export_module.RADAR_METRICS.values() for axis in axes})
+    df = pd.DataFrame(rows)
+    for col in all_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
+
+def test_build_radar_snapshot_percentiles_against_pool_only_not_every_candidate():
+    """
+    3 WR candidates eligible on games_played, 1 short of the floor.
+    roster_positions gives a WR pool of exactly 2 -- w3 (3rd by season
+    points) is excluded from the pool but still gets percentiled AGAINST
+    it, which is the whole point: a bench-caliber target_share should read
+    as near-0th percentile relative to real starters, not compressed
+    upward by including every WR in the denominator.
+    """
+    combined = _radar_test_frame([
+        # target-week (2025, wk10) stub rows
+        {"player_id": "w1", "position": "WR", "season": 2025, "week": 10, "games_played": 8,
+         "target_share_s2d": 0.30, "custom_points": np.nan},
+        {"player_id": "w2", "position": "WR", "season": 2025, "week": 10, "games_played": 8,
+         "target_share_s2d": 0.20, "custom_points": np.nan},
+        {"player_id": "w3", "position": "WR", "season": 2025, "week": 10, "games_played": 8,
+         "target_share_s2d": 0.05, "custom_points": np.nan},
+        {"player_id": "w4", "position": "WR", "season": 2025, "week": 10, "games_played": 2,
+         "target_share_s2d": 0.50, "custom_points": np.nan},  # below games floor -- excluded outright
+        # historical rows behind the target week -- season-to-date points ranking
+        {"player_id": "w1", "position": "WR", "season": 2025, "week": 9, "games_played": 7, "custom_points": 100.0},
+        {"player_id": "w2", "position": "WR", "season": 2025, "week": 9, "games_played": 7, "custom_points": 80.0},
+        {"player_id": "w3", "position": "WR", "season": 2025, "week": 9, "games_played": 7, "custom_points": 20.0},
+    ])
+    roster_positions = ["WR"]  # 1 direct slot, no FLEX -- pool = round(1 * 2) = 2 teams
+
+    radar = build_radar_snapshot(combined, target_season=2025, target_week=10,
+                                  roster_positions=roster_positions, n_teams=2)
+
+    assert radar["w1"]["eligible"] and radar["w2"]["eligible"] and radar["w3"]["eligible"]
+    assert radar["w1"]["pool_size"] == 2  # w1, w2 -- w3 ranked 3rd by season points, excluded
+    target_share_axis = lambda r: next(a for a in r["axes"] if a["label"] == "Target Share")
+    assert target_share_axis(radar["w1"])["percentile"] == 75   # above w2, below no one else in pool
+    assert target_share_axis(radar["w1"])["raw"] == pytest.approx(30.0)  # 0.30 -> 30.0, pct=True axis
+    assert target_share_axis(radar["w2"])["percentile"] == 25
+    assert target_share_axis(radar["w3"])["percentile"] == 0    # not in the pool, ranks below both who are
+
+    # w4 never got a chance to compress w3's ranking -- excluded before pool selection.
+    assert radar["w4"] == {"eligible": False, "games_played": 2, "min_games": 5}
+
+
+def test_build_radar_snapshot_all_ineligible_when_nobody_clears_games_floor():
+    """Early season: everyone at a position is short on games -- pool_size
+    is 0, so every candidate at that position (even one with real target
+    share data) gets an honest ineligible object, never a percentile
+    against an empty/meaningless pool."""
+    combined = _radar_test_frame([
+        {"player_id": "w1", "position": "WR", "season": 2025, "week": 2, "games_played": 1,
+         "target_share_s2d": 0.30, "custom_points": np.nan},
+        {"player_id": "w1", "position": "WR", "season": 2025, "week": 1, "games_played": 0, "custom_points": 5.0},
+    ])
+    radar = build_radar_snapshot(combined, target_season=2025, target_week=2,
+                                  roster_positions=["WR"], n_teams=2)
+    assert radar["w1"] == {"eligible": False, "games_played": 1, "min_games": 5}
+
+
 def test_assemble_and_validate_export_round_trip():
     scoped_predictions = pd.DataFrame({
         "player_id": ["00-0001", "00-0002"],
@@ -246,9 +344,17 @@ def test_assemble_and_validate_export_round_trip():
         "gsis_id": ["00-0001", "00-0002"],
         "sleeper_id": ["4984", "5001"],
     })
+    # 00-0001 has no entry at all (falls back to the honest default);
+    # 00-0002 has a real eligible radar from build_radar_snapshot's shape.
+    radar = {
+        "00-0002": {
+            "eligible": True, "games_played": 8, "min_games": 5, "pool_size": 33,
+            "axes": [{"label": "Touch Volume", "unit": " touches/gm", "percentile": 62, "raw": 14.3}],
+        },
+    }
 
     payload, report = assemble_player_advanced_stats(
-        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, crosswalk,
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, crosswalk,
         target_season=2026, target_week=1, seasons_trained=list(range(2018, 2026)),
         model_version="test-version",
     )
@@ -281,6 +387,14 @@ def test_assemble_and_validate_export_round_trip():
         "carry_share": {"current": None, "signal": None, "direction": None},
         "red_zone_share": {"current": 0.15, "signal": 0.1, "direction": "stable"},
     }
+
+    # radar: a candidate absent from the radar dict falls back to an honest
+    # ineligible object rather than a missing key or a KeyError; a real
+    # eligible entry passes through untouched.
+    assert payload["players"]["4984"]["radar"] == {"eligible": False, "games_played": 0, "min_games": 5}
+    assert payload["players"]["5001"]["radar"]["eligible"] is True
+    assert payload["players"]["5001"]["radar"]["pool_size"] == 33
+    assert payload["players"]["5001"]["radar"]["axes"][0]["label"] == "Touch Volume"
 
     validation = validate_export(payload, crosswalk)
     assert validation["n_players"] == 2

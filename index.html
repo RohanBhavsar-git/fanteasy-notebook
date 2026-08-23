@@ -766,6 +766,19 @@
 
     .radar-wrapper { position: relative; height: 320px; }
 
+    /* Position Profile radar's raw-value list -- percentile alone is a
+       rank, not a number; this is where the actual stat lives. */
+    .radar-axis-list { display: flex; flex-direction: column; margin-top: 10px; }
+    .radar-axis-row {
+      display: grid; grid-template-columns: 1fr auto auto; gap: 10px;
+      align-items: center; font-size: 12px; padding: 5px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .radar-axis-row:last-child { border-bottom: none; }
+    .radar-axis-label { color: var(--text-secondary); font-weight: 600; }
+    .radar-axis-raw { color: var(--text-primary); font-weight: 700; text-align: right; white-space: nowrap; }
+    .radar-axis-pct { color: var(--text-muted); font-size: 11px; text-align: right; min-width: 66px; white-space: nowrap; }
+
     /* Field heatmap */
     .field-container {
       position: relative; background: #0d4f1c; border-radius: 8px;
@@ -3095,6 +3108,85 @@
     `;
   }
 
+  // Phase 4: Position Profile radar. Three states, same honesty pattern
+  // as every other new-field rollout in this export -- an entirely
+  // missing `radar` key (an old export predating this feature) reads the
+  // same as `state.advancedStats` itself being absent; `radar.eligible ===
+  // false` (real, but too few games this season) gets a SPECIFIC reason
+  // rather than a generic placeholder, reusing the same games_played/
+  // min_games the export itself used to make that call so the copy can
+  // never drift from the actual gate; `radar.eligible === true` renders
+  // the real chart. Chart.js instantiation happens after this string is
+  // inserted into the DOM -- see renderPlayerDetail's post-innerHTML block.
+  function renderPositionProfilePanel(p) {
+    const advanced = getAdvancedPlayer(p.player_id);
+    const radar = advanced?.radar;
+
+    if (!radar) {
+      return `
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">${p.position} Profile</div>
+            <div class="panel-note">Percentile rank vs. startable ${p.position}s</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">📈</div>
+            <div class="pd-placeholder-title">Awaiting model output</div>
+            <div class="pd-placeholder-text">
+              Once <code>player_advanced_stats.json</code> covers this player, this panel will show a 6-axis
+              percentile profile for ${p.position}s -- volume, share, efficiency, and situational usage.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (!radar.eligible) {
+      return `
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">${p.position} Profile</div>
+            <div class="panel-note">Percentile rank vs. startable ${p.position}s</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">📈</div>
+            <div class="pd-placeholder-title">Not enough games yet</div>
+            <div class="pd-placeholder-text">
+              ${radar.games_played} of ${radar.min_games} games played this season. A profile built on this few
+              games would rank higher or lower than reality mostly by chance -- check back in a few weeks.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">${p.position} Profile</div>
+          <div class="panel-note">Percentile vs. ${radar.pool_size} startable ${p.position}s</div>
+        </div>
+        <div class="radar-wrapper">
+          <canvas id="pd-radar-chart"></canvas>
+        </div>
+        <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 6px;">
+          Each axis is a RANK, not a rating: the N here means this player is ahead of N% of this league's
+          startable ${p.position}s in that stat this season -- not that he's "good" at it. A high percentile in
+          Pass Volume just means more attempts than most starters, nothing about efficiency.
+        </div>
+        <div class="radar-axis-list">
+          ${radar.axes.map(ax => `
+            <div class="radar-axis-row">
+              <span class="radar-axis-label">${ax.label}</span>
+              <span class="radar-axis-raw">${ax.raw != null ? ax.raw + ax.unit : '—'}</span>
+              <span class="radar-axis-pct">${ax.percentile != null ? ax.percentile + 'th pctl' : '—'}</span>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+  }
+
   // Weekly xFP for one player in one season, keyed by week-as-string to
   // match the export's own {week_str: xfp} shape -- {} (not an error) if
   // the export hasn't loaded, predates this key, or doesn't cover this
@@ -3126,14 +3218,40 @@
     return `${calibration} ${accuracy}`;
   }
 
+  // True when the export's simulation block was generated for the
+  // CURRENTLY DISPLAYED season and week -- shared by the win-probability/
+  // playoff-odds getters below and their caveat footers in renderDashboard/
+  // renderMatchupsView so all of them can never disagree about whether
+  // real simulation numbers are actually showing.
+  //
+  // The season check closes a real gap found in a full-dashboard audit:
+  // fetchAllRealData()'s previous_league_id fallback means the dashboard
+  // can be displaying the PRIOR season (hasGames still false -- e.g. right
+  // after a new draft, before any of that season's games are played)
+  // while weekly-update.yml has already written a `simulation` block for
+  // the NEW season's week 1. Before this check, that block's week-1
+  // numbers would silently attach to the prior season's already-decided
+  // week-1 matchups/standings just because the week numbers happen to
+  // collide -- exactly the kind of stale-number-under-a-different-context
+  // bug getMyProj() already guards against, just missed here originally.
+  function simulationMatchesCurrentView() {
+    const advanced = state.advancedStats;
+    const sim = advanced?.simulation;
+    if (!sim) return false;
+    if (Number(advanced.meta?.season) !== Number(state.league?.season)) return false;
+    return sim.week === state.selectedWeek;
+  }
+
   // {home: pct, away: pct} for one matchup, or null. Only returns a value
-  // when the export's simulation covers the CURRENTLY VIEWED week -- the
-  // export only ever holds one week's simulation at a time (whichever
-  // week was upcoming when weekly-update.yml last ran), same "never show
-  // a stale number under a different week" rule getMyProj() follows.
+  // when the export's simulation covers the CURRENTLY VIEWED season AND
+  // week -- the export only ever holds one week's simulation at a time
+  // (whichever week was upcoming when weekly-update.yml last ran), same
+  // "never show a stale number under a different week" rule getMyProj()
+  // follows. See simulationMatchesCurrentView() above for why the season
+  // half of this check matters, not just the week half.
   function getMatchupWinProb(homeRosterId, awayRosterId) {
-    const sim = state.advancedStats?.simulation;
-    if (!sim || sim.week !== state.selectedWeek) return null;
+    if (!simulationMatchesCurrentView()) return null;
+    const sim = state.advancedStats.simulation;
     const m = sim.matchups.find(x =>
       (x.roster_a === homeRosterId && x.roster_b === awayRosterId) ||
       (x.roster_a === awayRosterId && x.roster_b === homeRosterId)
@@ -3144,11 +3262,27 @@
   }
 
   // Whole-percent playoff-qualification odds for one roster, or null.
-  // Unlike win probability this isn't week-scoped -- it's a season-long
-  // forecast computed once per export and valid regardless of which
-  // week's standings the table happens to be showing.
+  // Gated on the same simulationMatchesCurrentView() check as win
+  // probability above -- previously this checked neither season nor
+  // week, just whether a playoff_odds entry existed for the roster id.
+  // That was the same cross-season attachment risk getMatchupWinProb()
+  // had, but worse: roster_id isn't even guaranteed to refer to the same
+  // team across two different seasons' leagues, so a season mismatch
+  // could silently show one team's odds under a completely different
+  // team's row. The week half of the gate closes a second, same-season
+  // staleness gap: simulate_season() computes these odds from the
+  // standings AS OF simulation.week -- once real games have been played
+  // past that week, the standings it simulated from are already out of
+  // date, so showing the same number under a later selectedWeek would be
+  // a stale number in the same way an out-of-date My Proj would be. This
+  // does mean the column reads "--" for any week other than the one the
+  // export covers, not just for a season mismatch -- a real behavior
+  // change from the previous "always show the latest known odds"
+  // version, traded for the same never-show-stale guarantee every other
+  // projection on this dashboard already makes.
   function getPlayoffOdds(rosterId) {
-    const pct = state.advancedStats?.simulation?.playoff_odds?.[String(rosterId)];
+    if (!simulationMatchesCurrentView()) return null;
+    const pct = state.advancedStats.simulation.playoff_odds?.[String(rosterId)];
     return pct == null ? null : pct;
   }
 
@@ -3830,532 +3964,6 @@
     return worst;
   }
 
-  // Detailed descriptions for each radar stat — used in tooltips
-  const STAT_DESCRIPTIONS = {
-    // QB
-    'Pass Volume': { name: 'Pass Volume', desc: 'Pass attempts per game.' },
-    'Accuracy': { name: 'Accuracy (CMP%)', desc: 'Completion percentage on pass attempts.' },
-    'Big Play Rate': { name: 'Big Play Rate', desc: 'Percentage of throws that travel 20+ yards in the air.' },
-    'Rushing Threat': { name: 'Rushing Threat', desc: 'Rushing yards and touchdowns per game.' },
-    'TD Rate': { name: 'TD Rate', desc: 'Touchdown percentage on pass attempts.' },
-    'Sack %': { name: 'Sack %', desc: 'Percentage of dropbacks that result in a sack.' },
-    'INT Rate': { name: 'INT Rate', desc: 'Interception percentage on pass attempts.' },
-    'Fumble Rate': { name: 'Fumble Rate', desc: 'Fumbles per game.' },
-    'Boom %': { name: 'Boom %', desc: 'Percentage of weeks scoring at least 150% of season average.' },
-    'Bust %': { name: 'Bust %', desc: 'Percentage of weeks scoring under 50% of season average.' },
-    'Air Yards/Att': { name: 'Air Yards Per Attempt', desc: 'Average intended air yards per pass attempt.' },
-    'EPA/Play': { name: 'EPA Per Play', desc: 'Expected Points Added per play — measures efficiency relative to game state.' },
-    // RB
-    'Rush Volume': { name: 'Rush Volume', desc: 'Rushing attempts per game.' },
-    'Yards Per Carry': { name: 'Yards Per Carry (YPC)', desc: 'Average yards gained per rushing attempt.' },
-    'Receiving Work': { name: 'Receiving Work', desc: 'Targets and receptions per game.' },
-    'Explosive Runs': { name: 'Explosive Run Rate', desc: 'Percentage of runs gaining 10 or more yards.' },
-    'Goal Line Share': { name: 'Goal Line Share', desc: 'Percentage of team carries inside the 5-yard line.' },
-    'Snap Share': { name: 'Snap Share', desc: 'Percentage of team offensive snaps played.' },
-    'Catch Rate': { name: 'Catch Rate', desc: 'Receptions divided by targets.' },
-    'Drop Rate': { name: 'Drop Rate', desc: 'Percentage of catchable targets dropped.' },
-    'TD per Touch': { name: 'TD Per Touch', desc: 'Touchdowns scored per total touch (carry + reception).' },
-    'Yards After Contact': { name: 'Yards After Contact', desc: 'Average yards gained after first contact per carry.' },
-    // WR
-    'Target Volume': { name: 'Target Volume', desc: 'Targets per game.' },
-    'Target Share': { name: 'Target Share', desc: 'Percentage of team targets received.' },
-    'Avg Depth (aDOT)': { name: 'Avg Depth of Target (aDOT)', desc: 'Average air yards per target.' },
-    'YAC': { name: 'Yards After Catch', desc: 'Average yards gained after the catch per reception.' },
-    'Red Zone Share': { name: 'Red Zone Share', desc: 'Percentage of team targets inside the 20-yard line.' },
-    'Contested Catch': { name: 'Contested Catch Rate', desc: 'Win rate on contested (50/50) targets.' },
-    'Yards Per Target': { name: 'Yards Per Target', desc: 'Receiving yards divided by targets.' },
-    'Air Yards Share': { name: 'Air Yards Share', desc: 'Percentage of team total air yards.' },
-    'Routes/Game': { name: 'Routes Per Game', desc: 'Average number of routes run per game.' },
-    // TE
-    'Route Participation': { name: 'Route Participation', desc: 'Percentage of pass plays where the tight end runs a route.' },
-    'Yards Per Route': { name: 'Yards Per Route Run (YPRR)', desc: 'Receiving yards divided by total routes run.' },
-    'Red Zone Usage': { name: 'Red Zone Usage', desc: 'Target share inside the 20-yard line.' },
-    'Blocking Snaps': { name: 'Blocking Snaps', desc: 'Percentage of snaps spent blocking rather than running routes.' },
-    // K
-    'FG Attempts': { name: 'FG Attempts', desc: 'Field goal attempts per game.' },
-    'Long FG %': { name: 'Long FG %', desc: 'Conversion rate on field goals from 50 yards or longer.' },
-    'XP %': { name: 'Extra Point %', desc: 'Conversion rate on point-after-touchdown attempts.' },
-    'Touchback %': { name: 'Touchback %', desc: 'Percentage of kickoffs that result in a touchback.' },
-    'Game Script': { name: 'Game Script', desc: 'Percentage of games played in close situations.' },
-    'Dome %': { name: 'Dome %', desc: 'Percentage of games played indoors.' },
-    'FG Made': { name: 'FG Made', desc: 'Total field goals made on the season.' },
-    'Overall FG %': { name: 'Overall FG %', desc: 'Total field goal conversion rate at all distances.' },
-    // DEF
-    'Sacks/Game': { name: 'Sacks Per Game', desc: 'Average sacks recorded per game.' },
-    'Turnovers/Game': { name: 'Turnovers Per Game', desc: 'Interceptions plus fumble recoveries per game.' },
-    'Pts Allowed (inv)': { name: 'Points Allowed', desc: 'Points allowed per game.' },
-    'Yds Allowed (inv)': { name: 'Yards Allowed', desc: 'Total yards allowed per game.' },
-    'Def TDs': { name: 'Defensive TDs', desc: 'Total defensive and special teams touchdowns scored.' },
-    'Pressure Rate': { name: 'Pressure Rate', desc: 'Percentage of opponent dropbacks where the defense generates QB pressure.' },
-    'INTs': { name: 'Interceptions', desc: 'Total interceptions on the season.' },
-    'Forced Fumbles': { name: 'Forced Fumbles', desc: 'Total forced fumbles on the season.' },
-    'Safeties': { name: 'Safeties', desc: 'Total safeties recorded on the season.' },
-    'Shutouts': { name: 'Shutouts', desc: 'Number of games allowing zero points.' }
-  };
-
-  // Direction map — true means lower value is better. Used for best/worst highlighting in compare table.
-  const STAT_LOWER_IS_BETTER = {
-    'Sack %': true,
-    'INT Rate': true,
-    'Fumble Rate': true,
-    'Bust %': true,
-    'Drop Rate': true,
-    'Pts Allowed (inv)': true,
-    'Yds Allowed (inv)': true
-  };
-  // ============================================
-  // POSITION ANALYTICS — radar stats + heatmap data
-  // ============================================
-  // Generates a deterministic-ish 0-100 score for each radar axis based on player attributes.
-  function getRadarStats(p) {
-    // Use player_id as a seed for consistent values per player
-    const seed = parseInt(p.player_id.replace('p', '')) || 1;
-    const rand = (offset) => {
-      const x = Math.sin(seed * 9301 + offset * 49297) * 233280;
-      return Math.abs(x - Math.floor(x));
-    };
-    // Bias values toward player's overall quality
-    const qualityBoost = Math.min(40, (p.totalPts / 200) * 50);
-
-    const profiles = {
-      QB: {
-        labels: ['Pass Volume', 'Accuracy', 'Big Play Rate', 'Rushing Threat', 'TD Rate', 'Sack %'],
-        values: [
-          Math.round(50 + rand(1) * 30 + qualityBoost * 0.3),
-          Math.round(45 + rand(2) * 35 + qualityBoost * 0.4),
-          Math.round(30 + rand(3) * 50 + qualityBoost * 0.3),
-          p.role === 'Dual Threat' ? Math.round(70 + rand(4) * 25) : Math.round(15 + rand(4) * 35),
-          Math.round(40 + rand(5) * 30 + qualityBoost * 0.5),
-          Math.round(40 + rand(6) * 40 + qualityBoost * 0.2)
-        ]
-      },
-      RB: {
-        labels: ['Rush Volume', 'Yards Per Carry', 'Receiving Work', 'Explosive Runs', 'Goal Line Share', 'Snap Share'],
-        values: [
-          p.role === '3-Down Back' ? Math.round(70 + rand(1) * 25) : Math.round(30 + rand(1) * 40),
-          Math.round(40 + rand(2) * 40 + qualityBoost * 0.3),
-          p.role === 'Pass Catcher' ? Math.round(75 + rand(3) * 20) : Math.round(20 + rand(3) * 40),
-          Math.round(30 + rand(4) * 50 + qualityBoost * 0.2),
-          p.role === 'Goal Line' || p.role === '3-Down Back' ? Math.round(65 + rand(5) * 30) : Math.round(15 + rand(5) * 35),
-          p.role === '3-Down Back' ? Math.round(75 + rand(6) * 20) : Math.round(35 + rand(6) * 40)
-        ]
-      },
-      WR: {
-        labels: ['Target Volume', 'Target Share', 'Avg Depth (aDOT)', 'YAC', 'Red Zone Share', 'Contested Catch'],
-        values: [
-          Math.round(40 + rand(1) * 40 + qualityBoost * 0.4),
-          p.role === 'X-Receiver' || p.role === 'Possession' ? Math.round(60 + rand(2) * 35) : Math.round(35 + rand(2) * 40),
-          p.role === 'Deep Threat' ? Math.round(80 + rand(3) * 18) : p.role === 'Slot' ? Math.round(20 + rand(3) * 25) : Math.round(40 + rand(3) * 35),
-          p.role === 'Slot' || p.role === 'Deep Threat' ? Math.round(65 + rand(4) * 30) : Math.round(30 + rand(4) * 40),
-          p.role === 'Red Zone' ? Math.round(75 + rand(5) * 20) : Math.round(25 + rand(5) * 45),
-          p.role === 'X-Receiver' || p.role === 'Red Zone' ? Math.round(65 + rand(6) * 30) : Math.round(35 + rand(6) * 40)
-        ]
-      },
-      TE: {
-        labels: ['Route Participation', 'Target Share', 'Yards Per Route', 'Red Zone Usage', 'Blocking Snaps', 'YAC'],
-        values: [
-          p.role === 'Receiving TE' ? Math.round(80 + rand(1) * 18) : p.role === 'Blocking TE' ? Math.round(30 + rand(1) * 25) : Math.round(55 + rand(1) * 30),
-          p.role === 'Receiving TE' ? Math.round(60 + rand(2) * 30) : Math.round(20 + rand(2) * 35),
-          Math.round(35 + rand(3) * 45 + qualityBoost * 0.3),
-          p.role === 'Red Zone TE' ? Math.round(75 + rand(4) * 20) : Math.round(30 + rand(4) * 40),
-          p.role === 'Blocking TE' ? Math.round(80 + rand(5) * 15) : p.role === 'Receiving TE' ? Math.round(15 + rand(5) * 20) : Math.round(45 + rand(5) * 30),
-          Math.round(35 + rand(6) * 40)
-        ]
-      },
-      K: {
-        labels: ['FG Attempts', 'Long FG %', 'XP %', 'Touchback %', 'Game Script', 'Dome %'],
-        values: [
-          Math.round(40 + rand(1) * 40 + qualityBoost * 0.3),
-          p.role === 'Power Leg' ? Math.round(75 + rand(2) * 22) : Math.round(40 + rand(2) * 40),
-          Math.round(75 + rand(3) * 23),
-          p.role === 'Power Leg' ? Math.round(80 + rand(4) * 18) : Math.round(50 + rand(4) * 35),
-          Math.round(30 + rand(5) * 50),
-          p.role === 'Dome Specialist' ? Math.round(85 + rand(6) * 13) : Math.round(15 + rand(6) * 30)
-        ]
-      },
-      DEF: {
-        labels: ['Sacks/Game', 'Turnovers/Game', 'Pts Allowed (inv)', 'Yds Allowed (inv)', 'Def TDs', 'Pressure Rate'],
-        values: [
-          p.role === 'Pass Rush' ? Math.round(75 + rand(1) * 22) : Math.round(40 + rand(1) * 40),
-          p.role === 'Turnover-Heavy' ? Math.round(75 + rand(2) * 22) : Math.round(35 + rand(2) * 40),
-          Math.round(40 + rand(3) * 40 + qualityBoost * 0.3),
-          p.role === 'Stout Run D' ? Math.round(70 + rand(4) * 25) : Math.round(40 + rand(4) * 40),
-          Math.round(20 + rand(5) * 50),
-          p.role === 'Aggressive' || p.role === 'Pass Rush' ? Math.round(70 + rand(6) * 25) : Math.round(40 + rand(6) * 35)
-        ]
-      }
-    };
-
-    const profile = profiles[p.position];
-    profile.values = profile.values.map(v => Math.max(5, Math.min(98, v)));
-
-    // Generate raw stat values for display (expanded from 6 to ~12 per position)
-    const rawStats = generateRawStats(p, seed);
-    return { ...profile, rawStats };
-  }
-
-  function generateRawStats(p, seed) {
-    const rand = (offset) => {
-      const x = Math.sin(seed * 9301 + offset * 49297) * 233280;
-      return Math.abs(x - Math.floor(x));
-    };
-    const games = getAvailableWeeks().length || 14;
-    const boomCount = p.weeks.filter(w => w >= p.seasonAvg * 1.5).length;
-    const bustCount = p.weeks.filter(w => w < p.seasonAvg * 0.5).length;
-    const boomPct = ((boomCount / p.weeks.length) * 100).toFixed(0) + '%';
-    const bustPct = ((bustCount / p.weeks.length) * 100).toFixed(0) + '%';
-
-    if (p.position === 'QB') {
-      return {
-        'Pass Volume': (28 + rand(11) * 14).toFixed(1),
-        'Accuracy': (58 + rand(12) * 12).toFixed(1) + '%',
-        'Big Play Rate': (8 + rand(13) * 10).toFixed(1) + '%',
-        'Rushing Threat': p.role === 'Dual Threat' ? (40 + rand(14) * 30).toFixed(1) : (5 + rand(14) * 15).toFixed(1),
-        'TD Rate': (3.5 + rand(15) * 2.5).toFixed(1) + '%',
-        'Sack %': (4 + rand(16) * 5).toFixed(1) + '%',
-        'INT Rate': (1.5 + rand(17) * 2.5).toFixed(1) + '%',
-        'Fumble Rate': (0.3 + rand(18) * 0.6).toFixed(2),
-        'Air Yards/Att': (7 + rand(19) * 3).toFixed(1),
-        'EPA/Play': (-0.05 + rand(20) * 0.35).toFixed(2),
-        'Boom %': boomPct,
-        'Bust %': bustPct
-      };
-    }
-    if (p.position === 'RB') {
-      return {
-        'Rush Volume': p.role === '3-Down Back' ? (16 + rand(11) * 6).toFixed(1) : (8 + rand(11) * 8).toFixed(1),
-        'Yards Per Carry': (3.8 + rand(12) * 1.8).toFixed(1),
-        'Receiving Work': p.role === 'Pass Catcher' ? (5 + rand(13) * 3).toFixed(1) : (2 + rand(13) * 3).toFixed(1),
-        'Explosive Runs': (8 + rand(14) * 8).toFixed(1) + '%',
-        'Goal Line Share': (rand(15) * 35).toFixed(1) + '%',
-        'Snap Share': p.role === '3-Down Back' ? (65 + rand(16) * 25).toFixed(0) + '%' : (30 + rand(16) * 30).toFixed(0) + '%',
-        'Catch Rate': (70 + rand(17) * 20).toFixed(1) + '%',
-        'Drop Rate': (1 + rand(18) * 5).toFixed(1) + '%',
-        'Fumble Rate': (0.1 + rand(19) * 0.4).toFixed(2),
-        'TD per Touch': (2 + rand(20) * 4).toFixed(1) + '%',
-        'Yards After Contact': (2.0 + rand(21) * 1.5).toFixed(1),
-        'Boom %': boomPct,
-        'Bust %': bustPct
-      };
-    }
-    if (p.position === 'WR') {
-      return {
-        'Target Volume': (5 + rand(11) * 6).toFixed(1),
-        'Target Share': (15 + rand(12) * 15).toFixed(1) + '%',
-        'Avg Depth (aDOT)': p.role === 'Deep Threat' ? (14 + rand(13) * 4).toFixed(1) : p.role === 'Slot' ? (6 + rand(13) * 4).toFixed(1) : (10 + rand(13) * 4).toFixed(1),
-        'YAC': (3 + rand(14) * 5).toFixed(1),
-        'Red Zone Share': (8 + rand(15) * 17).toFixed(1) + '%',
-        'Contested Catch': (45 + rand(16) * 25).toFixed(1) + '%',
-        'Catch Rate': (55 + rand(17) * 25).toFixed(1) + '%',
-        'Drop Rate': (2 + rand(18) * 6).toFixed(1) + '%',
-        'Yards Per Target': (6 + rand(19) * 4).toFixed(1),
-        'Air Yards Share': (12 + rand(20) * 18).toFixed(1) + '%',
-        'Routes/Game': (24 + rand(21) * 12).toFixed(1),
-        'Boom %': boomPct,
-        'Bust %': bustPct
-      };
-    }
-    if (p.position === 'TE') {
-      return {
-        'Route Participation': p.role === 'Receiving TE' ? (80 + rand(11) * 15).toFixed(0) + '%' : (50 + rand(11) * 25).toFixed(0) + '%',
-        'Target Share': (8 + rand(12) * 14).toFixed(1) + '%',
-        'Yards Per Route': (1.0 + rand(13) * 1.2).toFixed(2),
-        'Red Zone Usage': (10 + rand(14) * 18).toFixed(1) + '%',
-        'Blocking Snaps': p.role === 'Blocking TE' ? (70 + rand(15) * 20).toFixed(0) + '%' : (20 + rand(15) * 25).toFixed(0) + '%',
-        'YAC': (3 + rand(16) * 4).toFixed(1),
-        'Catch Rate': (60 + rand(17) * 25).toFixed(1) + '%',
-        'Drop Rate': (2 + rand(18) * 5).toFixed(1) + '%',
-        'Avg Depth (aDOT)': (6 + rand(19) * 5).toFixed(1),
-        'Routes/Game': (18 + rand(20) * 12).toFixed(1),
-        'Boom %': boomPct,
-        'Bust %': bustPct
-      };
-    }
-    if (p.position === 'K') {
-      return {
-        'FG Attempts': (1.8 + rand(11) * 1.4).toFixed(1),
-        'Long FG %': (55 + rand(12) * 30).toFixed(0) + '%',
-        'XP %': (92 + rand(13) * 7).toFixed(1) + '%',
-        'Touchback %': (60 + rand(14) * 30).toFixed(0) + '%',
-        'Game Script': (30 + rand(15) * 40).toFixed(0) + '%',
-        'Dome %': p.role === 'Dome Specialist' ? '100%' : (rand(16) * 40).toFixed(0) + '%',
-        'FG Made': Math.floor(15 + rand(17) * 15),
-        'Overall FG %': (78 + rand(18) * 17).toFixed(1) + '%',
-        'Boom %': boomPct,
-        'Bust %': bustPct
-      };
-    }
-    if (p.position === 'DEF') {
-      return {
-        'Sacks/Game': (1.8 + rand(11) * 1.8).toFixed(1),
-        'Turnovers/Game': (1.2 + rand(12) * 1.0).toFixed(1),
-        'Pts Allowed (inv)': (16 + rand(13) * 10).toFixed(1),
-        'Yds Allowed (inv)': (290 + rand(14) * 90).toFixed(0),
-        'Def TDs': Math.floor(rand(15) * 5),
-        'Pressure Rate': (22 + rand(16) * 15).toFixed(1) + '%',
-        'INTs': Math.floor(8 + rand(17) * 12),
-        'Forced Fumbles': Math.floor(5 + rand(18) * 10),
-        'Safeties': Math.floor(rand(19) * 2),
-        'Shutouts': Math.floor(rand(20) * 2),
-        'Boom %': boomPct,
-        'Bust %': bustPct
-      };
-    }
-    return {};
-  }
-
-  // ============================================
-  // FIELD HEATMAPS — SVG-based
-  // ============================================
-  function getHeatmapData(p) {
-    const seed = parseInt(p.player_id.replace('p', '')) || 1;
-    const rand = (offset) => {
-      const x = Math.sin(seed * 9301 + offset * 49297) * 233280;
-      return Math.abs(x - Math.floor(x));
-    };
-
-    if (p.position === 'QB') {
-      // Pass distribution: 9 zones (3 depths x 3 widths)
-      // Bias by role
-      const bias = p.role === 'Dual Threat' ? [0.18, 0.20, 0.18, 0.10, 0.12, 0.10, 0.04, 0.04, 0.04]
-        : p.role === 'Gunslinger' ? [0.10, 0.10, 0.10, 0.10, 0.12, 0.10, 0.10, 0.18, 0.10]
-        : p.role === 'Game Manager' ? [0.20, 0.25, 0.20, 0.10, 0.10, 0.08, 0.02, 0.03, 0.02]
-        : [0.13, 0.15, 0.13, 0.12, 0.13, 0.12, 0.07, 0.08, 0.07];
-      return { type: 'qb-pass', zones: bias.map((b, i) => ({ value: b * 100 + (rand(i + 20) - 0.5) * 8 })) };
-    }
-    if (p.position === 'WR' || p.position === 'TE') {
-      const bias = p.role === 'Deep Threat' ? [0.05, 0.05, 0.10, 0.10, 0.20, 0.50]
-        : p.role === 'Slot' ? [0.30, 0.35, 0.20, 0.10, 0.03, 0.02]
-        : p.role === 'Red Zone' || p.role === 'Red Zone TE' ? [0.10, 0.15, 0.30, 0.25, 0.15, 0.05]
-        : p.role === 'Possession' ? [0.20, 0.25, 0.25, 0.15, 0.10, 0.05]
-        : p.role === 'X-Receiver' ? [0.15, 0.15, 0.20, 0.20, 0.20, 0.10]
-        : p.role === 'Move TE' ? [0.20, 0.25, 0.25, 0.15, 0.10, 0.05]
-        : p.role === 'Receiving TE' ? [0.15, 0.30, 0.30, 0.15, 0.07, 0.03]
-        : p.role === 'Blocking TE' ? [0.40, 0.30, 0.15, 0.08, 0.05, 0.02]
-        : [0.20, 0.20, 0.20, 0.20, 0.15, 0.05];
-      return { type: 'route-tree', zones: bias.map((b, i) => ({ value: b * 100 + (rand(i + 30) - 0.5) * 6 })) };
-    }
-    if (p.position === 'RB') {
-      // Rushing direction: left edge, left guard, middle, right guard, right edge + receiving zone
-      const dirs = [
-        { value: 12 + rand(40) * 12 },  // Left edge
-        { value: 16 + rand(41) * 10 },  // Left guard
-        { value: 24 + rand(42) * 12 },  // Middle
-        { value: 16 + rand(43) * 10 },  // Right guard
-        { value: 12 + rand(44) * 12 },  // Right edge
-      ];
-      const receivingShare = p.role === 'Pass Catcher' ? 22 + rand(45) * 8 : 5 + rand(45) * 10;
-      return { type: 'rb-rush', zones: dirs, receivingShare };
-    }
-    if (p.position === 'K') {
-      // FG attempts by distance: 20-29, 30-39, 40-49, 50+
-      return {
-        type: 'fg-distance',
-        ranges: [
-          { range: '20-29', attempts: Math.floor(2 + rand(50) * 4), pct: (rand(60) * 5 + 95).toFixed(0) },
-          { range: '30-39', attempts: Math.floor(3 + rand(51) * 5), pct: (rand(61) * 10 + 88).toFixed(0) },
-          { range: '40-49', attempts: Math.floor(2 + rand(52) * 4), pct: (rand(62) * 15 + 78).toFixed(0) },
-          { range: '50+',   attempts: Math.floor(rand(53) * 4),     pct: (rand(63) * 25 + 60).toFixed(0) }
-        ]
-      };
-    }
-    if (p.position === 'DEF') {
-      // Coverage zones: deep safety, deep CB L, deep CB R, intermediate, line, blitz frequency
-      return {
-        type: 'def-coverage',
-        zones: [
-          { value: p.role === 'Aggressive' ? 8 + rand(70) * 6 : 18 + rand(70) * 8 },
-          { value: 16 + rand(71) * 10 },
-          { value: 16 + rand(72) * 10 },
-          { value: 22 + rand(73) * 10 },
-          { value: 14 + rand(74) * 8 },
-          { value: p.role === 'Aggressive' || p.role === 'Pass Rush' ? 30 + rand(75) * 10 : 10 + rand(75) * 8 }
-        ]
-      };
-    }
-    return null;
-  }
-
-  function colorForHeat(value, max) {
-    const intensity = Math.min(1, value / max);
-    if (intensity < 0.2) return 'rgba(255, 255, 255, 0.08)';
-    if (intensity < 0.4) return 'rgba(251, 191, 36, 0.35)';
-    if (intensity < 0.65) return 'rgba(251, 191, 36, 0.7)';
-    if (intensity < 0.85) return 'rgba(239, 68, 68, 0.7)';
-    return 'rgba(239, 68, 68, 0.9)';
-  }
-
-  function renderFieldHeatmap(p) {
-    const data = getHeatmapData(p);
-    if (!data) return '<div class="placeholder-content">No heatmap data</div>';
-
-    if (data.type === 'qb-pass') {
-      const max = Math.max(...data.zones.map(z => z.value));
-      const labels = ['Short L','Short M','Short R','Inter L','Inter M','Inter R','Deep L','Deep M','Deep R'];
-      return `
-        <svg class="field-svg" viewBox="0 0 400 280" xmlns="http://www.w3.org/2000/svg">
-          <!-- Field markings -->
-          <rect width="400" height="280" fill="#0d4f1c"/>
-          <line x1="0" y1="93" x2="400" y2="93" stroke="rgba(255,255,255,0.25)" stroke-dasharray="4,4"/>
-          <line x1="0" y1="186" x2="400" y2="186" stroke="rgba(255,255,255,0.25)" stroke-dasharray="4,4"/>
-          <line x1="133" y1="0" x2="133" y2="280" stroke="rgba(255,255,255,0.15)"/>
-          <line x1="266" y1="0" x2="266" y2="280" stroke="rgba(255,255,255,0.15)"/>
-          <!-- LOS at bottom -->
-          <line x1="0" y1="280" x2="400" y2="280" stroke="white" stroke-width="2"/>
-          <text x="10" y="275" fill="white" font-size="9" font-weight="700" opacity="0.8">LOS</text>
-          <!-- Zone heat circles -->
-          ${data.zones.map((z, i) => {
-            const col = i % 3;
-            const row = Math.floor(i / 3);
-            const cx = 67 + col * 133;
-            const cy = 233 - row * 93;
-            const r = 18 + (z.value / max) * 22;
-            return `
-              <circle cx="${cx}" cy="${cy}" r="${r}" fill="${colorForHeat(z.value, max)}"/>
-              <text x="${cx}" y="${cy + 4}" fill="white" font-size="11" font-weight="800" text-anchor="middle">${z.value.toFixed(0)}%</text>
-              <text x="${cx}" y="${cy - r - 4}" fill="rgba(255,255,255,0.7)" font-size="9" text-anchor="middle" font-weight="600">${labels[i]}</text>
-            `;
-          }).join('')}
-          <!-- Depth labels -->
-          <text x="395" y="245" fill="white" font-size="9" opacity="0.6" text-anchor="end" font-weight="600">SHORT (0-10)</text>
-          <text x="395" y="152" fill="white" font-size="9" opacity="0.6" text-anchor="end" font-weight="600">INTER (10-20)</text>
-          <text x="395" y="59" fill="white" font-size="9" opacity="0.6" text-anchor="end" font-weight="600">DEEP (20+)</text>
-        </svg>
-      `;
-    }
-
-    if (data.type === 'route-tree') {
-      // 6 route types: Flat, Slant, Curl, Out, Post, Go
-      const max = Math.max(...data.zones.map(z => z.value));
-      const labels = ['Flat','Slant','Curl','Out','Post','Go'];
-      const positions = [
-        { x: 70, y: 250, depth: 'short' },   // Flat
-        { x: 200, y: 230, depth: 'short' },  // Slant
-        { x: 200, y: 180, depth: 'inter' },  // Curl
-        { x: 330, y: 200, depth: 'inter' },  // Out
-        { x: 280, y: 80, depth: 'deep' },    // Post
-        { x: 200, y: 40, depth: 'deep' }     // Go
-      ];
-      return `
-        <svg class="field-svg" viewBox="0 0 400 280" xmlns="http://www.w3.org/2000/svg">
-          <rect width="400" height="280" fill="#0d4f1c"/>
-          <line x1="0" y1="93" x2="400" y2="93" stroke="rgba(255,255,255,0.25)" stroke-dasharray="4,4"/>
-          <line x1="0" y1="186" x2="400" y2="186" stroke="rgba(255,255,255,0.25)" stroke-dasharray="4,4"/>
-          <line x1="0" y1="280" x2="400" y2="280" stroke="white" stroke-width="2"/>
-          <!-- WR start position -->
-          <circle cx="200" cy="280" r="6" fill="white"/>
-          <text x="200" y="275" fill="#0d4f1c" font-size="8" font-weight="800" text-anchor="middle">WR</text>
-          <!-- Routes as heat blobs -->
-          ${data.zones.map((z, i) => {
-            const pos = positions[i];
-            const r = 14 + (z.value / max) * 24;
-            return `
-              <line x1="200" y1="280" x2="${pos.x}" y2="${pos.y}" stroke="rgba(255,255,255,${0.15 + (z.value / max) * 0.5})" stroke-width="${1 + (z.value / max) * 2}"/>
-              <circle cx="${pos.x}" cy="${pos.y}" r="${r}" fill="${colorForHeat(z.value, max)}"/>
-              <text x="${pos.x}" y="${pos.y + 3}" fill="white" font-size="10" font-weight="800" text-anchor="middle">${z.value.toFixed(0)}%</text>
-              <text x="${pos.x}" y="${pos.y - r - 4}" fill="rgba(255,255,255,0.7)" font-size="9" text-anchor="middle" font-weight="600">${labels[i]}</text>
-            `;
-          }).join('')}
-          <text x="395" y="275" fill="white" font-size="9" opacity="0.6" text-anchor="end" font-weight="600">LOS</text>
-        </svg>
-      `;
-    }
-
-    if (data.type === 'rb-rush') {
-      const max = Math.max(...data.zones.map(z => z.value));
-      const labels = ['LE','LG','MID','RG','RE'];
-      return `
-        <svg class="field-svg" viewBox="0 0 400 280" xmlns="http://www.w3.org/2000/svg">
-          <rect width="400" height="280" fill="#0d4f1c"/>
-          <line x1="0" y1="200" x2="400" y2="200" stroke="white" stroke-width="2"/>
-          <text x="10" y="220" fill="white" font-size="9" opacity="0.8" font-weight="700">LOS</text>
-          <!-- O-line representation -->
-          ${[80, 130, 180, 220, 270, 320].map(x => `<rect x="${x - 6}" y="195" width="12" height="10" fill="rgba(255,255,255,0.4)"/>`).join('')}
-          <!-- RB position -->
-          <circle cx="200" cy="245" r="7" fill="white"/>
-          <text x="200" y="248" fill="#0d4f1c" font-size="8" font-weight="800" text-anchor="middle">RB</text>
-          <!-- Rush direction arrows + heat -->
-          ${data.zones.map((z, i) => {
-            const x = 50 + i * 75;
-            const y = 110;
-            const r = 18 + (z.value / max) * 20;
-            return `
-              <path d="M 200,245 Q ${(200 + x) / 2},${(245 + y) / 2} ${x},${y}" stroke="rgba(255,255,255,${0.2 + (z.value / max) * 0.5})" stroke-width="${1 + (z.value / max) * 3}" fill="none"/>
-              <circle cx="${x}" cy="${y}" r="${r}" fill="${colorForHeat(z.value, max)}"/>
-              <text x="${x}" y="${y + 3}" fill="white" font-size="11" font-weight="800" text-anchor="middle">${z.value.toFixed(0)}%</text>
-              <text x="${x}" y="${y - r - 4}" fill="rgba(255,255,255,0.7)" font-size="9" font-weight="700" text-anchor="middle">${labels[i]}</text>
-            `;
-          }).join('')}
-          <!-- Receiving zone -->
-          <rect x="305" y="240" width="85" height="32" fill="rgba(8, 145, 178, ${0.2 + (data.receivingShare / 30) * 0.5})" stroke="rgba(8, 145, 178, 0.6)" stroke-width="1" rx="4"/>
-          <text x="347" y="255" fill="white" font-size="9" font-weight="700" text-anchor="middle">RECEIVING</text>
-          <text x="347" y="268" fill="white" font-size="11" font-weight="800" text-anchor="middle">${data.receivingShare.toFixed(0)}%</text>
-        </svg>
-      `;
-    }
-
-    if (data.type === 'fg-distance') {
-      const maxAtt = Math.max(...data.ranges.map(r => r.attempts));
-      return `
-        <svg class="field-svg" viewBox="0 0 400 280" xmlns="http://www.w3.org/2000/svg">
-          <rect width="400" height="280" fill="#0d4f1c"/>
-          <!-- Goalpost at top -->
-          <rect x="180" y="0" width="40" height="6" fill="white"/>
-          <line x1="200" y1="6" x2="200" y2="20" stroke="white" stroke-width="3"/>
-          <text x="200" y="35" fill="white" font-size="10" font-weight="700" text-anchor="middle">GOAL</text>
-          <!-- Distance lines -->
-          ${[60, 130, 200, 270].map((y, i) => `
-            <line x1="0" y1="${y}" x2="400" y2="${y}" stroke="rgba(255,255,255,0.3)" stroke-dasharray="4,4"/>
-          `).join('')}
-          ${data.ranges.map((rng, i) => {
-            const y = 60 + i * 55;
-            const att = rng.attempts;
-            const radius = 12 + (att / Math.max(1, maxAtt)) * 22;
-            return `
-              <circle cx="200" cy="${y}" r="${radius}" fill="${colorForHeat(att, maxAtt || 1)}"/>
-              <text x="200" y="${y + 4}" fill="white" font-size="11" font-weight="800" text-anchor="middle">${att}</text>
-              <text x="50" y="${y + 4}" fill="white" font-size="11" font-weight="700">${rng.range} yd</text>
-              <text x="350" y="${y + 4}" fill="white" font-size="11" font-weight="700" text-anchor="end">${rng.pct}% acc</text>
-            `;
-          }).join('')}
-        </svg>
-      `;
-    }
-
-    if (data.type === 'def-coverage') {
-      const max = Math.max(...data.zones.map(z => z.value));
-      const labels = ['Deep S','Deep CB-L','Deep CB-R','Inter','Front 7','Blitz'];
-      const positions = [
-        { x: 200, y: 50 },   // Deep safety
-        { x: 70, y: 80 },    // Deep CB L
-        { x: 330, y: 80 },   // Deep CB R
-        { x: 200, y: 150 },  // Intermediate
-        { x: 200, y: 220 },  // Front 7
-        { x: 110, y: 220 }   // Blitz indicator (offset)
-      ];
-      return `
-        <svg class="field-svg" viewBox="0 0 400 280" xmlns="http://www.w3.org/2000/svg">
-          <rect width="400" height="280" fill="#0d4f1c"/>
-          <line x1="0" y1="260" x2="400" y2="260" stroke="white" stroke-width="2"/>
-          <text x="10" y="275" fill="white" font-size="9" opacity="0.8" font-weight="700">LOS</text>
-          <line x1="0" y1="190" x2="400" y2="190" stroke="rgba(255,255,255,0.2)" stroke-dasharray="4,4"/>
-          <line x1="0" y1="120" x2="400" y2="120" stroke="rgba(255,255,255,0.2)" stroke-dasharray="4,4"/>
-          ${data.zones.map((z, i) => {
-            const pos = positions[i];
-            const r = 16 + (z.value / max) * 22;
-            return `
-              <circle cx="${pos.x}" cy="${pos.y}" r="${r}" fill="${colorForHeat(z.value, max)}"/>
-              <text x="${pos.x}" y="${pos.y + 4}" fill="white" font-size="11" font-weight="800" text-anchor="middle">${z.value.toFixed(0)}%</text>
-              <text x="${pos.x}" y="${pos.y - r - 4}" fill="rgba(255,255,255,0.85)" font-size="9" font-weight="700" text-anchor="middle">${labels[i]}</text>
-            `;
-          }).join('')}
-        </svg>
-      `;
-    }
-
-    return '';
-  }
-
   function getHeatmapTitle(position) {
     return {
       QB: 'Pass Distribution',
@@ -4611,7 +4219,7 @@
               `;
             }).join('')}
           </div>
-          ${state.advancedStats?.simulation?.week === state.selectedWeek ? `
+          ${simulationMatchesCurrentView() ? `
             <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);">
               "sim" win probabilities: ${simulationCaveatText()}
             </div>
@@ -4673,7 +4281,7 @@
               }).join('')}
             </tbody>
           </table>
-          ${state.advancedStats?.simulation?.playoff_odds && Object.keys(state.advancedStats.simulation.playoff_odds).length ? `
+          ${simulationMatchesCurrentView() && Object.keys(state.advancedStats.simulation.playoff_odds || {}).length ? `
             <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);">
               Playoff odds are simulated: ${simulationCaveatText()}
             </div>
@@ -4849,7 +4457,7 @@
           `;
         }).join('')}
       </div>
-      ${state.advancedStats?.simulation?.week === state.selectedWeek ? `
+      ${simulationMatchesCurrentView() ? `
         <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin: 12px 0;">
           "sim" win probabilities: ${simulationCaveatText()}
         </div>
@@ -5797,28 +5405,7 @@
       ${renderOpportunitySharesPanel(p)}
 
       <div class="pd-analytics-grid">
-        <div class="panel">
-          <div class="panel-header">
-            <div class="panel-title">${p.position} Profile</div>
-            <div class="panel-note">Coming from your custom analytics</div>
-          </div>
-          <div class="pd-placeholder">
-            <div class="pd-placeholder-icon">📈</div>
-            <div class="pd-placeholder-title">Awaiting model output</div>
-            <div class="pd-placeholder-text">
-              Once your notebook produces a <code>player_advanced_stats.json</code> file with per-player profile metrics,
-              this panel will display a radar of:
-              ${({
-                QB: '<strong>Pass Volume · Accuracy · Big Play Rate · Rushing Threat · TD Rate · Sack %</strong>',
-                RB: '<strong>Rush Volume · YPC · Receiving Work · Explosive Runs · Goal Line Share · Snap Share</strong>',
-                WR: '<strong>Target Volume · Target Share · aDOT · YAC · Red Zone Share · Contested Catch %</strong>',
-                TE: '<strong>Route Participation · Target Share · YPRR · Red Zone Usage · Blocking Snaps · YAC</strong>',
-                K: '<strong>FG Attempts · Long FG % · XP % · Touchback % · Game Script · Dome %</strong>',
-                DEF: '<strong>Pressure Rate · Turnover Rate · YPG Allowed · Red Zone Stops · Sack Rate · ST TDs</strong>'
-              })[p.position] || 'metrics specific to this position.'}
-            </div>
-          </div>
-        </div>
+        ${renderPositionProfilePanel(p)}
 
         <div class="panel">
           <div class="panel-header">
@@ -5893,6 +5480,50 @@
         </table>
       </div>
     `;
+
+    // Position Profile radar (Phase 4) -- only present when this player's
+    // radar was eligible (see renderPositionProfilePanel); the canvas
+    // simply doesn't exist in the DOM otherwise, so this is a no-op then.
+    const radarCtx = document.getElementById('pd-radar-chart');
+    const playerRadar = getAdvancedPlayer(p.player_id)?.radar;
+    if (radarCtx && typeof Chart !== 'undefined' && playerRadar?.eligible) {
+      chartInstances.radar = new Chart(radarCtx, {
+        type: 'radar',
+        data: {
+          labels: playerRadar.axes.map(a => a.label),
+          datasets: [{
+            label: p.name,
+            data: playerRadar.axes.map(a => a.percentile),
+            backgroundColor: 'rgba(8, 145, 178, 0.2)',
+            borderColor: '#0891b2',
+            pointBackgroundColor: '#0891b2',
+            borderWidth: 2,
+          }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          scales: {
+            r: {
+              min: 0, max: 100, ticks: { stepSize: 25, showLabelBackdrop: false, font: { size: 9 } },
+              pointLabels: { font: { size: 11 } },
+              grid: { color: '#e5e9ee' }, angleLines: { color: '#e5e9ee' },
+            },
+          },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              callbacks: {
+                label: function(ctx) {
+                  const axis = playerRadar.axes[ctx.dataIndex];
+                  const raw = axis.raw != null ? `${axis.raw}${axis.unit}` : '—';
+                  return `${axis.percentile}th percentile (${raw})`;
+                },
+              },
+            },
+          },
+        },
+      });
+    }
 
     // Weekly production chart — uses real per-week points + 3 reference lines
     const ctx = document.getElementById('pd-chart');
@@ -7639,7 +7270,7 @@
 
       body = boxScoreHtml + playerStatsHtml + summaryHtml;
     } else if (state.activeGcTab === 'fantasy') {
-      body = `<div class="panel"><div class="placeholder-content"><h3>📊 Fantasy Impact</h3><p>Sprint 4 — show which players from this game are on which fantasy team rosters, with live fantasy points</p></div></div>`;
+      body = `<div class="panel"><div class="placeholder-content"><h3>📊 Fantasy Impact</h3><p>Not built yet — this will show which players from this game are on which fantasy team rosters, with live fantasy points.</p></div></div>`;
     }
     main.innerHTML = `
       <div class="gamecast-back" id="gc-back">← Back to Dashboard</div>
@@ -7680,13 +7311,6 @@
     `;
     document.getElementById('gc-back').addEventListener('click', () => { state.activeNflGameId = null; renderView(); });
     document.querySelectorAll('.gc-tab').forEach(t => { t.addEventListener('click', () => { state.activeGcTab = t.dataset.tab; renderView(); }); });
-  }
-
-  function renderPlaceholder(main, title) {
-    main.innerHTML = `
-      <div class="page-header-row"><div><div class="page-title">${title}</div><div class="page-subtitle">Coming up in a future sprint</div></div></div>
-      <div class="panel"><div class="placeholder-content"><h3>🚧 ${title} View</h3><p>Will be built in upcoming sprints</p></div></div>
-    `;
   }
 
   document.getElementById('nav-links').addEventListener('click', (e) => {

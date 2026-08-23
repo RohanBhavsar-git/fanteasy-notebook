@@ -47,9 +47,15 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > in the artifact is what makes "current season only" possible at all),
 > the artifact size, and two disclosed limitations (a candidate universe
 > that's only as fresh as the last retrain; `xfp` running noisier in a
-> season's first few weeks under weekly-only inference). See
-> **Verification status** near the end before treating any pipeline claim
-> as settled.
+> season's first few weeks under weekly-only inference). Phase 4 (radar
+> percentiles) is done — six axes per position chosen from already-computed
+> Family 1-4/xFP features (not `NOTEBOOK_OUTLINE.md`'s aspirational axis
+> list, which named several stats never actually built), percentiled
+> against a real startable-player pool ported from `index.html`'s own
+> `positionStarterCount()`, with an honest ineligible state below a
+> games-played floor rather than a misleading shape — see **Phase 4
+> findings** below. See **Verification status** near the end before
+> treating any pipeline claim as settled.
 
 ---
 
@@ -175,7 +181,7 @@ These are non-negotiable — they've shaped every decision we've made:
 - Real 64px headshot hero
 - 4 KPI cards in icon-tile style: Season Pts, Avg/Game (with position rank like "QB7 overall"), Sleeper Proj, Best Week
 - **Opportunity Shares panel** (Phase 8 round 1) — plain snap %/target share/carry share/red-zone share, no interpretation layered on. Carry share and red-zone share are read from the export's `trend.<feature>.current` (no `usage.*` counterpart exists for those two); red-zone share specifically uses the properly-combined `trend.red_zone_share`, not the two separate `usage.rz_target_share_ewm3`/`rz_carry_share_ewm3` (different denominators, can't be summed — see design decisions below). Per-stat empty state ("— · No games yet") when a value is null, not a whole-panel placeholder.
-- **Position profile panel**: Currently a placeholder card ("Awaiting model output") with a bulleted list of what stats will appear per position once the notebook lands — the Opportunity Shares panel above now covers part of what this promised (the plain share numbers); this one is still Phases 4-5's radar, not yet built
+- **Position profile panel** (Phase 4) — a real 6-axis Chart.js percentile radar per position (QB/RB/WR/TE, each axis its own genuinely-informative mix of volume/share/efficiency/situational stats, not a forced identical template), percentiled against this league's real startable-player pool (`position_starter_counts()`, ported from the Weekly Production chart's own `positionStarterCount()`). A raw-value list below the chart shows the actual stat behind each percentile — "Nth percentile" is a rank among startable players at the position, explicitly labeled as such, not a 0-100 quality score. Honest "Not enough games yet" empty state (with the real games-played count) when a player hasn't cleared the games floor; the earlier "Awaiting model output" placeholder still shows for an export that predates this key entirely.
 - **Field heatmap panel**: Same placeholder pattern
 - **Weekly Production chart** — real bars, 3 reference lines toggleable via legend:
   - **Season Avg** (dashed gray, on by default) — this player's own avg
@@ -248,7 +254,7 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 | 2a | Custom scoring — `src/features.py` + `02_custom_scoring.ipynb` | **Done** — 100% validated against Sleeper's actual results |
 | 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 6-10 (Phase 6 model A/B + quantile/SHAP/CQR, Phase 6.5 game-environment + season simulation) are all done — see **Phase 6 findings** and **Phase 6.5 findings**. Remaining work is Phase 7 (JSON export) and Phase 8 (automation), plus anything beyond this spec's original 10-step list (e.g. championship/bracket odds). |
 | 3' | Usage trend signal — replaces role classification (see `NOTEBOOK_OUTLINE.md`'s Phase 3') | **Done** — `src/usage.py` Family 7 (`add_trend_features`, `get_usage_trend_leaders`) + `04_usage_trends.ipynb`. Window (3-week EWM half-life) and direction threshold (z > 0.25) both validated against real hold-vs-revert data, not assumed — see **Phase 3' findings** below. Wired into Phase 7's export as a new `trend` key. |
-| 4 | Radar metrics — 0-100 percentile normalization within position | Not started |
+| 4 | Radar metrics — 0-100 percentile normalization within position | **Done** — `src/export.py`'s `RADAR_METRICS`/`position_starter_counts()`/`build_radar_snapshot()`, wired into the export as a new `radar` key and rendered as a real Chart.js radar on Player Detail. See **Phase 4 findings** below. |
 | 5 | Heatmap zones — field-location frequency tables | Not started |
 | 6 | Projection model — XGBoost/LightGBM regression with time-series CV | **Investigated, not shipped.** The earlier 2-season conclusion ("loses to every baseline") was premature — it was a data-volume ceiling, not a feature-quality one. At the 8-season default, Formulation A beats `season_to_date_avg`/`trailing_3wk_avg` at every position and closes (without closing entirely) the gap to `sleeper_proj`. Formulation B (predicting the residual against Sleeper) does not improve on Formulation A. Step 8 (quantile floor/ceiling models + SHAP) is done: coverage is measured and honestly overconfident (67-75% actual vs. 80% target for the 10th-90th interval), and SHAP shows nothing that looks like a leak. See **Phase 6 findings** below. Not abandoned (real, tested code exists in `src/model.py`) and not "done" in the sense of shipping a model — the honest outcome is still deciding not to ship one yet. |
 | 6.5 | Monte Carlo simulation — win probability, playoff odds, floor/ceiling | Steps 9-10 **done** (`src/simulate.py` — game-environment sampling, matchup + season simulation, playoff-qualification odds) — see **Phase 6.5 findings**. Validated against 204 real historical matchups and 8 season-snapshot combinations: calibration is reasonable where there's enough data to judge it in both. Untuned rho=0.35 sensitivity for playoff odds is small (~0.7pt mean, ~3pt max across rho 0.2-0.5). Championship/bracket-round odds are a separate, not-yet-started piece of work. |
@@ -384,6 +390,134 @@ row (nothing has been played yet THIS season), the same reason
 naturally from week 6 onward (once real players clear the
 `MIN_GAMES_FOR_TREND` floor) with no code change needed — same pattern as
 Phase 7's own rostered-players note above.
+
+---
+
+## Phase 4 findings
+
+`src/export.py`'s `RADAR_METRICS`, `position_starter_counts()`, and
+`build_radar_snapshot()` — a `radar` sibling key alongside
+`projection`/`usage`/`trend`/`xfp`, computed entirely in Python and wired
+through `scripts/weekly_update.py` and `07_export_json.ipynb` the same way
+every other export-layer field has been. `index.html`'s Position Profile
+panel (Player Detail) now renders a real Chart.js radar instead of the
+placeholder card.
+
+**Axes are chosen from what Families 1-4/xFP actually compute, not from
+`NOTEBOOK_OUTLINE.md`'s Phase 4 sketch.** That sketch (written before any
+feature work existed — see CLAUDE.md's "Phases 3-8... intent, not tested
+code") names several stats this pipeline has never built: Big Play Rate, TD
+Rate, Sack %, Explosive Runs, Contested Catch %, YPRR, Blocking Snaps, Dome
+%, ST TDs. Six real axes per position were picked instead, per position,
+from already-computed `_s2d` (season-to-date expanding mean) columns —
+`_s2d`, not the `_ewm3` value the Opportunity Shares panel and trend
+indicator already show elsewhere on the same page, because a "position
+profile" is meant to characterize a real-season sample, not the last three
+weeks, and `_s2d` is the more stable input for a percentile RANK
+specifically. QB: Pass Volume, Rush Volume, Yards/Carry, Scramble Rate,
+EPA/Dropback, CPOE. RB: Touch Volume, Touch Share, Target Share,
+Yards/Carry, Goal-Line Share, Snap Share. WR: Target Share, Air Yards
+Share, aDOT, Catch Rate, YAC/Reception, Red-Zone Target Share. TE: same as
+WR but Snap Share in place of Air Yards Share (TE snap share varies far
+more than WR's and is the more differentiating "real receiving threat vs.
+blocker" signal at that position). No NGS-only column
+(`avg_separation`/`avg_cushion`/`time_to_throw`) is used, so no axis is
+ever null for a position it's assigned to.
+
+**Percentile pool is "startable players," not "everyone at the position" —
+ported from `index.html`, not reimplemented independently.**
+`position_starter_counts()` is a direct Python port of `index.html`'s
+`positionStarterCount()` (same direct-slot + FLEX-share + SUPER_FLEX logic,
+including JS's round-half-up rounding rather than Python's round-half-to-
+even, in case a future league config lands exactly on a `.5` boundary) —
+pinned against this league's REAL `roster_positions` in
+`tests/test_export.py::test_position_starter_counts_matches_this_leagues_real_roster_positions`
+so the two copies can't silently drift apart. At 14 teams this league's
+real startable counts are QB=14, RB=33, WR=35, TE=16 — WR's 35 matches the
+number already published in the Weekly Production chart's own footnote.
+The pool itself is the top-N players per position by season-to-date total
+`custom_points`, restricted to players who themselves clear the
+games-played floor — "startable" means both "ranks near the top" and "has
+enough sample to rank honestly." Every candidate at the position (pool
+member or not) is percentiled against this same pool, not just pool
+members — a bench player's profile still reads as "where would this rank
+among actual starters," which only works if the denominator excludes deep
+backups (a bench-inclusive pool would compress every real contributor
+toward the top of the range, the exact failure mode this was built to
+avoid).
+
+**Eligibility is a single whole-player gate, reusing Phase 3's
+`MIN_GAMES_FOR_TREND` (5), not a second, separately-justified number.** A
+player short on games gets `{"eligible": false, "games_played": N,
+"min_games": 5}` — no axes at all, not a partial radar with some axes
+plotted and others silently missing, which would draw a misleading shape
+on the chart. The dashboard reads `games_played`/`min_games` straight from
+the payload for its empty-state copy, so the UI's stated reason can never
+drift from the actual gate.
+
+**Verified against the real, completed 2025 season (league
+`1250182471429931008`), replayed at week 10 the same point-in-time-safe
+way Phase 8 Round 2's verification did** (history truncated to weeks < 10,
+real model artifact, real Sleeper rosters/matchups) — 391 of 555 candidates
+eligible. Five real, well-known players spot-checked by hand, each reading
+exactly as their real-world reputation would predict:
+- **Christian McCaffrey (RB, SF)**: 98th percentile in Touch Volume, Touch
+  Share, Target Share, AND Snap Share — the archetypal 3-down workhorse —
+  but only 8th percentile in Yards/Carry, a sane "so much volume his
+  per-touch efficiency naturally regresses" story, not a contradiction.
+- **James Cook (RB, BUF)**: 95th percentile Touch Volume and Yards/Carry
+  (elite volume + elite per-touch efficiency) but only 20th percentile
+  Target Share — matches his real profile as a rushing-first back Buffalo
+  doesn't feature much in the passing game.
+- **Justin Jefferson (WR, MIN) vs. Puka Nacua (WR, LAR)**, both high
+  target-share receivers, read as clearly different types: Jefferson —
+  90th percentile Air Yards Share, 87th YAC/Reception, only 44th Catch
+  Rate (a true downfield alpha whose catch rate is unremarkable because his
+  targets are harder); Nacua — 93rd percentile Catch Rate, only 41st aDOT
+  (a high-floor, high-catch-rate possession receiver). The radar captures a
+  real stylistic difference between two elite-target-share WRs, not just
+  "who gets more targets."
+- **Travis Kelce (TE, KC)**: only 34th percentile Snap Share (matches his
+  real, reported diminished workload in his age-35 2025 season) but still
+  78th percentile Red-Zone Target Share and 84th YAC/Reception — still a
+  red-zone weapon and dangerous after the catch even in a reduced role.
+- **Joe Burrow (QB, CIN)**: correctly `eligible: false` at 4 of 5 games —
+  matches his real, injury-shortened 2025 season — the empty state fires
+  for exactly the real-world reason it should, not a data artifact.
+
+Also caught a real name-collision in Sleeper's player DB during this spot
+check (a linebacker also named "Justin Jefferson," CLE) — correctly absent
+from the export entirely (LB isn't a QB/RB/WR/TE candidate position),
+confirming candidate filtering works as intended rather than silently
+mixing the two players up by name.
+
+Frontend verified separately via Playwright against the same real week-10
+export: the eligible case (McCaffrey) renders a real 6-point Chart.js
+radar polygon plus a raw-value list, with `Chart.getChart(canvas).data`
+matching the Python-computed percentiles exactly; the ineligible case
+(Burrow) renders the specific "4 of 5 games played" empty state, not a
+generic placeholder. Zero new console errors in either case.
+
+**Radar is deliberately NOT gated on `meta.season` matching the displayed
+league's season, unlike `getMyProj()`/the Phase 8 Round 2 simulation
+getters.** This was checked against the same audit that found the
+win-probability/playoff-odds gap (see the verification-status row on that
+fix): radar's own `games_played >= MIN_GAMES_FOR_TREND` gate structurally
+can't go eligible until roughly week 5-6 of a season, by which point real
+games have already been decided and `fetchAllRealData()`'s
+`previous_league_id` fallback (the mechanism that caused the win-probability
+gap) has already cleared on its own — there's no realistic window where
+radar has real eligible data AND the dashboard is still showing a different
+season. This makes radar's un-gated read consistent with Opportunity
+Shares/Usage Trending/xFP (its closest siblings, all of which read
+`state.advancedStats` the same way), not an oversight.
+
+**Comparison tab's "Profile Overlay" placeholder is unchanged, deliberately
+out of scope for this round** — the request was Player Detail's Position
+Profile specifically; overlaying multiple players' radars on one chart is
+a distinct UI problem (Chart.js's `radar` type supports multiple datasets,
+so the data is already there whenever this is picked up) left for later,
+not silently dropped.
 
 ---
 
@@ -1022,6 +1156,8 @@ assumptions as facts.
 | `CQR_WIDEN_BY_25_75` derivation method (Phase 8 round 2) | **Verified** — reproducing the already-known, already-published `CQR_WIDEN_BY_10_90` constants from the Phase 6 CQR table's before/after-width columns via `widen_by = (width_after − width_before) / 2` matches the hardcoded values (QB 2.309, RB 0.730, WR 0.606, TE 0.467) to within the source table's own 2-decimal rounding, before trusting the same method on the 25-75 row (never independently re-run). |
 | `scripts/weekly_update.py::build_simulation_block` produces correct win probabilities and playoff odds | **Verified** — against the real, completed 2025 season (league `1250182471429931008`, week 10): 7 real matchups simulated for a 14-team league, every pair of win probabilities summing to exactly 100, playoff odds returned for all 14 rosters. See **Phase 8 findings** for the two real bugs this caught before either reached a committed export. Not yet run on real GitHub Actions infrastructure — that's the next `retrain.yml` + `weekly-update.yml` `workflow_dispatch` pair, still to happen. |
 | Round 2 dashboard panels (win probability, playoff odds) render correctly and null-safely | **Verified** — Playwright + a UTF-8-aware local server, both against the populated case (index.html temporarily pointed at the real 2025 league so matchup roster_ids matched the test export — never committed) and the null case (the real, pre-simulation-key 2026 export, a stricter test than an explicit `null`). Zero new console errors either way; see **Phase 8 findings** for what each screenshot showed. |
+| `getMatchupWinProb()`/`getPlayoffOdds()` gate on `meta.season` matching the displayed league's season, not just week | **Verified — a real gap found in a full-dashboard audit, since fixed.** Neither getter checked `meta.season` (`getPlayoffOdds` checked nothing at all — not season, not week — just whether a `playoff_odds` entry existed for the roster id). This mattered specifically because of `fetchAllRealData()`'s `previous_league_id` fallback: right after a new season's draft, before any of that season's games are played, the dashboard still displays the PRIOR season (`hasGames` still false) while `weekly-update.yml` may already have written a `simulation` block for the NEW season's week 1 — unguarded, that block's week-1 win probabilities/playoff odds would silently attach to the prior season's already-decided week-1 matchups and standings just because the week numbers happen to collide. `getPlayoffOdds` had a second, same-season risk too: `roster_id` isn't guaranteed to mean the same team across two different seasons' leagues. Fixed with a shared `simulationMatchesCurrentView()` gate (`index.html`) requiring both `meta.season === league.season` and `simulation.week === selectedWeek`, applied to both getters and to the three inline caveat-footer conditions that previously only checked week (so a caveat could show with no data behind it). This is a deliberate behavior change for `getPlayoffOdds` specifically: it now reads `—` for any week other than the one the export covers, not only for a season mismatch, trading the previous "always show the latest known odds" behavior for the same never-show-a-stale-number rule `getMyProj()` already followed. Verified against the real, completed 2025 season (league `1250182471429931008`): a real week-10 simulation block was rebuilt the same way Round 2's did (point-in-time-safe history truncated to weeks < 10, real model artifact, real Sleeper matchups/rosters) and served two ways — with `meta.season: 2025` (matching the displayed league), all 14 win-probability badges (7 real matchups) and all 14 rosters' playoff-odds percentages rendered, with both caveat footers visible; with the identical export relabeled `meta.season: 2026` (season mismatch only, week held constant at 10 in both), every badge and every Playoff Odds cell blanked to `—` and both caveat footers disappeared. Confirmed via Playwright against a local server, zero unexplained console errors in either case (the only console noise was the ESPN scoreboard sidebar's CORS failure, a known artifact of serving off of GitHub Pages' origin, unrelated to this change). |
+| Phase 4 radar percentiles (`position_starter_counts()`, `build_radar_snapshot()`) are correct and match `index.html`'s startable-count logic | **Verified** — `position_starter_counts()` pinned against this league's real `roster_positions` (14 teams) reproduces QB=14/RB=33/WR=35/TE=16, matching the Weekly Production chart's own already-published "~35" WR footnote. Replayed against the real, completed 2025 season at week 10 (point-in-time-safe history, real model artifact): 391/555 candidates eligible, and 5 real, well-known players (Christian McCaffrey, James Cook, Justin Jefferson, Puka Nacua, Travis Kelce) each produced a percentile profile matching their real-world reputation on inspection, plus Joe Burrow correctly came back ineligible (4 of 5 games) for his real, injury-shortened 2025 season. Frontend verified via Playwright: the eligible case renders a real Chart.js radar whose `Chart.getChart(canvas).data` matches the Python-computed percentiles exactly; the ineligible case renders the specific games-played empty state. Zero new console errors. See **Phase 4 findings**. |
 
 ## What's outstanding
 
@@ -1035,8 +1171,8 @@ assumptions as facts.
 - Push the latest `index.html` changes to GitHub Pages (all recent work is local)
 - **Activity feed panel** sizing vs matchups panel — layout issue, minor
 - **NFL sidebar** currently shows preseason week labels; should default to last completed regular-season week
-- **Season Leaders panel** on the dashboard is pending replacement
-- **Build out the Python notebook pipeline**, phases 4-5 (radar/heatmap) still not started
+- **Build out the Python notebook pipeline** — Phase 4 (radar) is done; Phase 5 (heatmap) still not started
+- **Comparison tab's "Profile Overlay" placeholder** still needs wiring — Phase 4's `radar` key has the data, but overlaying multiple players' radars on one Chart.js chart (vs. Player Detail's single-player radar) wasn't part of this round; see **Phase 4 findings**
 - **Historical champion data** — plan is to maintain a small `champions.json` file by hand for the league's history
 - **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
 

@@ -56,9 +56,9 @@ import pandas as pd  # noqa: E402
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
     CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_matchup_simulation,
-    build_playoff_odds, build_starter_quantile_rows, build_target_week_features, build_team_game_id_lookup,
-    build_trend_snapshot, build_usage_snapshot, build_weekly_xfp, build_xfp_summary, get_export_candidates,
-    get_export_scope, predict_target_week_from_artifact, validate_export, validate_simulation,
+    build_playoff_odds, build_radar_snapshot, build_starter_quantile_rows, build_target_week_features,
+    build_team_game_id_lookup, build_trend_snapshot, build_usage_snapshot, build_weekly_xfp, build_xfp_summary,
+    get_export_candidates, get_export_scope, predict_target_week_from_artifact, validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
     DATA_OUTPUT, DEFAULT_LEAGUE_ID, get_id_crosswalk, get_schedule, get_sleeper_league,
@@ -326,8 +326,16 @@ def main() -> None:
     scoped_predictions, scope_report = get_export_scope(rostered_gsis_ids, predictions, top_n=TOP_N_FREE_AGENTS)
     print(f"    scope report: {scope_report}")
 
+    # Phase 4: radar percentiles, against this league's REAL roster_positions
+    # and real team count -- not a guessed/default league shape.
+    radar = build_radar_snapshot(
+        combined_features, current_season, target_week, league["roster_positions"], len(rosters_raw)
+    )
+    n_eligible = sum(1 for r in radar.values() if r["eligible"])
+    print(f"    radar: {n_eligible}/{len(radar)} candidates eligible (>= games played floor)")
+
     payload, crosswalk_report = assemble_player_advanced_stats(
-        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, crosswalk,
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, crosswalk,
         current_season, target_week, artifact["seasons_trained"], artifact["model_version"],
         performance=artifact["performance"],
         caveats=CAVEATS + WEEKLY_EXTRA_CAVEATS,

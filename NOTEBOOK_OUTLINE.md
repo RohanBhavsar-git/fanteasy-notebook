@@ -161,7 +161,8 @@ fanteasy-notebook/
 │   ├── export.py          # Phase 7 -- JSON assembly
 │   ├── pipeline.py        # Phase 8 -- shared fetch/score/feature orchestration
 │   └── artifacts.py       # Phase 8 -- model artifact save/load
-│   # radar.py / heatmap.py (Phases 4-5) not built yet -- see the phase table above
+│   # Phase 4 (radar) lives in export.py, not a separate radar.py -- see Phase 4 findings
+│   # heatmap.py (Phase 5) not built yet -- see the phase table above
 ├── scripts/                # Phase 8 -- CI entry points, no notebook execution in CI
 │   ├── retrain.py          # .github/workflows/retrain.yml calls this
 │   └── weekly_update.py    # .github/workflows/weekly-update.yml calls this
@@ -386,6 +387,20 @@ summed into one share directly):
 ---
 
 ## Phase 4 — Radar metric normalization
+
+**Done — implemented in `src/export.py` (`RADAR_METRICS`,
+`position_starter_counts()`, `build_radar_snapshot()`), see
+`PROJECT_CONTEXT.md`'s Phase 4 findings for the full picture.** The
+percentile-rank approach below is what actually shipped; the specific axis
+list per position is NOT what shipped — this sketch names several stats
+this pipeline has never computed (Big Play Rate, TD Rate, Sack %,
+Explosive Runs, Contested Catch %, YPRR, Blocking Snaps, Dome %, ST TDs).
+The real axes were chosen from Family 1-4/xFP's already-computed columns
+instead — see Phase 4 findings for the actual per-position list and why.
+One other real difference: the percentile pool is this league's real
+STARTABLE players (ported from `index.html`'s `positionStarterCount()`),
+not "every player at the position" as this sketch's `position_distribution`
+implies — see Phase 4 findings for why that distinction matters.
 
 The dashboard expects each radar metric to be **0-100 scaled relative to the player's position group**.
 

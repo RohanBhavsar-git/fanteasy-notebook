@@ -173,6 +173,118 @@ TREND_FEATURE_LABELS = {
     "rz_opportunity_share": "red_zone_share",
 }
 
+# ==========================================================================
+# PHASE 4: RADAR PERCENTILES
+# ==========================================================================
+# Six axes per position, each an ALREADY-COMPUTED Family 1-4 `_s2d` column
+# (season-to-date expanding mean, point-in-time safe -- see
+# add_rolling_features's docstring) -- deliberately not `_ewm3` (the
+# trailing-3-week value the Opportunity Shares panel and the trend
+# indicator already show elsewhere on Player Detail): a "position profile"
+# is meant to characterize what KIND of player this is over a real season
+# sample, not this week's hot/cold streak, and `_s2d` is the more stable
+# input for a percentile RANK specifically -- a 3-week-EWM percentile would
+# jump around week to week for reasons that have nothing to do with the
+# player's underlying role. Nothing here is a new feature computation: no
+# NGS-only column (avg_separation/avg_cushion/time_to_throw) is used, so
+# every axis is available for every position it's assigned to.
+#
+# NOTEBOOK_OUTLINE.md's Phase 4 sketch names several axes this pipeline has
+# never actually computed (Big Play Rate, TD Rate, Sack %, Explosive Runs,
+# Contested Catch %, YPRR, Blocking Snaps, Dome %, ST TDs) -- that sketch
+# predates any real feature work (see CLAUDE.md: "Phases 3-8 were written
+# before anything ran, so their code snippets are intent, not tested
+# code"). The axes below are chosen from what Families 1-4/xFP actually
+# produce, per position, rather than forced to match that list.
+#
+# `unit` is a plain display suffix, not a format spec -- index.html just
+# concatenates raw + unit, no per-axis-name branching needed there. `pct`
+# marks columns that are 0-1 fractions needing x100 before either the UI
+# or a human reads them as a percentage; everything else (yards, EPA,
+# CPOE's percentage-POINT delta, counts) is already in its natural,
+# human-facing scale.
+RADAR_METRICS = {
+    "QB": [
+        {"column": "pass_attempts_s2d", "label": "Pass Volume", "unit": " att/gm", "pct": False},
+        {"column": "designed_rush_attempts_s2d", "label": "Rush Volume", "unit": " att/gm", "pct": False},
+        {"column": "yards_per_carry_s2d", "label": "Yards / Carry", "unit": " yds", "pct": False},
+        {"column": "scramble_rate_s2d", "label": "Scramble Rate", "unit": "%", "pct": True},
+        {"column": "epa_per_dropback_s2d", "label": "EPA / Dropback", "unit": " EPA", "pct": False},
+        {"column": "cpoe_s2d", "label": "Comp % Over Expected", "unit": " pts", "pct": False},
+    ],
+    "RB": [
+        {"column": "touches_s2d", "label": "Touch Volume", "unit": " touches/gm", "pct": False},
+        {"column": "touch_share_s2d", "label": "Touch Share", "unit": "%", "pct": True},
+        {"column": "target_share_s2d", "label": "Target Share", "unit": "%", "pct": True},
+        {"column": "yards_per_carry_s2d", "label": "Yards / Carry", "unit": " yds", "pct": False},
+        {"column": "goal_line_carry_share_s2d", "label": "Goal-Line Share", "unit": "%", "pct": True},
+        {"column": "offense_pct_s2d", "label": "Snap Share", "unit": "%", "pct": True},
+    ],
+    "WR": [
+        {"column": "target_share_s2d", "label": "Target Share", "unit": "%", "pct": True},
+        {"column": "air_yards_share_s2d", "label": "Air Yards Share", "unit": "%", "pct": True},
+        {"column": "adot_s2d", "label": "Avg Depth of Target", "unit": " yds", "pct": False},
+        {"column": "catch_rate_s2d", "label": "Catch Rate", "unit": "%", "pct": True},
+        {"column": "yac_per_reception_s2d", "label": "YAC / Reception", "unit": " yds", "pct": False},
+        {"column": "rz_target_share_s2d", "label": "Red-Zone Target Share", "unit": "%", "pct": True},
+    ],
+    "TE": [
+        {"column": "target_share_s2d", "label": "Target Share", "unit": "%", "pct": True},
+        {"column": "offense_pct_s2d", "label": "Snap Share", "unit": "%", "pct": True},
+        {"column": "catch_rate_s2d", "label": "Catch Rate", "unit": "%", "pct": True},
+        {"column": "adot_s2d", "label": "Avg Depth of Target", "unit": " yds", "pct": False},
+        {"column": "rz_target_share_s2d", "label": "Red-Zone Target Share", "unit": "%", "pct": True},
+        {"column": "yac_per_reception_s2d", "label": "YAC / Reception", "unit": " yds", "pct": False},
+    ],
+}
+
+# FLEX-eligible slot names and each position's assumed share of a FLEX
+# start -- must stay byte-for-byte in sync with index.html's
+# positionStarterCount() (search that name). Not shared code (index.html
+# has no Python runtime to import from and this pipeline has no JS runtime
+# to import from) -- kept in lockstep instead by
+# tests/test_export.py::test_position_starter_counts_matches_frontend_logic,
+# which pins this function's output against this league's REAL
+# roster_positions so either side drifting from the other fails a test,
+# not just a silent mismatch a reader would have to notice by eye.
+_FLEX_SLOT_NAMES = {"FLEX", "WRRB_FLEX", "REC_FLEX"}
+_FLEX_SHARE_BY_POSITION = {"WR": 0.5, "RB": 0.35, "TE": 0.15}
+_DEFAULT_STARTER_SHARE = {"QB": 1, "RB": 2.5, "WR": 3, "TE": 1.2}
+
+
+def position_starter_counts(roster_positions: list[str], n_teams: int) -> dict[str, int]:
+    """
+    League-wide startable-slot count per EXPORT_POSITIONS position -- the
+    radar's percentile pool is ranked against exactly these many players,
+    not every player at the position (which would include deep backups
+    and compress every real contributor into the top of the range).
+
+    Direct Python port of index.html's positionStarterCount(), which
+    already powers the Weekly Production chart's Top-N baseline -- same
+    direct-slot + FLEX-share + SUPER_FLEX logic, so "startable" means the
+    same thing in both places. `round()` here uses round-half-up (matching
+    JS's Math.round(), not Python's own round-half-to-even) so the two
+    stay identical even on a future league config that lands exactly on
+    a .5 boundary -- this league's real roster_positions (QB=14, RB=33,
+    WR=35, TE=16 at 14 teams) don't currently hit one, but the port
+    shouldn't silently diverge the day one does.
+    """
+    import math
+
+    counts = {}
+    for position in EXPORT_POSITIONS:
+        direct = roster_positions.count(position)
+        flex_share = sum(
+            _FLEX_SHARE_BY_POSITION.get(position, 0.0)
+            for slot in roster_positions if slot in _FLEX_SLOT_NAMES
+        )
+        super_flex_share = roster_positions.count("SUPER_FLEX") if position == "QB" else 0
+        raw = direct + flex_share + super_flex_share
+        if raw == 0:
+            raw = _DEFAULT_STARTER_SHARE.get(position, 1)
+        counts[position] = max(1, math.floor(raw * n_teams + 0.5))
+    return counts
+
 
 # ==========================================================================
 # STEP 1: build the point-in-time-safe feature row for the target week
@@ -396,6 +508,112 @@ def build_trend_snapshot(combined_features: pd.DataFrame, target_season: int, ta
     return out.rename(columns={f"{f}_ewm3": f"trend_{f}_current" for f in TREND_SOURCE_FEATURES})
 
 
+def build_radar_snapshot(
+    combined_features: pd.DataFrame,
+    target_season: int,
+    target_week: int,
+    roster_positions: list[str],
+    n_teams: int,
+) -> dict:
+    """
+    Phase 4: one radar entry per candidate player_id (gsis_id-keyed, same
+    convention as every other pre-crosswalk builder in this module).
+
+    Eligibility gate: the player's OWN `games_played` (point-in-time-safe,
+    from add_rolling_features -- see its docstring) must be >=
+    RADAR_MIN_GAMES, reusing Phase 3's already-validated MIN_GAMES_FOR_TREND
+    floor rather than a second, separately-justified number (same reasoning
+    Family 7 already used for reusing EWM_HALFLIFE). This is a single,
+    whole-player gate, not per-axis: a radar with some axes plotted and
+    others silently missing would draw a misleading shape on the chart, so
+    a player short on games gets an honest "not enough games yet" object
+    instead of a partial one.
+
+    Percentile pool: for each position, the top position_starter_counts()
+    players (this league's real roster_positions/n_teams) by season-to-date
+    total custom_points among players who ALSO clear RADAR_MIN_GAMES --
+    "startable" means both "ranks near the top of the position" and "has
+    enough of a sample to rank honestly." Every candidate at the position
+    (pool member or not) gets percentiled against this same pool, so a
+    thin-sample or bench player's radar still reads as "where would this
+    profile rank among this league's actual starters," which is the whole
+    point of restricting the pool -- a bench-inclusive denominator would
+    compress every real contributor into the top of the range.
+
+    Percentile convention: scipy's percentileofscore(kind='mean') -- a
+    tied raw value gets credit for half its tied group rather than being
+    arbitrarily broken toward one side.
+
+    Returns: {player_id: radar_dict}, where radar_dict is either
+      {"eligible": False, "games_played": int, "min_games": RADAR_MIN_GAMES}
+    or
+      {"eligible": True, "games_played": int, "min_games": RADAR_MIN_GAMES,
+       "pool_size": int,
+       "axes": [{"label": str, "unit": str, "percentile": int, "raw": float}, ...]}
+    (raw/percentile null on axes where the pool itself has no data for that
+    column -- doesn't happen for this pipeline's current RADAR_METRICS,
+    since every listed column is populated for every position it's
+    assigned to, but handled rather than assumed).
+    """
+    from scipy.stats import percentileofscore
+
+    from src.usage import MIN_GAMES_FOR_TREND as RADAR_MIN_GAMES
+
+    target_mask = (combined_features["season"] == target_season) & (combined_features["week"] == target_week)
+    all_axis_cols = sorted({axis["column"] for axes in RADAR_METRICS.values() for axis in axes})
+    target_rows = combined_features.loc[
+        target_mask, ["player_id", "position", "games_played"] + all_axis_cols
+    ].reset_index(drop=True)
+
+    history_mask = (combined_features["season"] == target_season) & (combined_features["week"] < target_week)
+    season_points = (
+        combined_features.loc[history_mask].groupby("player_id")["custom_points"].sum()
+    )
+
+    starter_counts = position_starter_counts(roster_positions, n_teams)
+
+    out: dict = {}
+    for position, axes in RADAR_METRICS.items():
+        pos_rows = target_rows[target_rows["position"] == position]
+        if pos_rows.empty:
+            continue
+
+        eligible_ids = pos_rows.loc[pos_rows["games_played"] >= RADAR_MIN_GAMES, "player_id"]
+        pool_points = season_points.reindex(eligible_ids).dropna().sort_values(ascending=False)
+        pool_ids = set(pool_points.head(starter_counts[position]).index)
+        pool_rows = pos_rows[pos_rows["player_id"].isin(pool_ids)]
+        pool_size = len(pool_rows)
+
+        for _, row in pos_rows.iterrows():
+            games_played = int(row["games_played"])
+            if games_played < RADAR_MIN_GAMES or pool_size == 0:
+                out[row["player_id"]] = {
+                    "eligible": False, "games_played": games_played, "min_games": RADAR_MIN_GAMES,
+                }
+                continue
+
+            axis_out = []
+            for axis in axes:
+                col = axis["column"]
+                raw = row[col]
+                pool_vals = pool_rows[col].dropna()
+                if pd.isna(raw) or pool_vals.empty:
+                    pct, raw_display = None, None
+                else:
+                    pct = round(percentileofscore(pool_vals, raw, kind="mean"))
+                    raw_display = round(float(raw) * 100 if axis["pct"] else float(raw), 2)
+                axis_out.append({
+                    "label": axis["label"], "unit": axis["unit"], "percentile": pct, "raw": raw_display,
+                })
+
+            out[row["player_id"]] = {
+                "eligible": True, "games_played": games_played, "min_games": RADAR_MIN_GAMES,
+                "pool_size": pool_size, "axes": axis_out,
+            }
+
+    return out
+
+
 def build_xfp_summary(historical_features: pd.DataFrame, xfp_season: int) -> pd.DataFrame:
     """
     Real, completed-season xFP vs. actual custom_points, summed over
@@ -476,6 +694,7 @@ def assemble_player_advanced_stats(
     trend: pd.DataFrame,
     xfp_summary: pd.DataFrame,
     weekly_xfp: pd.DataFrame,
+    radar: dict,
     crosswalk: pd.DataFrame,
     target_season: int,
     target_week: int,
@@ -504,11 +723,20 @@ def assemble_player_advanced_stats(
     week), so a plain merge would multiply scoped_predictions' rows
     instead of adding a column to them.
 
+    `radar` (build_radar_snapshot's output) is ALREADY a {player_id: dict}
+    mapping, not a DataFrame -- its per-player value is a nested
+    eligible/axes structure, not a flat set of columns a `.merge()` could
+    add, same reasoning as weekly_xfp_by_player just built above. A
+    candidate absent from `radar` (shouldn't happen -- build_radar_snapshot
+    covers every RADAR_METRICS position for every target-week candidate,
+    this is defensive, not expected) falls back to an honest "not
+    eligible, 0 games" object rather than a KeyError.
+
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
     not just assumed.
     """
-    from src.usage import TREND_SOURCE_FEATURES
+    from src.usage import MIN_GAMES_FOR_TREND, TREND_SOURCE_FEATURES
 
     weekly_xfp_by_player = {}
     if not weekly_xfp.empty:
@@ -556,6 +784,9 @@ def assemble_player_advanced_stats(
                 ),
             },
             "weekly_xfp": weekly_xfp_by_player.get(row["player_id"], {}),
+            "radar": radar.get(
+                row["player_id"], {"eligible": False, "games_played": 0, "min_games": MIN_GAMES_FOR_TREND}
+            ),
         }
 
     payload = {
@@ -610,11 +841,21 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
     ]
     assert not out_of_order, f"{len(out_of_order)} players violate floor <= point <= ceiling: {out_of_order[:5]}"
 
+    bad_radar_percentiles = [
+        pid for pid, p in players.items()
+        if p["radar"]["eligible"]
+        and any(ax["percentile"] is not None and not (0 <= ax["percentile"] <= 100) for ax in p["radar"]["axes"])
+    ]
+    assert not bad_radar_percentiles, (
+        f"{len(bad_radar_percentiles)} players have an out-of-range radar percentile: {bad_radar_percentiles[:5]}"
+    )
+
     return {
         "n_players": len(players),
         "all_keys_real_sleeper_ids": True,
         "no_null_projections": True,
         "floor_le_point_le_ceiling": True,
+        "radar_percentiles_in_range": True,
     }
 
 
