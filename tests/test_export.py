@@ -22,6 +22,7 @@ from src.export import (  # noqa: E402
     build_target_week_features,
     build_team_game_id_lookup,
     build_trend_snapshot,
+    build_weekly_xfp,
     build_xfp_summary,
     get_export_candidates,
     get_export_scope,
@@ -94,6 +95,25 @@ def test_build_xfp_summary_sums_the_completed_season_and_computes_the_gap():
     assert result.loc["p1", "season_actual"] == pytest.approx(18.0)
     assert result.loc["p1", "fp_over_expected"] == pytest.approx(0.0)
     assert pd.isna(result.loc["p2", "season_xfp"])  # never fabricated from a null source
+
+
+def test_build_weekly_xfp_scopes_to_target_season_and_drops_null_weeks():
+    historical = pd.DataFrame([
+        {"player_id": "p1", "season": 2025, "week": 1, "xfp": 9.5},
+        {"player_id": "p1", "season": 2025, "week": 2, "xfp": np.nan},  # dropped, not zero-filled
+        {"player_id": "p1", "season": 2024, "week": 1, "xfp": 100.0},  # wrong season, excluded
+        {"player_id": "p2", "season": 2025, "week": 1, "xfp": 12.25},
+    ])
+    result = build_weekly_xfp(historical, target_season=2025)
+
+    assert set(zip(result["player_id"], result["week"])) == {("p1", 1), ("p2", 1)}
+    assert result.set_index("player_id").loc["p1", "xfp"] == pytest.approx(9.5)
+
+
+def test_build_weekly_xfp_empty_when_target_season_has_no_rows():
+    historical = pd.DataFrame([{"player_id": "p1", "season": 2025, "week": 1, "xfp": 9.5}])
+    result = build_weekly_xfp(historical, target_season=2026)
+    assert result.empty
 
 
 def test_build_target_week_features_new_season_row_is_null_in_season_and_carries_prev_season():
@@ -196,6 +216,7 @@ def test_assemble_and_validate_export_round_trip():
         "prev_season_target_share": [np.nan, 0.18],
         "prev_season_touch_share": [np.nan, 0.45],
         "prev_season_offense_pct": [0.9, 0.65],
+        "xfp_vol": [np.nan, 3.2],
     })
     trend = pd.DataFrame({
         "player_id": ["00-0001", "00-0002"],
@@ -216,13 +237,18 @@ def test_assemble_and_validate_export_round_trip():
         "player_id": ["00-0002"],
         "season_xfp": [180.0], "season_actual": [200.0], "fp_over_expected": [20.0],
     })
+    weekly_xfp = pd.DataFrame({
+        "player_id": ["00-0002", "00-0002", "00-0002"],
+        "week": [1, 2, 3],
+        "xfp": [9.5, 11.25, np.nan],  # week 3 null on purpose -- should be dropped, not zero-filled
+    })
     crosswalk = pd.DataFrame({
         "gsis_id": ["00-0001", "00-0002"],
         "sleeper_id": ["4984", "5001"],
     })
 
     payload, report = assemble_player_advanced_stats(
-        scoped_predictions, usage, trend, xfp_summary, crosswalk,
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, crosswalk,
         target_season=2026, target_week=1, seasons_trained=list(range(2018, 2026)),
         model_version="test-version",
     )
@@ -233,6 +259,16 @@ def test_assemble_and_validate_export_round_trip():
     assert payload["players"]["5001"]["xfp"]["season_xfp"] == pytest.approx(180.0)
     assert payload["meta"]["season"] == 2026
     assert payload["meta"]["week"] == 1
+
+    # weekly_xfp: grouped into {week_str: xfp}, null week dropped (not
+    # zero-filled), and a player with no weekly_xfp rows at all gets {}
+    # rather than a missing key.
+    assert payload["players"]["4984"]["weekly_xfp"] == {}
+    assert payload["players"]["5001"]["weekly_xfp"] == {"1": 9.5, "2": 11.25}
+
+    # xfp_vol: rides the usage block like every other USAGE_EXPORT_COLUMNS entry.
+    assert payload["players"]["4984"]["usage"]["xfp_vol"] is None
+    assert payload["players"]["5001"]["usage"]["xfp_vol"] == pytest.approx(3.2)
 
     # Phase 3' trend block: renamed to human-readable keys, null-safe,
     # direction strings pass through untouched.

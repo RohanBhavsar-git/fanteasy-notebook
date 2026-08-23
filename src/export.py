@@ -138,10 +138,25 @@ CAVEATS = [
 # underlying number is real, not fabricated -- so both are exposed under
 # their own honest names instead, and the dashboard can choose how to
 # display/fall back between them.
+#
+# xfp_vol (Phase 8 round 3) -- expanding std of xFP, i.e. how much this
+# player's OPPORTUNITY-implied points have swung week to week. Added as
+# this pipeline's "boom/bust" / volatility signal for the dashboard's
+# Player Detail page: no column here is fantasy-POINTS volatility itself
+# (Family 6 deliberately excludes custom_points, the model's own target,
+# from ROLLING_SOURCE_COLUMNS -- see src/model.py's module docstring), and
+# xfp_vol is the closest already-computed, points-denominated proxy to
+# it -- unlike a single usage-share's volatility, xFP already blends
+# targets, carries, and field position into one points-scale number, so
+# its volatility reads as "swings in scoring OPPORTUNITY" rather than one
+# narrow usage metric. Null for QB by construction (xfp has no passing
+# counterpart, see add_xfp_features's docstring) -- same disclosed gap
+# already true of every other xFP-derived field in this export.
 USAGE_EXPORT_COLUMNS = [
     "target_share_ewm3", "touch_share_ewm3", "offense_pct_ewm3",
     "snap_share_delta_3wk", "rz_target_share_ewm3", "rz_carry_share_ewm3",
     "prev_season_target_share", "prev_season_touch_share", "prev_season_offense_pct",
+    "xfp_vol",
 ]
 
 # Phase 3' trend block: src/usage.py's internal column-name feature ->
@@ -401,6 +416,35 @@ def build_xfp_summary(historical_features: pd.DataFrame, xfp_season: int) -> pd.
     return summary
 
 
+def build_weekly_xfp(historical_features: pd.DataFrame, target_season: int) -> pd.DataFrame:
+    """
+    Per-player, per-week REAL xfp for target_season's played weeks so far
+    (Phase 8 round 3) -- src/usage.py::add_xfp_features's per-play-derived
+    value for that exact week, not the lagged xfp_ewm3/xfp_s2d already in
+    the `usage` block. Powers the Weekly Production chart's optional xFP
+    line: this is the one field in this export that's a per-week time
+    series rather than a single upcoming-week snapshot, because a chart
+    line needs one value per already-played week, not one number
+    summarizing the whole season (build_xfp_summary) or the model's own
+    upcoming-week prediction (predict_target_week*).
+
+    Deliberately scoped to target_season, not the full multi-season
+    historical_features table -- the Weekly Production chart only ever
+    shows ONE season's bars at a time, and a stray prior-season week
+    would just be dead data the chart never reads.
+
+    Rows with a null xfp (QB, always -- xfp has no passing counterpart;
+    or any other player-week xfp itself came back null for) are dropped
+    here, not zero-filled, matching every other null-means-absent
+    convention in this export.
+
+    Returns: player_id, week, xfp -- one row per (player, played week).
+    Can be empty (e.g. the target season has no games played yet).
+    """
+    season_rows = historical_features[historical_features["season"] == target_season]
+    return season_rows.dropna(subset=["xfp"])[["player_id", "week", "xfp"]].reset_index(drop=True)
+
+
 # ==========================================================================
 # STEP 4: scope -- real 2026 rosters, union top ~300 by point projection
 # ==========================================================================
@@ -431,6 +475,7 @@ def assemble_player_advanced_stats(
     usage: pd.DataFrame,
     trend: pd.DataFrame,
     xfp_summary: pd.DataFrame,
+    weekly_xfp: pd.DataFrame,
     crosswalk: pd.DataFrame,
     target_season: int,
     target_week: int,
@@ -452,11 +497,25 @@ def assemble_player_advanced_stats(
     JSON should report whatever the artifact that produced its predictions
     actually measured, not a number that could be stale by several retrains.
 
+    `weekly_xfp` (build_weekly_xfp's output) is grouped into a
+    {player_id: {week_str: xfp}} dict BEFORE the per-row loop below,
+    rather than merged the way usage/trend/xfp_summary are -- those are
+    already one row per player, but weekly_xfp is one row per (player,
+    week), so a plain merge would multiply scoped_predictions' rows
+    instead of adding a column to them.
+
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
     not just assumed.
     """
     from src.usage import TREND_SOURCE_FEATURES
+
+    weekly_xfp_by_player = {}
+    if not weekly_xfp.empty:
+        for player_id, group in weekly_xfp.dropna(subset=["xfp"]).groupby("player_id"):
+            weekly_xfp_by_player[player_id] = {
+                str(int(w)): round(float(x), 2) for w, x in zip(group["week"], group["xfp"])
+            }
 
     cw = crosswalk.dropna(subset=["gsis_id", "sleeper_id"]).drop_duplicates(subset=["gsis_id"])
     merged = scoped_predictions.merge(usage, on="player_id", how="left")
@@ -496,6 +555,7 @@ def assemble_player_advanced_stats(
                     None if pd.isna(row.get("fp_over_expected")) else round(float(row["fp_over_expected"]), 2)
                 ),
             },
+            "weekly_xfp": weekly_xfp_by_player.get(row["player_id"], {}),
         }
 
     payload = {

@@ -868,6 +868,94 @@ identical wording only for the case where `state.advancedStats` predates
 this key entirely, so the caveat text has exactly one source of truth,
 not two copies that could drift.
 
+### Round 3: Player Detail enrichment (My Proj, Volatility, weekly xFP, trend indicator)
+
+Four additions to Player Detail, all reusing `.injury-stat-card`/
+`.injury-stat-grid`/`.panel` — no new CSS patterns:
+
+- **KPI grid: 4 → 6 cards**, not more (My Proj + Volatility added
+  alongside the existing Season Pts/Avg-Game/Sleeper Proj/Best Week). The
+  grid stays `.injury-stat-grid` with an inline `grid-template-columns:
+  repeat(3, 1fr)` override for this one 6-card instance — the injury tab's
+  own 4-card usage of the same class is untouched.
+- **My Proj** reuses `getMyProj()` (already existed, previously only used
+  on the Players/Comparison tabs) — point plus a floor–ceiling range,
+  gated on the export's `meta.season`/`week` matching what's being viewed,
+  same rule every other "My Proj" surface already follows.
+- **Volatility** exports `xfp_vol` (Family 6's expanding std of xFP) for
+  the first time — it rode `USAGE_EXPORT_COLUMNS` like every other
+  `usage.*` field, so no new top-level export key was needed, just one
+  more entry in an existing list. Chosen deliberately over a raw
+  usage-share volatility: no column in this pipeline is fantasy-POINTS
+  volatility itself (Family 6 excludes `custom_points`, the model's own
+  target, from `ROLLING_SOURCE_COLUMNS` by design — see `src/model.py`'s
+  module docstring), and xFP already blends targets, carries, and field
+  position into one points-scale number, making its volatility the
+  closest already-computed proxy to "boom/bust in points" this pipeline
+  has. Shown as a plain points figure ("4.5 pts, week-to-week swing"), not
+  normalized into a 0-100 score, per the request's "label it plainly."
+  Null for QB by construction, same disclosed gap as every other
+  xFP-derived field.
+- **Weekly xFP chart line** needed a genuinely new kind of export field:
+  everything else in `player_advanced_stats.json` is a single
+  upcoming-week snapshot, but a chart line needs one value per
+  ALREADY-PLAYED week. `src/export.py::build_weekly_xfp` scopes to
+  `target_season`'s played weeks only (the Weekly Production chart only
+  ever plots one season's bars), drops null xfp (QB; any real gap) rather
+  than zero-filling, and `assemble_player_advanced_stats` groups the
+  result into `{player_id: {week_str: xfp}}` BEFORE its per-row loop —
+  unlike `usage`/`trend`/`xfp_summary`, this can't be a plain `.merge()`,
+  since it's one row per (player, week) rather than one row per player.
+  Added defensively at the grouping step too (`.dropna(subset=["xfp"])`
+  before grouping, not just trusting `build_weekly_xfp`'s own contract) —
+  JSON has no `NaN`, and a caller passing an unfiltered frame shouldn't be
+  able to leak one through. On the chart itself: a new dataset, same
+  `hidden: true` off-by-default convention as the existing Top-N Position
+  Avg line, distinct color/dash (`#059669` green, `[2,2]` dotted) so it
+  reads as its own thing next to Sleeper Proj (solid orange) and Top-N
+  (dashed purple).
+- **Trend indicator** reuses the SAME per-player "biggest signal"
+  selection the Dashboard's Usage Trending panel (Round 1) already used —
+  refactored out of that panel's inline loop into a shared
+  `getPlayerTrendHeadline()` so the leaderboard and this compact,
+  one-line indicator can never disagree about which feature is "the"
+  trend for a given player. One line above the Opportunity Shares grid
+  (direction arrow + feature name), not its own panel, per the request.
+
+**Verified against the real, completed 2025 season (same league,
+`1250182471429931008`) before touching the live 2026 export, at TWO
+target weeks specifically to exercise both the "export's week matches
+what's live" and "it doesn't" paths:**
+- **Week 10** (weeks 1-9 real, matching Round 1/2's own test week):
+  `corr(actual, xfp)` = **0.788** across 2,668 real (player, week) rows —
+  strong positive, not 1.0, exactly the expected signature of a signal
+  that's opportunity-driven but not outcome-driven. Individual gaps read
+  sensibly by hand: Zach Ertz Wk 2 (actual 15.4, xfp 8.9, gap +6.5 — a big
+  TD game beating opportunity) and Wk 8 (actual 3.6, xfp 6.2, gap −2.6 —
+  real opportunity that didn't convert).
+- **Week 17** (weeks 1-16 real, chosen specifically to match the live
+  browser's own detected "current week" so `getMyProj()`'s week-matching
+  gate would actually pass): same 0.788 correlation held at the larger
+  4,748-row sample. Jonathan Taylor's real Wk 10 explosion (47.1 actual
+  points) shows an xFP of 24.64 that week — the single clearest "luck, at
+  a glance" moment in the whole verification: a real 22-point gap between
+  the bar and the line, on a week that really was a historically lucky
+  outing relative to his own opportunity level that game.
+- **Frontend**: Playwright confirmed all 6 KPI cards, the trend indicator,
+  and the chart's new dataset render correctly in both the populated case
+  (My Proj "14.9 / 7.5–25.2 range", Volatility "4.5 pts", trend "↑ Carry
+  Share rising") and a null case (the pre-Round-2/3 export, which has
+  neither `simulation` NOR `weekly_xfp` NOR `usage.xfp_vol` at all — a
+  stricter test than an explicit `null` for any of the three) — every new
+  element degraded to its designed empty state (`—`, "Not available", "No
+  usage trend yet this season", the xFP legend entry present but simply
+  empty of data) with zero new console errors. One tooling note, not a
+  product bug: Chart.js renders its legend on `<canvas>`, so Playwright's
+  text-based click can't toggle it in headless testing — verified the
+  `hidden: true` default and the dataset's actual per-week values instead,
+  via `Chart.getChart(canvas).data.datasets`, and used the same API to
+  force the line visible for the confirming screenshot.
+
 ---
 
 ## Design decisions worth preserving (the "why")

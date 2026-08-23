@@ -2818,29 +2818,38 @@
 
   const TREND_FEATURE_LABELS = { target_share: 'Target Share', carry_share: 'Carry Share', snap_share: 'Snap Share' };
 
-  // Combined usage-trend leaderboard across every player the export covers.
-  // red_zone_share is deliberately excluded here -- PROJECT_CONTEXT.md's
-  // Phase 3' findings measured its hold-rate under 50% even at the
-  // validated window/threshold (a "rise" reverts more often than it holds),
-  // too noisy for a waiver-wire risers/fallers list. Per player, only the
-  // single largest-magnitude signal among target/carry/snap share is kept
-  // (not one row per feature) -- this is meant to answer "who's trending
-  // right now", not "rank every feature separately".
+  // One player's single biggest non-red-zone usage-trend signal, or null
+  // if every feature is stable/unsigalled -- red_zone_share is
+  // deliberately excluded here -- PROJECT_CONTEXT.md's Phase 3' findings
+  // measured its hold-rate under 50% even at the validated window/
+  // threshold (a "rise" reverts more often than it holds), too noisy to
+  // headline either a leaderboard entry or a single player's trend badge.
+  // Shared by getUsageTrendLeaders (Round 1's Dashboard leaderboard) and
+  // the compact trend indicator on the Opportunity Shares panel (Round 3)
+  // so the two can never define "biggest signal" differently.
+  function getPlayerTrendHeadline(trend) {
+    if (!trend) return null;
+    let best = null;
+    ['target_share', 'carry_share', 'snap_share'].forEach(feat => {
+      const t = trend[feat];
+      if (!t || t.signal == null || !t.direction || t.direction === 'stable') return;
+      if (!best || Math.abs(t.signal) > Math.abs(best.signal)) {
+        best = { feature: feat, current: t.current, signal: t.signal, direction: t.direction };
+      }
+    });
+    return best;
+  }
+
+  // Combined usage-trend leaderboard across every player the export
+  // covers, one row per player (its single biggest signal, not one row
+  // per feature) -- this is meant to answer "who's trending right now",
+  // not "rank every feature separately".
   function getUsageTrendLeaders(limit) {
     const players = state.advancedStats?.players;
     if (!players) return { risers: [], fallers: [] };
     const rows = [];
     Object.entries(players).forEach(([playerId, data]) => {
-      const trend = data.trend;
-      if (!trend) return;
-      let best = null;
-      ['target_share', 'carry_share', 'snap_share'].forEach(feat => {
-        const t = trend[feat];
-        if (!t || t.signal == null || !t.direction || t.direction === 'stable') return;
-        if (!best || Math.abs(t.signal) > Math.abs(best.signal)) {
-          best = { feature: feat, current: t.current, signal: t.signal, direction: t.direction };
-        }
-      });
+      const best = getPlayerTrendHeadline(data.trend);
       if (best) rows.push({ playerId, ...best });
     });
     const risers = rows.filter(r => r.direction === 'rising').sort((a, b) => b.signal - a.signal).slice(0, limit);
@@ -3055,12 +3064,27 @@
         </div>
       </div>
     `;
+
+    // Compact trend indicator (Phase 8 round 3) -- direction + which
+    // feature drove it, reusing the SAME per-player "biggest signal"
+    // selection the Dashboard's Usage Trending panel (Round 1) uses, so
+    // the two can never disagree about which feature is "the" trend for
+    // this player. Deliberately not its own panel -- one line here.
+    const trendHeadline = getPlayerTrendHeadline(trend);
+    const trendLineHtml = trendHeadline
+      ? `<div style="font-size: 12px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; margin-bottom: 12px;">
+           <span style="color: ${trendHeadline.direction === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 700;">${trendHeadline.direction === 'rising' ? '↑' : '↓'}</span>
+           <span>${TREND_FEATURE_LABELS[trendHeadline.feature]} ${trendHeadline.direction}</span>
+         </div>`
+      : `<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">No usage trend yet this season</div>`;
+
     return `
       <div class="panel">
         <div class="panel-header">
           <div class="panel-title">Opportunity Shares</div>
           <div class="panel-note">Trailing 3-week usage, as of last update</div>
         </div>
+        ${trendLineHtml}
         <div class="injury-stat-grid">
           ${shareCard('🏃', 'blue', 'Snap %', usage.offense_pct_ewm3, 'Of offensive snaps')}
           ${shareCard('🎯', 'purple', 'Target Share', usage.target_share_ewm3, 'Of team targets')}
@@ -3069,6 +3093,20 @@
         </div>
       </div>
     `;
+  }
+
+  // Weekly xFP for one player in one season, keyed by week-as-string to
+  // match the export's own {week_str: xfp} shape -- {} (not an error) if
+  // the export hasn't loaded, predates this key, or doesn't cover this
+  // player/season. Only valid for the CURRENTLY EXPORTED season (same
+  // "don't show a stale number under a different week/season" rule
+  // getMyProj() already follows) -- weekly_xfp is season-scoped inside
+  // the export itself, so a mismatched season would silently mix data
+  // from two different years onto one chart if this weren't gated.
+  function getWeeklyXfp(playerId, season) {
+    const advanced = state.advancedStats;
+    if (!advanced || Number(advanced.meta?.season) !== Number(season)) return {};
+    return advanced.players?.[playerId]?.weekly_xfp || {};
   }
 
   // ---- Phase 8 round 2: win probability + playoff odds (src/simulate.py) ----
@@ -5589,11 +5627,13 @@
     const posStarterInfo = positionStarterCount(p.position);
     const posStartersN = posStarterInfo.count;
     const posStartersBreakdown = posStarterInfo.breakdown;
+    const weeklyXfp = getWeeklyXfp(p.player_id, season);
 
     const weeklyData = availableWeeks.map(w => {
       const weekStats = state.statsByWeek[w];
       const weekProj = state.projectionsByWeek?.[w] || {};
       const sleeperProj = resolvePts(weekProj[p.player_id], state.league, p.position);
+      const xfp = weeklyXfp[String(w)] ?? null;
 
       // Positional average for week w — mean of the top-N scorers at this
       // position, where N = league-wide starter count for the position.
@@ -5616,12 +5656,12 @@
         }
       }
 
-      if (!weekStats) return { week: w, pts: null, line: '', sleeperProj, posAvg, loaded: false };
+      if (!weekStats) return { week: w, pts: null, line: '', sleeperProj, posAvg, xfp, loaded: false };
       const ps = weekStats[p.player_id];
-      if (!ps) return { week: w, pts: 0, line: 'DNP', sleeperProj, posAvg, loaded: true };
+      if (!ps) return { week: w, pts: 0, line: 'DNP', sleeperProj, posAvg, xfp, loaded: true };
       const pts = resolvePts(ps, state.league, p.position) ?? 0;
       const line = getStatLine(p, weekStats);
-      return { week: w, pts, line, sleeperProj, posAvg, loaded: true };
+      return { week: w, pts, line, sleeperProj, posAvg, xfp, loaded: true };
     });
     const weeksWithPts = weeklyData.filter(w => w.loaded && w.pts != null);
     const totalPts = weeksWithPts.reduce((s, w) => s + w.pts, 0);
@@ -5661,6 +5701,28 @@
       ? `<div class="injury-stat-value">${sleeperProjThisWeek.toFixed(1)}</div><div class="injury-stat-sub">Wk ${currentWeek} · per Sleeper</div>`
       : `<div class="injury-stat-value" style="color: var(--text-muted);">—</div><div class="injury-stat-sub">Wk ${currentWeek} projection</div>`;
 
+    // My Proj (Phase 8 round 3) -- this project's own point projection
+    // plus its floor-ceiling range, alongside Sleeper's own card above.
+    // getMyProj() already gates on the export's meta.season/week matching
+    // what's being viewed (same rule the Players/Comparison tabs use), so
+    // a stale projection under a different week never shows here either.
+    const myProj = getMyProj(p.player_id, season, currentWeek);
+    const myProjCard = myProj != null
+      ? `<div class="injury-stat-value">${myProj.point.toFixed(1)}</div><div class="injury-stat-sub" title="${myProjTooltip()}">${myProj.floor.toFixed(1)}–${myProj.ceiling.toFixed(1)} range</div>`
+      : `<div class="injury-stat-value" style="color: var(--text-muted);">—</div><div class="injury-stat-sub">Wk ${currentWeek} projection</div>`;
+
+    // Volatility (Phase 8 round 3) -- xfp_vol, the closest already-computed,
+    // points-denominated proxy this pipeline has for week-to-week boom/bust
+    // (see src/export.py's USAGE_EXPORT_COLUMNS comment for why xfp_vol and
+    // not a raw usage-share volatility). Shown as a plain points figure,
+    // not normalized into a 0-100 "score" -- the raw number IS the label.
+    // Null for QB by construction (xfp has no passing counterpart) and for
+    // anyone without enough season-to-date games yet.
+    const volatility = getAdvancedPlayer(p.player_id)?.usage?.xfp_vol;
+    const volatilityCard = volatility != null
+      ? `<div class="injury-stat-value">${volatility.toFixed(1)}</div><div class="injury-stat-sub">pts, week-to-week swing</div>`
+      : `<div class="injury-stat-value" style="color: var(--text-muted);">—</div><div class="injury-stat-sub">Not available</div>`;
+
     main.innerHTML = `
       <div class="back-btn" id="pd-back">← Back</div>
 
@@ -5684,7 +5746,7 @@
         </div>
       </div>
 
-      <div class="injury-stat-grid">
+      <div class="injury-stat-grid" style="grid-template-columns: repeat(3, 1fr);">
         <div class="injury-stat-card">
           <div class="injury-stat-icon blue">🏈</div>
           <div class="injury-stat-content">
@@ -5706,6 +5768,20 @@
           <div class="injury-stat-content">
             <div class="injury-stat-label">Sleeper Proj</div>
             ${sleeperProjCard}
+          </div>
+        </div>
+        <div class="injury-stat-card">
+          <div class="injury-stat-icon purple">🤖</div>
+          <div class="injury-stat-content">
+            <div class="injury-stat-label" title="${myProjTooltip()}">My Proj</div>
+            ${myProjCard}
+          </div>
+        </div>
+        <div class="injury-stat-card">
+          <div class="injury-stat-icon red">🎢</div>
+          <div class="injury-stat-content">
+            <div class="injury-stat-label">Volatility</div>
+            ${volatilityCard}
           </div>
         </div>
         <div class="injury-stat-card">
@@ -5770,6 +5846,7 @@
         </div>
         <div class="chart-footnote">
           <strong>Top ${posStartersN} ${p.position}s</strong> = ${posStartersBreakdown}. This baseline reflects what a startable ${p.position} typically scores in this league, based on starting-lineup slots (FLEX usage estimated as ~50% WR, ~35% RB, ~15% TE).
+          <strong>Expected Points (xFP)</strong> reflects what this player's opportunities alone implied that week, not the outcome — the gap between it and Actual Points is touchdown/red-zone luck, not model error.
         </div>
       </div>
 
@@ -5823,6 +5900,7 @@
       const chartPts = weeklyData.map(w => w.loaded ? w.pts : null);
       const projLine = weeklyData.map(w => w.sleeperProj);
       const posAvgLine = weeklyData.map(w => w.posAvg);
+      const xfpLine = weeklyData.map(w => w.xfp);
       chartInstances.player = new Chart(ctx, {
         type: 'bar',
         data: {
@@ -5861,6 +5939,24 @@
               backgroundColor: 'transparent',
               borderWidth: 2, borderDash: [3, 3], fill: false,
               pointRadius: 2, pointBackgroundColor: '#7c3aed',
+              spanGaps: true, tension: 0.2, order: 0,
+              hidden: true   // Off by default — toggle on via legend
+            },
+            {
+              // Phase 8 round 3: expected points from opportunity alone
+              // (src/usage.py::add_xfp_features), not this season's rolled
+              // xfp_ewm3 -- the per-week REAL value, so the gap between
+              // this line and the Actual Points bars reads as TD/red-zone
+              // luck at a glance. Off by default, same convention as
+              // Top-N Position Avg above, so the chart doesn't get
+              // crowded by default.
+              label: 'Expected Points (xFP)',
+              data: xfpLine,
+              type: 'line',
+              borderColor: '#059669',
+              backgroundColor: 'transparent',
+              borderWidth: 2, borderDash: [2, 2], fill: false,
+              pointRadius: 2, pointBackgroundColor: '#059669',
               spanGaps: true, tension: 0.2, order: 0,
               hidden: true   // Off by default — toggle on via legend
             }

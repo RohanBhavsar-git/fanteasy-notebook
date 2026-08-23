@@ -57,8 +57,8 @@ from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
     CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_matchup_simulation,
     build_playoff_odds, build_starter_quantile_rows, build_target_week_features, build_team_game_id_lookup,
-    build_trend_snapshot, build_usage_snapshot, build_xfp_summary, get_export_candidates, get_export_scope,
-    predict_target_week_from_artifact, validate_export, validate_simulation,
+    build_trend_snapshot, build_usage_snapshot, build_weekly_xfp, build_xfp_summary, get_export_candidates,
+    get_export_scope, predict_target_week_from_artifact, validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
     DATA_OUTPUT, DEFAULT_LEAGUE_ID, get_id_crosswalk, get_schedule, get_sleeper_league,
@@ -309,6 +309,13 @@ def main() -> None:
     xfp_season = current_season if not raw_current.empty else current_season - 1
     xfp_summary = build_xfp_summary(historical_features, xfp_season)
 
+    # Per-week xfp for THIS season's played weeks -- always current_season,
+    # unlike xfp_summary's xfp_season fallback above, since the Weekly
+    # Production chart only ever plots current_season's own bars. Honestly
+    # empty (not an error) if current_season has zero games played yet.
+    weekly_xfp = build_weekly_xfp(historical_features, current_season)
+    print(f"    weekly xfp: {len(weekly_xfp)} (player, week) rows for season {current_season}")
+
     print("[5/7] Scoping to real rosters + top free agents, assembling JSON...")
     rosters_raw = get_sleeper_rosters(DEFAULT_LEAGUE_ID, refresh=True)
     rostered_sleeper_ids = {pid for r in rosters_raw for pid in (r.get("players") or [])}
@@ -320,7 +327,7 @@ def main() -> None:
     print(f"    scope report: {scope_report}")
 
     payload, crosswalk_report = assemble_player_advanced_stats(
-        scoped_predictions, usage, trend, xfp_summary, crosswalk,
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, crosswalk,
         current_season, target_week, artifact["seasons_trained"], artifact["model_version"],
         performance=artifact["performance"],
         caveats=CAVEATS + WEEKLY_EXTRA_CAVEATS,
