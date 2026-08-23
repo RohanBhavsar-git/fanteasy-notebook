@@ -65,12 +65,17 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > silent `previous_league_id` fallback with an explicit season picker that
 > switches Sleeper league data, the NFL sidebar, and which export loads
 > all together, fixing a real incoherence (a full real season in the KPI
-> cards next to "0 of 5 games played" in the radar). Only 2025 is archived
-> so far, a deliberate scope decision made AFTER checking real feasibility
-> for all 5 of this league's completed seasons (2021-2025) — see **Phase 9
-> findings** for the concrete numbers, including a real candidate-selection
-> bug (dropping 47-89% of a season's real rostered players) that had to be
-> fixed before archiving was viable at all. See **Verification status**
+> cards next to "0 of 5 games played" in the radar). 2023, 2024, and 2025
+> are archived (plus the live current season) — 2021/2022 deliberately
+> skipped, a scope decision, not a technical limit, made AFTER checking
+> real feasibility for all 5 of this league's completed seasons (2021-2025)
+> — see **Phase 9 findings** for the concrete numbers, including a real
+> candidate-selection bug (dropping 47-89% of a season's real rostered
+> players) that had to be fixed before archiving was viable at all, and a
+> `seasonDataCache` (keyed by season number, so it can't repeat the
+> `statsByWeek` week-only cache-key collision Phase 9's own first round
+> caught) that makes re-visiting an already-loaded archive instant rather
+> than re-fetching ~900 KB every time. See **Verification status**
 > near the end before treating any pipeline claim as settled.
 
 ---
@@ -1460,6 +1465,75 @@ switched away from, both checked against every panel the request named:**
   noise was the already-established ESPN CORS artifact of local
   off-origin serving).
 
+### Round 2: 2023 + 2024 archives, lazy-load confirmation, instant re-switching
+
+Three completed seasons now archived (2023, 2024, 2025) plus the live
+current season, four `SEASON_OPTIONS` entries total. **2021 and 2022
+deliberately skipped** — real, older seasons on this league's own Sleeper
+history (`SEASON_LEAGUE_IDS` still has both real league_ids, so adding
+them later needs no new infrastructure), left out because roster turnover
+makes them less useful for draft prep than the 3 most recent seasons,
+which is what this dashboard is actually for.
+
+**Confirmed the selector was already lazy, not eager, before touching
+anything.** `fetchAllRealData(season)` only ever calls
+`fetchJSON(seasonOption.exportPath)` for the ONE season it's given —
+`SEASON_OPTIONS` growing to 4 entries doesn't cost anything until a
+season is actually selected; there was no "fetch every archive on page
+load" behavior to fix. What WAS missing: switching back to an
+already-visited archive re-fetched it from scratch every time — at
+~900 KB-940 KB per archive, real but avoidable cost.
+
+**Fixed with `seasonDataCache`, a `Map` keyed by season number, storing
+each ARCHIVED season's full `fetchAllRealData()` bundle after its first
+load.** Correct to cache permanently, not just as a bounded LRU or
+TTL cache: an archived season's data (real final Sleeper standings AND
+the frozen export) can never change again, so there's no staleness
+window to worry about — unlike a typical cache, there's no wrong answer
+this could ever return. The LIVE season is deliberately excluded from
+this cache (its Sleeper data and its own export can both change while
+the page is open), so switching back to it always re-fetches fresh, same
+as before this round.
+
+**Checked for the exact bug class the `statsByWeek`/`projectionsByWeek`
+fix (Round 1) represents, not just assumed the new cache avoids it.**
+That bug was a cache keyed by week number ALONE (no season dimension),
+so one season's data could silently answer for another's once switching
+became possible. `seasonDataCache` is keyed by the season number
+directly — there's no shared key two different seasons could collide
+under, so the same bug class can't recur here by construction, not
+merely by not-yet-having-been-caught. Verified directly, not just
+argued: switching 2023 -> 2024 -> 2023 in a real browser produced
+byte-identical KPI/radar output on both visits to 2023, and the SECOND
+visit made zero network requests for any `/archive/` path (confirmed via
+Playwright's own request log, not inferred from the UI alone) — the
+cache is actually being hit, not just coincidentally correct.
+
+**Verified with two more real, well-known, independently-checkable
+players — one per new archive:**
+- **Christian McCaffrey, 2023 (SF)** — his real Offensive Player of the
+  Year season. Radar: 95th percentile Touch Volume, 98th Target Share,
+  95th Yards/Carry, 92nd Touch Share, 95th Snap Share — a radar shape
+  that fills out nearly every axis, matching a real do-everything,
+  historically dominant season. 272 real rushing plays + 83 real
+  receiving plays over 16 games.
+- **Saquon Barkley, 2024 (PHI)** — his real historic 2000+-rushing-yard
+  season. Radar: 98th percentile Touch Volume AND 98th percentile
+  Yards/Carry (matching his real, unusually efficient high-volume
+  rushing that year) but only 65th percentile Target Share and, more
+  tellingly, only 14th percentile Goal-Line Share despite his massive
+  overall rushing workload — consistent with Philadelphia's real,
+  well-documented use of Jalen Hurts' own QB sneak ("tush push") for a
+  large share of the team's actual goal-line/short-yardage scoring
+  instead of handing those specific carries to Barkley. The radar shape
+  itself visibly differs from McCaffrey's fuller hexagon — pulled hard
+  toward the rushing axes, pinched at goal-line and target share — a
+  real, visible distinction between a rushing-dominant bell-cow and a
+  more complete one, not just two similarly-shaped "great RB" seasons.
+
+All of this against the real production config (unmodified `LEAGUE_ID`),
+zero new console errors.
+
 ---
 
 ## Design decisions worth preserving (the "why")
@@ -1530,6 +1604,7 @@ assumptions as facts.
 | Phase 4 radar percentiles (`position_starter_counts()`, `build_radar_snapshot()`) are correct and match `index.html`'s startable-count logic | **Verified** — `position_starter_counts()` pinned against this league's real `roster_positions` (14 teams) reproduces QB=14/RB=33/WR=35/TE=16, matching the Weekly Production chart's own already-published "~35" WR footnote. Replayed against the real, completed 2025 season at week 10 (point-in-time-safe history, real model artifact): 391/555 candidates eligible, and 5 real, well-known players (Christian McCaffrey, James Cook, Justin Jefferson, Puka Nacua, Travis Kelce) each produced a percentile profile matching their real-world reputation on inspection, plus Joe Burrow correctly came back ineligible (4 of 5 games) for his real, injury-shortened 2025 season. Frontend verified via Playwright: the eligible case renders a real Chart.js radar whose `Chart.getChart(canvas).data` matches the Python-computed percentiles exactly; the ineligible case renders the specific games-played empty state. Zero new console errors. See **Phase 4 findings**. |
 | Phase 5 heatmap zones (`receiving_zone_plays()`/`passing_zone_plays()`/`rushing_zone_plays()`, `build_heatmap_snapshot()`) derive real zones from real pbp and read correctly per position | **Verified** — replayed against the real, completed 2025 season at week 10 (point-in-time-safe history, real model artifact, real pbp): 391/555 candidates eligible, real play counts reported and spot-checked (single digits up to 168 real carries for a workhorse back). Two archetype contrasts specifically requested were confirmed on real, not hand-picked, players — Tyquan Thornton (60.7% of real targets in the two Deep zones) vs. Khalil Shakir (75%+ in Short/Behind-LOS zones, near-zero deep usage) for deep-threat-vs-slot; Josh Jacobs (real red-zone-heavy rushing, checkdown-only receiving on 28 real targets) vs. Christian McCaffrey (a similar rushing shape but 80 real targets spread across 10 zones including real intermediate/deep work) for goal-line-vs-passing-down. A real production bug was caught and fixed in the process: `nflreadpy.load_pbp()` raises `ValueError` (not the already-handled ConnectionError/404 shape) for a season with no pbp published yet, surfaced by running `scripts/weekly_update.py` for real against the live pre-draft 2026 league — fixed at that one caller (and the notebook's equivalent cell), matching where `build_weekly_scored`'s own analogous tolerance already lives, not pushed into `get_pbp` itself. Frontend verified via Playwright: correct panel titles/grid counts per position, the ineligible state renders its specific games-played reason, zero new console errors across a full click-through. See **Phase 5 findings**. |
 | Season archives + selector: `get_archive_candidates()` doesn't silently drop real historical rostered players, the generated 2025 archive is well-formed, and the UI switches every panel together with no mixed-season state | **Verified** — `get_archive_candidates()` checked directly against this league's real historical rosters for all 5 completed seasons (2021-2025): `n_with_current_team == n_crosswalk_matched` for every one, vs. 46.9%-88.8% survival if `get_export_candidates()` had been reused unmodified (see the per-season table in **Phase 9 findings**). `scripts/archive_season.py 2025` generated a real, validated 921,516-byte archive (465 players, 466/1468 radar/heatmap-eligible, crosswalk match rate 99.0%). Frontend verified via Playwright against the real production config (unmodified `LEAGUE_ID`, real committed archive): defaulted to 2025 automatically (2026 has zero real games), and on 2025 every named panel (KPI cards, radar, heatmap, opportunity shares, weekly chart) reported the same real full season for Christian McCaffrey with no partial/mixed state; switching to 2026 correctly reverted radar/heatmap to "0 of 5 games" with zero 2025 data leaking through, and the standings table correctly emptied. Also caught and fixed a real latent bug in the process: `state.statsByWeek`/`state.projectionsByWeek` were cached by week number alone, which would have let one season's per-week stats silently answer for another's after a switch — fixed by clearing both caches on every season load, verified via a full click-through of every tab in both seasons plus a mid-navigation season switch, zero new console errors. See **Phase 9 findings**. |
+| Round 2: 2023/2024 archives are well-formed, `seasonDataCache` actually prevents re-fetching (not just correct by coincidence), and it can't repeat the `statsByWeek` cache-key collision bug | **Verified** — `scripts/archive_season.py` generated real, validated archives for 2023 (933,208 bytes, 467 players) and 2024 (941,250 bytes, 461 players), both with `n_with_current_team == n_crosswalk_matched` (the same fix already proven for 2025). Two more real, well-known players spot-checked: Christian McCaffrey's real 2023 Offensive Player of the Year season (95th-98th percentile across nearly every radar axis) and Saquon Barkley's real historic 2024 2000+-rushing-yard season with Philadelphia (98th percentile Touch Volume/Yards-per-Carry, but only 14th percentile Goal-Line Share — consistent with the Eagles' real, well-documented use of Jalen Hurts' own QB sneak for goal-line scoring instead). Confirmed via Playwright that switching 2023 -> 2024 -> 2023 produces byte-identical output on both visits to 2023 AND that the second visit makes zero network requests for any `/archive/` path (checked via the browser's own request log, not inferred) — `seasonDataCache` is a `Map` keyed by season number, so it can't repeat the week-number-only collision `statsByWeek`/`projectionsByWeek` had. Zero new console errors. See **Phase 9 findings**' Round 2. |
 
 ## What's outstanding
 
@@ -1547,7 +1622,7 @@ assumptions as facts.
 - **Comparison tab's "Profile Overlay" placeholder** still needs wiring — Phase 4's `radar` key has the data, but overlaying multiple players' radars on one Chart.js chart (vs. Player Detail's single-player radar) wasn't part of that round; see **Phase 4 findings**. No equivalent multi-player heatmap overlay was requested or built for Phase 5 either.
 - **`get_pbp()` still raises a raw, unguarded `ValueError` for an unpublished season in the general case** — only `scripts/weekly_update.py`'s and `07_export_json.ipynb`'s single-current-season heatmap-building callers were fixed (see **Phase 5 findings**), matching the same narrowly-scoped-fix pattern already true of `get_weekly_stats`'s equivalent 404 case (see the `src/ingest.py`-level season guard item below, which this is the same open item as, just a second exception shape).
 - **Historical champion data** — plan is to maintain a small `champions.json` file by hand for the league's history
-- **Season archives beyond 2025** — `src/ingest.py::SEASON_LEAGUE_IDS` already has real league_ids for 2021-2024 (this league's full Sleeper history), and `get_archive_candidates()` was verified against all 5 seasons before scoping to just 2025 (see Phase 9 findings). Adding one is `python scripts/archive_season.py <year>` plus one new entry in `index.html`'s `SEASON_OPTIONS` — no code changes needed, just a decision to do it.
+- **Season archives beyond 2023-2025** — 2023, 2024, and 2025 are archived and in the selector; 2021 and 2022 were deliberately skipped (roster turnover makes them less useful for draft prep, not a technical limitation). `src/ingest.py::SEASON_LEAGUE_IDS` already has both their real league_ids, and `get_archive_candidates()` was verified against all 5 seasons before scoping down (see Phase 9 findings). Adding either later is `python scripts/archive_season.py <year>` plus one new entry in `index.html`'s `SEASON_OPTIONS` — no code changes needed, just a decision to do it.
 - **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
 
 ---

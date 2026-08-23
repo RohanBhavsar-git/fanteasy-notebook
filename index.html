@@ -1856,7 +1856,13 @@
   const SEASON_OPTIONS = [
     { season: 2026, leagueId: LEAGUE_ID, live: true, exportPath: 'data/output/player_advanced_stats.json' },
     { season: 2025, leagueId: '1250182471429931008', live: false, exportPath: 'data/output/archive/2025.json' },
+    { season: 2024, leagueId: '1124849308202467328', live: false, exportPath: 'data/output/archive/2024.json' },
+    { season: 2023, leagueId: '997302154270433280', live: false, exportPath: 'data/output/archive/2023.json' },
   ];
+  // 2021/2022 deliberately not archived -- src/ingest.py's SEASON_LEAGUE_IDS
+  // still has their real league_ids if that changes; roster turnover makes
+  // them less useful for draft prep than the 3 most recent completed
+  // seasons, which is what this dashboard's actually for.
 
   // NFL team abbreviations — used by filters
   const NFL_TEAMS = ['BUF','MIA','NE','NYJ','BAL','CIN','CLE','PIT','HOU','IND','JAX','TEN','DEN','KC','LV','LAC','DAL','NYG','PHI','WAS','CHI','DET','GB','MIN','ATL','CAR','NO','TB','ARI','LAR','SF','SEA'];
@@ -2541,6 +2547,24 @@
 
   let chartInstances = {};
 
+  // Cache of already-loaded ARCHIVED (non-live) seasons' full
+  // fetchAllRealData() bundles, keyed by season number. An archive is a
+  // frozen, immutable snapshot -- the real Sleeper standings/matchups AND
+  // the archived export both describe a season that's already over and
+  // can never change -- so caching one permanently for the rest of this
+  // page session is always correct, not just an optimization with a
+  // staleness risk. The LIVE season is deliberately NEVER cached here:
+  // its Sleeper data and its own export can both change while this page
+  // is open, so switching back to it always re-fetches fresh.
+  //
+  // Keyed by the season number itself -- deliberately not the
+  // statsByWeek/projectionsByWeek mistake this same round fixed (keyed by
+  // week number ALONE, so one season's data could silently answer for
+  // another's). A Map keyed by season can't collide across seasons by
+  // construction: switching 2023 -> 2024 -> 2023 always reads the entry
+  // stored under the key 2023, never anything cached under 2024.
+  const seasonDataCache = new Map();
+
   // ============================================
   // TOAST + COMPARE HELPERS
   // ============================================
@@ -2685,7 +2709,15 @@
     state.statsFetching = new Set();
     state.projectionsByWeek = {};
     state.projectionsFetching = new Set();
-    const realData = await fetchAllRealData(season);
+
+    const seasonOption = SEASON_OPTIONS.find(s => s.season === season);
+    let realData;
+    if (seasonOption && !seasonOption.live && seasonDataCache.has(season)) {
+      realData = seasonDataCache.get(season); // archived + already visited this session -- instant, no fetch
+    } else {
+      realData = await fetchAllRealData(season);
+      if (seasonOption && !seasonOption.live) seasonDataCache.set(season, realData);
+    }
     Object.assign(state, realData);
     document.getElementById('league-info-text').innerHTML = `<strong>${state.league.name}</strong>`;
     renderSeasonSelector();
