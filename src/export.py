@@ -348,6 +348,64 @@ def get_export_candidates(
     return candidates, report
 
 
+def get_archive_candidates(historical_features: pd.DataFrame, crosswalk: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Candidate pool for a SEASON ARCHIVE (scripts/archive_season.py), not a
+    live upcoming week -- see get_export_candidates for that path, which
+    this deliberately does NOT reuse unmodified.
+
+    The one real difference: `team` comes from this player's own most
+    recent REAL row in historical_features (whatever team they were on
+    the last time they actually played), not from Sleeper's CURRENT
+    snapshot the way get_export_candidates resolves it via `sleeper_players`.
+    That distinction matters enormously here and barely at all on the live
+    path: a live "predict the upcoming week" candidate genuinely needs a
+    CURRENT team (there's no game to attach pregame context to for a free
+    agent with no team today), but an archive candidate's `team` is only
+    ever used to build a stub row for a week that's already over --
+    add_context_features finds no real schedule entry for a week that
+    never happened regardless of which team is filled in, so the value
+    only needs to be non-null, not current.
+
+    Using get_export_candidates' current-team filter here would silently
+    drop every retired/moved-on player from a historical archive --
+    checked directly against this league's real rosters before choosing
+    this fix, not assumed: it would have excluded 47-89% of a season's
+    REAL rostered players depending on how long ago the season was (2021:
+    53% dropped; 2025: 11% dropped even for the most recent completed
+    season), which would defeat an archive's entire purpose.
+
+    Returns: (candidates, report), same shape as get_export_candidates.
+    `n_with_current_team` is kept as the same report key for schema
+    consistency, though here it's always identical to n_crosswalk_matched
+    by construction -- a real historical row always has a real team, so
+    once a player clears the crosswalk match there's nothing left to drop.
+    """
+    position_eligible = historical_features[
+        historical_features["position"].isin(EXPORT_POSITIONS)
+    ][["player_id", "position", "season", "week", "team"]]
+
+    last_known_team = (
+        position_eligible.sort_values(["player_id", "season", "week"])
+        .drop_duplicates(subset=["player_id"], keep="last")[["player_id", "position", "team"]]
+    )
+    last_known_team["team"] = last_known_team["team"].map(normalize_team_code)
+    n_position_eligible = len(last_known_team)
+
+    cw = crosswalk.dropna(subset=["gsis_id", "sleeper_id"]).drop_duplicates(subset=["gsis_id"])
+    merged = last_known_team.merge(cw[["gsis_id", "sleeper_id"]], left_on="player_id", right_on="gsis_id", how="left")
+    n_crosswalk_matched = int(merged["sleeper_id"].notna().sum())
+
+    candidates = merged.dropna(subset=["sleeper_id"])[["player_id", "position", "team"]].reset_index(drop=True)
+    report = {
+        "n_position_eligible": n_position_eligible,
+        "n_crosswalk_matched": n_crosswalk_matched,
+        "n_with_current_team": n_crosswalk_matched,
+        "crosswalk_match_rate": n_crosswalk_matched / n_position_eligible if n_position_eligible else float("nan"),
+    }
+    return candidates, report
+
+
 def build_target_week_features(
     historical_features: pd.DataFrame,
     candidates: pd.DataFrame,

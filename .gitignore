@@ -6,9 +6,14 @@ data/processed/
 
 # data/output/ holds the Phase 7 export -- the actual dashboard deliverable,
 # not intermediate cache, so it's committed while raw/processed stay excluded.
+# data/output/archive/ holds one frozen final-snapshot export per completed
+# season (scripts/archive_season.py) -- same "deliverable, not cache"
+# exception, same reasoning.
 data/output/*
 !data/output/.gitkeep
 !data/output/player_advanced_stats.json
+!data/output/archive/
+!data/output/archive/*.json
 
 # models/ holds the Phase 8 model artifact (src/artifacts.py) -- committed
 # by retrain.yml only, same "deliverable, not cache" exception as

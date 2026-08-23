@@ -68,6 +68,22 @@ SLEEPER_API_ALT = "https://api.sleeper.com"
 # older than the one you're modeling, update this constant.
 DEFAULT_LEAGUE_ID = "1389706592789733376"
 
+# season -> that season's real league_id, walked by hand from DEFAULT_LEAGUE_ID's
+# own previous_league_id chain (verified live: this league goes back to 2021,
+# every one of these seasons shows status "complete"). Used by
+# scripts/archive_season.py to fetch that season's real rosters/schedule/
+# scoring_settings -- an archive needs the league_id that was ACTUALLY LIVE
+# that season, not DEFAULT_LEAGUE_ID. Extend by hand each time a new season
+# completes and gets archived, same manual-maintenance pattern as
+# DEFAULT_LEAGUE_ID itself.
+SEASON_LEAGUE_IDS = {
+    2021: "734176377493958656",
+    2022: "863908569819582464",
+    2023: "997302154270433280",
+    2024: "1124849308202467328",
+    2025: "1250182471429931008",
+}
+
 
 # ==========================================================================
 # INTERNAL HELPERS

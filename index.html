@@ -53,6 +53,14 @@
       position: relative;
     }
     .league-info strong { color: var(--text-primary); }
+    .season-selector {
+      padding: 5px 8px; font-size: 12px; font-weight: 700;
+      border: 1px solid var(--border); border-radius: 6px;
+      background: var(--bg-tertiary); color: var(--text-primary);
+      cursor: pointer; font-family: inherit;
+    }
+    .season-selector:focus { outline: none; border-color: var(--accent); }
+    .season-selector:disabled { opacity: 0.5; cursor: wait; }
 
     .layout {
       display: grid; grid-template-columns: 280px 1fr;
@@ -1792,13 +1800,16 @@
         <div class="nav-link" data-view="injuries">Injuries</div>
       </div>
       <div class="league-info" id="league-info">
+        <select class="season-selector" id="season-selector" disabled>
+          <option>Loading…</option>
+        </select>
         <span id="league-info-text">Loading…</span>
       </div>
     </div>
   </nav>
 
   <div class="layout">
-    <div id="season-fallback-banner" class="info-banner" style="grid-column: 1 / -1; display: none;"></div>
+    <div id="season-banner" class="info-banner" style="grid-column: 1 / -1; display: none;"></div>
     <aside class="sidebar">
       <div class="sidebar-title">
         <span>NFL Schedule</span>
@@ -1827,6 +1838,25 @@
   // concerns. To change the league, edit this constant and redeploy.
   const LEAGUE_ID = '1389706592789733376';
   const API = 'https://api.sleeper.app/v1';
+
+  // Real seasons this dashboard can show -- one entry per season THIS SAME
+  // hard-coded league has existed under on Sleeper (walked by hand from
+  // LEAGUE_ID's own previous_league_id chain). This is NOT the runtime
+  // league-switcher the comment above forbids: every entry here is still
+  // this one league, just a different season of it -- the season selector
+  // replaces the old silent previous_league_id fallback with an explicit,
+  // user-visible choice (see PROJECT_CONTEXT.md's Phase 9 findings).
+  //
+  // `live: true` marks the current/upcoming season, served from the
+  // always-current player_advanced_stats.json; every other entry is a
+  // frozen, final snapshot of a COMPLETED season (scripts/archive_season.py)
+  // at exportPath. Extend by hand each time a new season is archived --
+  // matches LEAGUE_ID's own manual-update convention. Newest first, so
+  // "the most recent archive" is simply the first non-live entry.
+  const SEASON_OPTIONS = [
+    { season: 2026, leagueId: LEAGUE_ID, live: true, exportPath: 'data/output/player_advanced_stats.json' },
+    { season: 2025, leagueId: '1250182471429931008', live: false, exportPath: 'data/output/archive/2025.json' },
+  ];
 
   // NFL team abbreviations — used by filters
   const NFL_TEAMS = ['BUF','MIA','NE','NYJ','BAL','CIN','CLE','PIT','HOU','IND','JAX','TEN','DEN','KC','LV','LAC','DAL','NYG','PHI','WAS','CHI','DET','GB','MIN','ATL','CAR','NO','TB','ARI','LAR','SF','SEA'];
@@ -2480,6 +2510,7 @@
 
 
   let state = {
+    selectedSeason: null,    // which SEASON_OPTIONS entry is active -- set by init()/switchSeason()
     league: { name: '', season: '', settings: {} }, users: [], rosters: [],
     weeklyMatchups: {}, activityByWeek: {}, nflGames: [],
     winnersBracket: [], losersBracket: [],
@@ -2572,25 +2603,135 @@
     chartInstances = {};
   }
 
-  async function init() {
-    document.getElementById('main-content').innerHTML =
-      `<div class="loading"><div class="spinner"></div>Loading league data...</div>`;
+  // Whichever season has real data, checked explicitly rather than assumed
+  // -- this is the ONE place "does the live season have real games yet"
+  // still gets checked, now to pick an honest DEFAULT selection rather
+  // than to silently swap which league's data loads. Falls back to the
+  // most recent archive (SEASON_OPTIONS' first non-live entry) when the
+  // live season has no real games yet; falls back to the live season
+  // itself if even the rosters fetch fails, so init() always has SOME
+  // season to try next rather than never starting.
+  async function determineDefaultSeason() {
+    const live = SEASON_OPTIONS.find(s => s.live);
     try {
-      const realData = await fetchAllRealData();
-      Object.assign(state, realData);
-      document.getElementById('league-info-text').innerHTML =
-        `<strong>${state.league.name}</strong>`;
-      const banner = document.getElementById('season-fallback-banner');
-      if (state.usingFallbackSeason) {
-        banner.innerHTML =
-          `ℹ️ <span>Showing the <strong>${state.league.season}</strong> season — the ` +
-          `${state.notYetDraftedSeason} league hasn't drafted yet.</span>`;
+      const rosters = await fetchJSON(`${API}/league/${live.leagueId}/rosters`);
+      const hasGames = rosters.some(r =>
+        (r.settings?.wins || 0) + (r.settings?.losses || 0) + (r.settings?.ties || 0) > 0
+      );
+      if (hasGames) return live.season;
+    } catch (e) {
+      console.warn('Could not check live season status, defaulting to the most recent archive:', e);
+    }
+    const mostRecentArchive = SEASON_OPTIONS.find(s => !s.live);
+    return mostRecentArchive ? mostRecentArchive.season : live.season;
+  }
+
+  function renderSeasonSelector() {
+    const sel = document.getElementById('season-selector');
+    if (!sel) return;
+    sel.innerHTML = SEASON_OPTIONS.map(opt =>
+      `<option value="${opt.season}"${opt.season === state.selectedSeason ? ' selected' : ''}>
+        ${opt.season}${opt.live ? '' : ' (archive)'}
+      </option>`
+    ).join('');
+    sel.disabled = false;
+    sel.onchange = () => switchSeason(Number(sel.value));
+  }
+
+  // Honest context for whichever season is selected -- an archived season
+  // says plainly that it's a completed-season snapshot; the live season
+  // only gets a note when there's genuinely nothing live yet (no "hasn't
+  // drafted yet" framing anymore -- the selector itself already makes
+  // clear which season you're looking at, so there's nothing left to
+  // explain a silent switch away from).
+  function updateSeasonBanner() {
+    const banner = document.getElementById('season-banner');
+    const opt = SEASON_OPTIONS.find(s => s.season === state.selectedSeason);
+    if (!opt) { banner.style.display = 'none'; return; }
+    if (!opt.live) {
+      banner.innerHTML =
+        `📁 <span>Viewing the <strong>${opt.season}</strong> season — a completed-season archive. ` +
+        `Final standings and real season stats; nothing here is live.</span>`;
+      banner.style.display = 'flex';
+    } else {
+      const hasGames = state.rosters.some(r =>
+        (r.settings?.wins || 0) + (r.settings?.losses || 0) + (r.settings?.ties || 0) > 0
+      );
+      if (!hasGames) {
+        banner.innerHTML = `🕐 <span><strong>${opt.season}</strong> season — nothing live yet.</span>`;
         banner.style.display = 'flex';
       } else {
         banner.style.display = 'none';
       }
+    }
+  }
+
+  // Load one season's data end to end and swap the whole page over to it.
+  // Shared by init() (first load) and the season selector's onchange
+  // (switchSeason below) so there's exactly one place that knows how to
+  // bring the dashboard into a fully-consistent state for a given season.
+  async function loadSeason(season) {
+    state.selectedSeason = season;
+    // statsByWeek/projectionsByWeek are keyed by WEEK NUMBER ONLY, not
+    // (season, week) -- safe as long as only one season is ever loaded
+    // per page load, which is no longer true once a season switch is
+    // possible. Without this reset, switching from a 17-week 2025 archive
+    // back to 2026 would let 2025's week-1 stats silently answer for
+    // 2026's week 1 (both cached under the same key "1"). Cleared here,
+    // not re-keyed by season, since nothing needs a completed season's
+    // stats cache to survive a switch away from it -- switching back just
+    // re-fetches, cheap for real per-week data that never changes once final.
+    state.statsByWeek = {};
+    state.statsFetching = new Set();
+    state.projectionsByWeek = {};
+    state.projectionsFetching = new Set();
+    const realData = await fetchAllRealData(season);
+    Object.assign(state, realData);
+    document.getElementById('league-info-text').innerHTML = `<strong>${state.league.name}</strong>`;
+    renderSeasonSelector();
+    updateSeasonBanner();
+    renderSidebar();
+    renderView();
+  }
+
+  // Season selector's onchange handler. Resets every detail-view/active-ID
+  // piece of state first -- a season switch must never leave a player/
+  // team/matchup/gamecast detail view open referencing an ID from the OLD
+  // season's roster_ids or player set, which could silently resolve to a
+  // different real entity (or nothing) under the new season's data. "No
+  // mixed-season pages" applies to navigation state, not just the data.
+  async function switchSeason(newSeason) {
+    if (newSeason === state.selectedSeason) return;
+    const sel = document.getElementById('season-selector');
+    if (sel) sel.disabled = true;
+    state.activeMatchupId = null;
+    state.activeTeamId = null;
+    state.activePlayerId = null;
+    state.activeNflGameId = null;
+    document.getElementById('main-content').innerHTML =
+      `<div class="loading"><div class="spinner"></div>Loading ${newSeason} season...</div>`;
+    try {
+      await loadSeason(newSeason);
+    } catch (err) {
+      console.error(`Season switch to ${newSeason} failed:`, err);
+      showToast(`Couldn't load the ${newSeason} season. ${err.message}`);
+      // Revert to whatever season is actually still loaded in state, both
+      // on screen and in the dropdown, rather than leaving the page on a
+      // half-updated season.
+      if (sel) sel.value = state.selectedSeason;
       renderSidebar();
       renderView();
+    } finally {
+      if (sel) sel.disabled = false;
+    }
+  }
+
+  async function init() {
+    document.getElementById('main-content').innerHTML =
+      `<div class="loading"><div class="spinner"></div>Loading league data...</div>`;
+    try {
+      const defaultSeason = await determineDefaultSeason();
+      await loadSeason(defaultSeason);
     } catch (err) {
       console.error('Real data fetch failed:', err);
       document.getElementById('main-content').innerHTML = `
@@ -2615,34 +2756,23 @@
     return res.json();
   }
 
-  async function fetchAllRealData() {
-    // Step 1: Fetch league, users, rosters (with previous-season fallback)
-    let [leagueResp, usersResp, rostersResp] = await Promise.all([
-      fetchJSON(`${API}/league/${LEAGUE_ID}`),
-      fetchJSON(`${API}/league/${LEAGUE_ID}/users`),
-      fetchJSON(`${API}/league/${LEAGUE_ID}/rosters`)
-    ]);
-    let league = leagueResp, users = usersResp, rosters = rostersResp;
-
-    // Set once, here, rather than inferred later from state -- so the
-    // fallback banner can never drift out of sync with what actually loaded.
-    let usingFallbackSeason = false;
-    const notYetDraftedSeason = leagueResp.season;
-
-    const hasGames = rosters.some(r =>
-      (r.settings?.wins || 0) + (r.settings?.losses || 0) + (r.settings?.ties || 0) > 0
-    );
-    if (!hasGames && league.previous_league_id) {
-      try {
-        const [pl, pu, pr] = await Promise.all([
-          fetchJSON(`${API}/league/${league.previous_league_id}`),
-          fetchJSON(`${API}/league/${league.previous_league_id}/users`),
-          fetchJSON(`${API}/league/${league.previous_league_id}/rosters`)
-        ]);
-        league = pl; users = pu; rosters = pr;
-        usingFallbackSeason = true;
-      } catch (e) { console.warn('Prior season fetch failed, using current:', e); }
+  async function fetchAllRealData(season) {
+    const seasonOption = SEASON_OPTIONS.find(s => s.season === season);
+    if (!seasonOption) {
+      throw new Error(`Unknown season ${season} -- not in SEASON_OPTIONS.`);
     }
+    const leagueId = seasonOption.leagueId;
+
+    // Step 1: Fetch league, users, rosters for the SELECTED season. No
+    // previous_league_id fallback here anymore -- the season selector is
+    // the explicit, user-visible version of that same idea (see
+    // PROJECT_CONTEXT.md's Phase 9 findings for why it replaces the
+    // fallback rather than sitting alongside it).
+    const [league, users, rosters] = await Promise.all([
+      fetchJSON(`${API}/league/${leagueId}`),
+      fetchJSON(`${API}/league/${leagueId}/users`),
+      fetchJSON(`${API}/league/${leagueId}/rosters`)
+    ]);
 
     // ---- League-size compatibility check ----
     // The bracket layout, KPI cards, and several views were designed around
@@ -2719,14 +2849,22 @@
       } catch (e) { activityByWeek[w] = []; }
     }));
 
-    // Step 5: Fetch NFL games from ESPN
+    // Step 5: Fetch NFL games from ESPN -- LIVE season only. ESPN's
+    // scoreboard endpoint always returns TODAY's games regardless of what
+    // season is asked for, so there's no honest way to scope it to an
+    // archived season; showing it there would be exactly the
+    // mixed-season problem the season selector exists to fix (real 2026
+    // scores next to a 2025 archive). renderSidebar() shows an explicit
+    // "not available for archives" message when nflGames stays empty here.
     let nflGames = [];
     let nflWeekInfo = { label: 'NFL', isHistorical: false };
-    try {
-      const nflResult = await fetchNFLGames();
-      nflGames = nflResult.games || [];
-      nflWeekInfo = nflResult.weekInfo || nflWeekInfo;
-    } catch (e) { console.warn('ESPN fetch failed, using empty:', e); }
+    if (seasonOption.live) {
+      try {
+        const nflResult = await fetchNFLGames();
+        nflGames = nflResult.games || [];
+        nflWeekInfo = nflResult.weekInfo || nflWeekInfo;
+      } catch (e) { console.warn('ESPN fetch failed, using empty:', e); }
+    }
 
     // Step 5b: Fetch playoff brackets — winners and losers (toilet bowl).
     // Sleeper returns these arrays of {r, m, t1, t2, w, l, t1_from, t2_from}.
@@ -2763,11 +2901,14 @@
     // Compute biggest blowout (across all matchups of the season)
     const blowout = computeBiggestBlowout(matchupsByWeek);
 
-    // Step 7: This project's own model output (Phase 7 export). Not
-    // critical -- a missing/failed fetch leaves advancedStats null and
-    // "My Proj" correctly shows as unavailable, same honesty as any other
-    // placeholder in this dashboard, rather than breaking the whole load.
-    const advancedStats = await fetchJSON('data/output/player_advanced_stats.json').catch(() => null);
+    // Step 7: This project's own model output -- the export matching the
+    // SELECTED season: the always-current live export, or a frozen
+    // archive (scripts/archive_season.py), per seasonOption.exportPath.
+    // Not critical -- a missing/failed fetch leaves advancedStats null and
+    // "My Proj"/radar/heatmap correctly show as unavailable, same honesty
+    // as any other placeholder in this dashboard, rather than breaking
+    // the whole load.
+    const advancedStats = await fetchJSON(seasonOption.exportPath).catch(() => null);
 
     return {
       league,
@@ -2792,8 +2933,7 @@
       availableWeeks,
       selectedWeek: currentWeek,
       advancedStats,
-      usingFallbackSeason,
-      notYetDraftedSeason
+      selectedSeason: season
     };
   }
 
@@ -4216,6 +4356,28 @@
   function renderSidebar() {
     const container = document.getElementById('nfl-games');
     const weekTag = document.getElementById('sidebar-week-tag');
+    const seasonOption = SEASON_OPTIONS.find(s => s.season === state.selectedSeason);
+
+    // Archived season: no live NFL sidebar at all -- ESPN's scoreboard
+    // endpoint always returns TODAY's games, so there's no honest way to
+    // scope it to a past season (see fetchAllRealData's own comment on
+    // this). Say so plainly rather than showing an empty "no games" state
+    // that would read as a fetch failure instead of a deliberate scope
+    // decision.
+    if (seasonOption && !seasonOption.live) {
+      if (weekTag) weekTag.textContent = 'N/A';
+      const weekSel = document.getElementById('nfl-week-selector');
+      if (weekSel) { weekSel.innerHTML = '<option>Not available</option>'; weekSel.disabled = true; }
+      container.innerHTML = `
+        <div class="sidebar-placeholder" style="padding: 20px 12px; text-align: center;">
+          <div style="font-size: 24px; margin-bottom: 6px;">📁</div>
+          <div style="font-weight: 600; color: var(--text-secondary); margin-bottom: 4px;">Archived season</div>
+          <div style="font-size: 11px; color: var(--text-muted);">Live NFL scores aren't shown while viewing a completed-season archive.</div>
+        </div>
+      `;
+      return;
+    }
+
     if (weekTag) {
       const label = state.nflWeekInfo?.label || `Wk ${getCurrentWeek()}`;
       weekTag.textContent = label;

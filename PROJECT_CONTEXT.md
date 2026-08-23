@@ -61,8 +61,17 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > rather than dropped or merged — see **Phase 5 findings** below, which
 > also documents a real `nflreadpy.load_pbp()` bug this phase's own
 > verification run caught and fixed before it reached a committed export.
-> See **Verification status** near the end before
-> treating any pipeline claim as settled.
+> Phase 9 (season archives + selector) is also done — replaces the old
+> silent `previous_league_id` fallback with an explicit season picker that
+> switches Sleeper league data, the NFL sidebar, and which export loads
+> all together, fixing a real incoherence (a full real season in the KPI
+> cards next to "0 of 5 games played" in the radar). Only 2025 is archived
+> so far, a deliberate scope decision made AFTER checking real feasibility
+> for all 5 of this league's completed seasons (2021-2025) — see **Phase 9
+> findings** for the concrete numbers, including a real candidate-selection
+> bug (dropping 47-89% of a season's real rostered players) that had to be
+> fixed before archiving was viable at all. See **Verification status**
+> near the end before treating any pipeline claim as settled.
 
 ---
 
@@ -133,11 +142,11 @@ These are non-negotiable — they've shaped every decision we've made:
 ## Dashboard sections and their current state
 
 ### Dashboard (home)
+- **Season selector** (Phase 9, top nav) — switches the ENTIRE page (Sleeper league/rosters/matchups, the NFL sidebar, and which `player_advanced_stats.json`/archive is loaded) to a different season in one action. Replaces the old silent `previous_league_id` fallback outright — see Phase 9 findings. Currently offers the live 2026 season and the 2025 archive; defaults to whichever actually has real data (2025, since 2026 is still pre-draft).
 - League standings table with sortable columns
 - Weekly matchup cards with real scores
 - League-wide KPI cards (top scorer, biggest blowout, closest game, etc.)
 - Activity feed (transactions, waivers, trades) — real Sleeper data
-- Season Leaders panel (pending replacement per outstanding item)
 - **Usage Trending panel** (Phase 8 round 1) — biggest risers/fallers by target/carry/snap-share trend signal, one row per player showing current share + direction. `red_zone_share` deliberately excluded (hold-rate under 50%, see Phase 3' findings). Honest empty state ("No trend signal yet... populate from Week 6 onward") when `player_advanced_stats.json` hasn't accumulated 5 games this season yet — this is what actually renders as of the 2026 pre-season export.
 - **xFP Regression panel** (Phase 8 round 1) — season `fp_over_expected` leaders/laggards, RB/WR/TE only, explicitly labeled "luck indicator, not a prediction." Pulls from the most recently COMPLETED season, so unlike Usage Trending it already shows real 2025 numbers even in the 2026 pre-season export, not an empty state.
 - **Win probability on matchup cards** (Phase 8 round 2) — "N% sim" badge next to each team, from `src/simulate.py`'s `simulate_matchup` via the export's new `simulation` block. Only shown when the export's `simulation.week` matches the currently viewed week (same "don't show a stale number" rule `getMyProj()` already follows) — null on the 2026 pre-draft export (no real matchups exist yet), which is what actually renders today. A visible caption (not tooltip-only) beneath the matchup list states both the calibration limitation and that this doesn't out-pick "higher projection wins."
@@ -1253,6 +1262,206 @@ what's live" and "it doesn't" paths:**
 
 ---
 
+## Phase 9 findings — season archives + selector
+
+**The problem this fixes, stated the way it was found:** on a Player Detail
+page, the 6 KPI cards read LIVE Sleeper data for whichever season the
+dashboard happened to be showing (a full 16-17-game 2025 season, via the
+old `previous_league_id` fallback), while the radar/heatmap/opportunity
+shares read `state.advancedStats`, which only ever held ONE export at a
+time — the live 2026 pre-draft export, `games_played: 0` for everyone.
+Both halves of the page were individually correct and honest; shown
+together, a full season next to "0 of 5 games played" reads as broken.
+The fix isn't a smarter gate on either side — it's making "which season"
+one explicit choice that both sides answer from, instead of two
+independent mechanisms that happened to agree only by accident.
+
+### Feasibility, answered before scope was decided
+
+**This league's own Sleeper history, walked live from `DEFAULT_LEAGUE_ID`'s
+`previous_league_id` chain, not assumed:** 2021, 2022, 2023, 2024, 2025 all
+report `status: "complete"`; 2026 is `pre_draft`. Five real, complete
+seasons exist to archive. nflverse data (pbp/weekly/ngs/snaps/schedule) is
+already cached for all of 2018-2025 (the model's own training window), so
+raw-data coverage was never the constraint for any of these five.
+
+**The real constraint was a live bug in candidate selection, not data
+availability, and it gets worse the further back you go.**
+`get_export_candidates()` requires a player to have a CURRENT team on
+file in TODAY's live Sleeper player DB — correct for the live weekly
+export (a free agent with no team has no upcoming game to attach context
+to), completely wrong for an archive (a 2021 season's real rostered
+player who has since retired still played real 2021 games; "no current
+team" just means they're no longer active TODAY, which has nothing to do
+with whether 2021 is archivable). Checked directly against this league's
+real historical rosters before deciding anything, not assumed: reusing
+`get_export_candidates()` unmodified would have silently dropped
+
+| Season | Real rostered players | Would survive unmodified `get_export_candidates` |
+|---|---|---|
+| 2021 | 179 | 84 (46.9%) |
+| 2022 | 179 | 107 (59.8%) |
+| 2023 | 182 | 125 (68.7%) |
+| 2024 | 177 | 143 (80.8%) |
+| 2025 | 179 | 159 (88.8%) |
+
+— i.e. even the MOST RECENT completed season would have silently lost 1
+in 9 of its real rostered players, and the oldest would have lost more
+than half. This is why archiving isn't "call the existing export
+functions with a different season" — a real fix was needed:
+`get_archive_candidates()` (`src/export.py`) resolves `team` from a
+player's own LAST REAL historical row (always available for anyone who
+actually played) instead of today's live Sleeper snapshot, dropping the
+current-team requirement entirely — a stub row for a week that already
+happened (or in an archive's case, a week that never will) doesn't need a
+CURRENT team, `add_context_features` finds no real schedule entry for it
+either way, so the value only needs to be non-null. With this fix,
+`n_with_current_team == n_crosswalk_matched` for every one of the 5
+seasons checked — nobody is dropped for a reason that shouldn't apply to
+a historical archive.
+
+**File size is real and larger than a first guess based on the current
+committed export would suggest — measured, not assumed.** The live
+`player_advanced_stats.json` is currently ~250-270 KB, but that reflects
+the 2026 PRE-DRAFT export, where radar/heatmap are null for everyone
+(nothing played yet). A populated export — real radar percentiles, real
+heatmap zones, more real candidates surviving the fixed team filter — is
+much bigger: the real, committed 2025 archive is **921,516 bytes (900
+KB)**, and an in-season LIVE export will grow to roughly the same size
+once 2026's players clear the games-played floor. At that real size, 5
+seasons (2021-2025) would be ~4.5 MB total — still trivially cheap for
+git (the model artifact alone is already 7.57-11.16 MB, committed
+routinely, see Phase 8 findings), just a materially different number than
+a 200 KB-per-season guess would suggest.
+
+**Bottom line: all 5 completed seasons (2021-2025) are technically
+feasible now, but only 2025 is actually shipped.** `src/ingest.py`'s
+`SEASON_LEAGUE_IDS` lists all 5 real league_ids (so the infrastructure
+doesn't need to change to add more), but `index.html`'s `SEASON_OPTIONS`
+and the committed `data/output/archive/` directory currently carry only
+2025, matching the explicit "2025 to start" scope of the request. Any of
+2021-2024 can be added later by running `python scripts/archive_season.py
+<year>` and adding one entry to `SEASON_OPTIONS` — no code changes needed
+beyond that.
+
+### Archive generation (`scripts/archive_season.py`)
+
+Reuses the exact point-in-time-safe machinery `scripts/weekly_update.py`
+already established for a live week — a stub row for `target_week`,
+`add_context_features`/`add_rolling_features` re-run over the combined
+frame — with `target_week` set to ONE PAST that season's real final REG
+week (`determine_archive_target_week()`, the same "one past the last
+completed week" logic `weekly_update.py`'s `determine_target_week()`
+already uses, just applied to a frozen season instead of a live one).
+This is why "full-season aggregates" and "point-in-time-safe" aren't in
+tension: historical_features covers every real week of the season
+(1 through the final week), the stub row is for a week that never
+happened, and there's nothing at or after it to leak from BY
+CONSTRUCTION — not a new leakage argument, the identical one
+`weekly_update.py`'s live path already relies on every single week.
+
+Reads the full cached `weekly_features.parquet` (2018-2025) directly
+rather than `weekly_update.py`'s constrained `history_seed` approach —
+this is a manual, occasional script, not a CI job under a fetch-cost
+budget, and the full history is already on disk. Uses the already-
+committed model artifact (same one `weekly_update.py` uses) rather than
+training a fresh one — an archive is a snapshot with today's best model,
+not a retrain. `simulation` is always `null` — win probability for a
+week that never happened isn't a real thing to compute, so this script
+doesn't try building it at all.
+
+`projection.point/floor/ceiling` in an archive describes a hypothetical
+week after the season ended, not a real number anyone should act on —
+disclosed via `ARCHIVE_EXTRA_CAVEATS`, appended to the same `meta.caveats`
+list every other caveat already lives in, not a new mechanism.
+
+Generated for real, not just tested against synthetic data: `python
+scripts/archive_season.py 2025` produced `data/output/archive/2025.json`
+(921,516 bytes, 465 players, 466/1468 radar/heatmap-eligible candidates,
+crosswalk match rate 99.0%) — committed alongside this work.
+
+### Season selector (`index.html`)
+
+`SEASON_OPTIONS` (near `LEAGUE_ID`) is a small, hand-maintained array —
+`{season, leagueId, live, exportPath}` — one entry per season this SAME
+hard-coded league has existed under, extended by hand the same way
+`LEAGUE_ID`/`SEASON_LEAGUE_IDS` already are. This is NOT the runtime
+league-switcher CLAUDE.md's non-negotiables forbid: every entry is still
+this one league, just a different season of it — there's no way to type
+in an arbitrary league_id.
+
+**Replaces `previous_league_id` fallback outright, not alongside it.**
+`fetchAllRealData()` now takes a `season` argument and looks up that
+season's real `leagueId`/`exportPath` from `SEASON_OPTIONS` — no
+`previous_league_id` fetch, no silent swap. `determineDefaultSeason()` is
+the one place "does the live season have real games yet" still gets
+checked (the same `hasGames` logic the old fallback used), now to pick an
+honest DEFAULT selection rather than to silently substitute which
+league's data loads — the user can always override it via the selector.
+
+**Switching a season switches everything together, including things that
+were previously silent, persistent caches keyed only by week number.**
+`state.statsByWeek`/`state.projectionsByWeek` (Sleeper per-week stats/
+projections, used by Player Detail's KPI cards and game log) were keyed
+by week number ALONE, never season — safe when only one season was ever
+loaded per page load, a real cross-season contamination bug the moment a
+switch became possible (2025's week-1 stats would silently answer for
+2026's week 1, both cached under the key `"1"`). Caught before it shipped
+by reasoning through "what does 'no mixed state' actually require,"
+not just testing the happy path — fixed by clearing both caches (and
+their in-flight-fetch dedupe sets) on every season load, in the one
+function (`loadSeason()`) both `init()` and the selector's `switchSeason()`
+funnel through. `switchSeason()` also resets every active detail-view ID
+(`activeMatchupId`/`activeTeamId`/`activePlayerId`/`activeNflGameId`) --
+"no mixed-season pages" applies to navigation state, not just data, since
+a stale roster_id or player_id from the old season's data could otherwise
+resolve to a different real entity (or silently nothing) under the new
+season.
+
+**The NFL sidebar is season-gated too, not just fetched-and-ignored.**
+ESPN's scoreboard endpoint always returns TODAY's games regardless of what
+season is asked for — there's no honest way to scope it to an archived
+season, so `fetchAllRealData()` skips the ESPN fetch entirely when
+`!seasonOption.live`, and `renderSidebar()` shows an explicit "Archived
+season — live NFL scores aren't shown" message rather than an empty
+"no games" state that would read as a fetch failure.
+
+**Banner reworded, not just re-purposed.** `#season-banner` (renamed from
+`#season-fallback-banner`) now states plainly, for an archived season,
+that it's a completed-season archive — real final standings, nothing
+live. For the live season with no real games yet, it says so without the
+old "hasn't drafted yet, so we're showing you something else" framing,
+since the selector itself already makes clear which season is being
+viewed; there's nothing left for the banner to explain away.
+
+**Verified exactly the way the request asked — 2025 switched-to, then
+switched away from, both checked against every panel the request named:**
+- **On 2025 (real archive):** page defaulted to 2025 automatically (2026
+  has zero real games); banner correctly reads "completed-season
+  archive"; Christian McCaffrey's Player Detail showed Season Pts 354.9 /
+  Avg 22.2 / Best Week 35.6 (real full 2025 season) alongside a FULLY
+  ELIGIBLE radar ("Percentile vs. 33 startable RBs") and heatmap (311 real
+  rushing plays, 129 real receiving plays) and real Opportunity Shares
+  (Snap 83.0% / Target 20.9% / Carry 64.8% / Red-Zone 62.0%) and a Weekly
+  Production chart with 17 real bars (weeks 1-17) — every panel the
+  request named reporting the same real season, no partial/mixed state
+  anywhere.
+- **Switched to 2026 (live, pre-draft):** standings table correctly went
+  to 0 rows (no real rosters yet); McCaffrey's Player Detail correctly
+  showed Season Pts 0.0 / Best Week 0.0, radar and heatmap BOTH correctly
+  reverted to "Not enough games yet (0 of 5)" — not a trace of 2025's real
+  354.9-point season leaking through. Sleeper Proj (17.1) and My Proj
+  (19.0) correctly still populated, since those are legitimately about
+  the live upcoming week, not the completed season.
+- Confirmed via Playwright against the real production config (unmodified
+  `LEAGUE_ID`, real committed 2025 archive), including a mid-navigation
+  season switch (while on the Draft view) and a full click-through of
+  every tab in both seasons. Zero new console errors throughout (the only
+  noise was the already-established ESPN CORS artifact of local
+  off-origin serving).
+
+---
+
 ## Design decisions worth preserving (the "why")
 
 Things that took real conversation to arrive at — a new Claude should NOT re-litigate these unless Rohan explicitly asks:
@@ -1320,6 +1529,7 @@ assumptions as facts.
 | `getMatchupWinProb()`/`getPlayoffOdds()` gate on `meta.season` matching the displayed league's season, not just week | **Verified — a real gap found in a full-dashboard audit, since fixed.** Neither getter checked `meta.season` (`getPlayoffOdds` checked nothing at all — not season, not week — just whether a `playoff_odds` entry existed for the roster id). This mattered specifically because of `fetchAllRealData()`'s `previous_league_id` fallback: right after a new season's draft, before any of that season's games are played, the dashboard still displays the PRIOR season (`hasGames` still false) while `weekly-update.yml` may already have written a `simulation` block for the NEW season's week 1 — unguarded, that block's week-1 win probabilities/playoff odds would silently attach to the prior season's already-decided week-1 matchups and standings just because the week numbers happen to collide. `getPlayoffOdds` had a second, same-season risk too: `roster_id` isn't guaranteed to mean the same team across two different seasons' leagues. Fixed with a shared `simulationMatchesCurrentView()` gate (`index.html`) requiring both `meta.season === league.season` and `simulation.week === selectedWeek`, applied to both getters and to the three inline caveat-footer conditions that previously only checked week (so a caveat could show with no data behind it). This is a deliberate behavior change for `getPlayoffOdds` specifically: it now reads `—` for any week other than the one the export covers, not only for a season mismatch, trading the previous "always show the latest known odds" behavior for the same never-show-a-stale-number rule `getMyProj()` already followed. Verified against the real, completed 2025 season (league `1250182471429931008`): a real week-10 simulation block was rebuilt the same way Round 2's did (point-in-time-safe history truncated to weeks < 10, real model artifact, real Sleeper matchups/rosters) and served two ways — with `meta.season: 2025` (matching the displayed league), all 14 win-probability badges (7 real matchups) and all 14 rosters' playoff-odds percentages rendered, with both caveat footers visible; with the identical export relabeled `meta.season: 2026` (season mismatch only, week held constant at 10 in both), every badge and every Playoff Odds cell blanked to `—` and both caveat footers disappeared. Confirmed via Playwright against a local server, zero unexplained console errors in either case (the only console noise was the ESPN scoreboard sidebar's CORS failure, a known artifact of serving off of GitHub Pages' origin, unrelated to this change). |
 | Phase 4 radar percentiles (`position_starter_counts()`, `build_radar_snapshot()`) are correct and match `index.html`'s startable-count logic | **Verified** — `position_starter_counts()` pinned against this league's real `roster_positions` (14 teams) reproduces QB=14/RB=33/WR=35/TE=16, matching the Weekly Production chart's own already-published "~35" WR footnote. Replayed against the real, completed 2025 season at week 10 (point-in-time-safe history, real model artifact): 391/555 candidates eligible, and 5 real, well-known players (Christian McCaffrey, James Cook, Justin Jefferson, Puka Nacua, Travis Kelce) each produced a percentile profile matching their real-world reputation on inspection, plus Joe Burrow correctly came back ineligible (4 of 5 games) for his real, injury-shortened 2025 season. Frontend verified via Playwright: the eligible case renders a real Chart.js radar whose `Chart.getChart(canvas).data` matches the Python-computed percentiles exactly; the ineligible case renders the specific games-played empty state. Zero new console errors. See **Phase 4 findings**. |
 | Phase 5 heatmap zones (`receiving_zone_plays()`/`passing_zone_plays()`/`rushing_zone_plays()`, `build_heatmap_snapshot()`) derive real zones from real pbp and read correctly per position | **Verified** — replayed against the real, completed 2025 season at week 10 (point-in-time-safe history, real model artifact, real pbp): 391/555 candidates eligible, real play counts reported and spot-checked (single digits up to 168 real carries for a workhorse back). Two archetype contrasts specifically requested were confirmed on real, not hand-picked, players — Tyquan Thornton (60.7% of real targets in the two Deep zones) vs. Khalil Shakir (75%+ in Short/Behind-LOS zones, near-zero deep usage) for deep-threat-vs-slot; Josh Jacobs (real red-zone-heavy rushing, checkdown-only receiving on 28 real targets) vs. Christian McCaffrey (a similar rushing shape but 80 real targets spread across 10 zones including real intermediate/deep work) for goal-line-vs-passing-down. A real production bug was caught and fixed in the process: `nflreadpy.load_pbp()` raises `ValueError` (not the already-handled ConnectionError/404 shape) for a season with no pbp published yet, surfaced by running `scripts/weekly_update.py` for real against the live pre-draft 2026 league — fixed at that one caller (and the notebook's equivalent cell), matching where `build_weekly_scored`'s own analogous tolerance already lives, not pushed into `get_pbp` itself. Frontend verified via Playwright: correct panel titles/grid counts per position, the ineligible state renders its specific games-played reason, zero new console errors across a full click-through. See **Phase 5 findings**. |
+| Season archives + selector: `get_archive_candidates()` doesn't silently drop real historical rostered players, the generated 2025 archive is well-formed, and the UI switches every panel together with no mixed-season state | **Verified** — `get_archive_candidates()` checked directly against this league's real historical rosters for all 5 completed seasons (2021-2025): `n_with_current_team == n_crosswalk_matched` for every one, vs. 46.9%-88.8% survival if `get_export_candidates()` had been reused unmodified (see the per-season table in **Phase 9 findings**). `scripts/archive_season.py 2025` generated a real, validated 921,516-byte archive (465 players, 466/1468 radar/heatmap-eligible, crosswalk match rate 99.0%). Frontend verified via Playwright against the real production config (unmodified `LEAGUE_ID`, real committed archive): defaulted to 2025 automatically (2026 has zero real games), and on 2025 every named panel (KPI cards, radar, heatmap, opportunity shares, weekly chart) reported the same real full season for Christian McCaffrey with no partial/mixed state; switching to 2026 correctly reverted radar/heatmap to "0 of 5 games" with zero 2025 data leaking through, and the standings table correctly emptied. Also caught and fixed a real latent bug in the process: `state.statsByWeek`/`state.projectionsByWeek` were cached by week number alone, which would have let one season's per-week stats silently answer for another's after a switch — fixed by clearing both caches on every season load, verified via a full click-through of every tab in both seasons plus a mid-navigation season switch, zero new console errors. See **Phase 9 findings**. |
 
 ## What's outstanding
 
@@ -1337,6 +1547,7 @@ assumptions as facts.
 - **Comparison tab's "Profile Overlay" placeholder** still needs wiring — Phase 4's `radar` key has the data, but overlaying multiple players' radars on one Chart.js chart (vs. Player Detail's single-player radar) wasn't part of that round; see **Phase 4 findings**. No equivalent multi-player heatmap overlay was requested or built for Phase 5 either.
 - **`get_pbp()` still raises a raw, unguarded `ValueError` for an unpublished season in the general case** — only `scripts/weekly_update.py`'s and `07_export_json.ipynb`'s single-current-season heatmap-building callers were fixed (see **Phase 5 findings**), matching the same narrowly-scoped-fix pattern already true of `get_weekly_stats`'s equivalent 404 case (see the `src/ingest.py`-level season guard item below, which this is the same open item as, just a second exception shape).
 - **Historical champion data** — plan is to maintain a small `champions.json` file by hand for the league's history
+- **Season archives beyond 2025** — `src/ingest.py::SEASON_LEAGUE_IDS` already has real league_ids for 2021-2024 (this league's full Sleeper history), and `get_archive_candidates()` was verified against all 5 seasons before scoping to just 2025 (see Phase 9 findings). Adding one is `python scripts/archive_season.py <year>` plus one new entry in `index.html`'s `SEASON_OPTIONS` — no code changes needed, just a decision to do it.
 - **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
 
 ---

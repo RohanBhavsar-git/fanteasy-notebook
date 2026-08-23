@@ -26,6 +26,7 @@ from src.export import (  # noqa: E402
     build_trend_snapshot,
     build_weekly_xfp,
     build_xfp_summary,
+    get_archive_candidates,
     get_export_candidates,
     get_export_scope,
     normalize_team_code,
@@ -68,6 +69,38 @@ def test_get_export_candidates_starts_from_history_and_reports_real_match_rate()
         "n_crosswalk_matched": 3,       # 0001, 0002, 0004 -- 0005 has no crosswalk entry
         "n_with_current_team": 2,       # 0004 matched but has no team on file
         "crosswalk_match_rate": 0.75,
+    }
+
+
+def test_get_archive_candidates_uses_last_real_team_not_current_sleeper_snapshot():
+    """
+    The one real difference from get_export_candidates: a player with a
+    real crosswalk match but NO current team on file (retired/moved on by
+    today) is still a candidate here, resolved from their own last real
+    row -- this is the whole point of get_archive_candidates existing
+    separately, not a live-path detail carried over by accident.
+    """
+    historical_features = pd.DataFrame([
+        {"player_id": "00-0001", "position": "QB", "season": 2024, "week": 1, "team": "KC"},
+        {"player_id": "00-0001", "position": "QB", "season": 2025, "week": 3, "team": "KC"},  # latest -- should win
+        {"player_id": "00-0002", "position": "RB", "season": 2021, "week": 5, "team": "LAR"},  # retired since; needs LAR->LA
+        {"player_id": "00-0003", "position": "K", "season": 2025, "week": 1, "team": "SF"},    # wrong position
+        {"player_id": "00-0004", "position": "WR", "season": 2025, "week": 2, "team": "DAL"},  # no crosswalk entry
+    ])
+    crosswalk = pd.DataFrame([
+        {"sleeper_id": "1", "gsis_id": "00-0001"},
+        {"sleeper_id": "2", "gsis_id": "00-0002"},
+    ])
+
+    candidates, report = get_archive_candidates(historical_features, crosswalk)
+
+    assert set(candidates["player_id"]) == {"00-0001", "00-0002"}
+    assert candidates.loc[candidates["player_id"] == "00-0002", "team"].iloc[0] == "LA"
+    assert report == {
+        "n_position_eligible": 3,   # QB/RB/WR, K excluded -- 0001/0002/0004
+        "n_crosswalk_matched": 2,   # 0004 has no crosswalk entry
+        "n_with_current_team": 2,   # always == n_crosswalk_matched here, by construction
+        "crosswalk_match_rate": pytest.approx(2 / 3),
     }
 
 
