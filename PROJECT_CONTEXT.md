@@ -234,7 +234,10 @@ These are non-negotiable — they've shaped every decision we've made:
 - Selected Players shelf with 48px headshot cards + mini stats (Avg, Total, Sleeper Proj for selected week)
 - Stat Comparison table with Total Points, Avg/Game, Games Played, Best Week (with Wk N), Worst Week, Sleeper Proj (Wk N), My Proj (Wk N). Best in green, worst in red per row
 - Weekly Production line chart overlaying all compared players (real data)
-- Profile Overlay panel: same "Awaiting model output" placeholder as player detail
+- Profile Overlay panel: one real Phase 4 radar PER POSITION present among the
+  compared players (never merged across positions -- see the finding below),
+  reusing each player's already-exported `radar` block, same color per
+  player as the shelf cards/line chart
 - Search & Add Players panel at the bottom with same filters + headshots + projection columns
 
 ---
@@ -550,12 +553,11 @@ season. This makes radar's un-gated read consistent with Opportunity
 Shares/Usage Trending/xFP (its closest siblings, all of which read
 `state.advancedStats` the same way), not an oversight.
 
-**Comparison tab's "Profile Overlay" placeholder is unchanged, deliberately
-out of scope for this round** — the request was Player Detail's Position
-Profile specifically; overlaying multiple players' radars on one chart is
-a distinct UI problem (Chart.js's `radar` type supports multiple datasets,
-so the data is already there whenever this is picked up) left for later,
-not silently dropped.
+**Comparison tab's "Profile Overlay" placeholder was picked up later and
+built for real — see the multi-player radar overlay finding further down**
+(the request at the time this note was written was Player Detail's Position
+Profile specifically; overlaying multiple players' radars on one chart was
+a distinct UI problem left for later, not silently dropped).
 
 ---
 
@@ -1761,6 +1763,76 @@ whole dashboard to the clicked player's season.
 
 ---
 
+## Player Comparison — multi-player radar overlay findings
+
+**The Profile Overlay placeholder became a real feature: one Chart.js
+radar per POSITION present among the compared players, never one radar
+merged across positions.** `RADAR_METRICS` (`src/export.py`) defines a
+completely different 6-axis set per position — a QB's axes are Pass
+Volume/Rush Volume/Yards per Carry/Scramble Rate/EPA per Dropback/CPOE,
+nothing like a WR's Target Share/Air Yards Share/aDOT/Catch Rate/YAC/
+Red-Zone Target Share. Even WR and TE, which look closest, aren't
+identical — TE swaps Air Yards Share for Snap Share. Overlaying two
+positions on one radar would plot two unrelated metrics at the same
+vertex under one shared axis label: not an approximation, just wrong,
+and exactly the "silently plot incomparable axes" failure this was built
+to avoid. Blocking mixed-position comparisons outright was the other
+option considered and rejected — Comparison already allows any 4
+players regardless of position (a QB-for-WR trade evaluation is a normal
+use case), and refusing to show ANY profile data for that case throws
+away real, correct information just because it can't all fit on one
+chart. Grouping by position keeps every player's real profile visible:
+`radarGroups` (`index.html`, inside `renderComparisonView`) buckets the
+compared players by `position`, and one radar (with its own canvas,
+`cmp-radar-<position>`) renders per bucket — a same-position comparison
+(the common case) still gets exactly one combined chart; a fully mixed
+comparison (e.g. QB + RB + WR + TE) gets four small single-player radars
+stacked in the same panel, each real and correctly labeled, instead of
+nothing. Each player keeps the same color index used by the shelf cards
+and the weekly line chart (`colors[i]`, not re-indexed per group), so a
+player's line reads consistently across every chart in the view. A
+player who IS the right position but isn't radar-eligible yet (too few
+games, or no advanced data at all for this season) is named and excluded
+with the same honest reasoning text Player Detail's own placeholder
+already used, rather than silently omitted or faked.
+
+**No multi-player Field Heatmap was built for Comparison, deliberately.**
+Considered and rejected: superimposing 2-4 players' heatmaps on one grid
+(the ORIGINAL ask ruled this out directly — two heat grids on top of each
+other is unreadable, worse than one). Also considered: side-by-side small
+multiples. Rejected too, on the same principle just applied at smaller
+scale — Field Heatmap is already visually dense at its shipped size (a
+400×280 SVG grid with a 9px-font row/column axis, per-cell percentage
+labels, and a sparse-sample marker; some positions render TWO grids
+stacked, e.g. RB's rushing + receiving). Shrinking that to fit 2-4 across
+in a comparison panel (up to 8 small grids for a fully mixed 4-position,
+2-group comparison) would make the percentage labels and sparse markers
+illegible at a useful size — the same "worse than not having it" outcome
+the superimposed version has, just distributed across more, smaller
+panels instead of one big mess. Field Heatmap stays a Player Detail-only,
+full-width, one-player-at-a-time panel, where it's already legible; a
+user comparing two players' usage geography opens both Player Detail
+pages rather than reading a squeezed miniature here.
+
+**Verified against real, currently-loaded 2025 season data (the main
+season selector's default, since 2026 preseason has zero real games) in
+a real browser via Playwright, zero console errors both times:**
+- **Same-position, contrasting shapes:** Puka Nacua (Target Share 84th
+  pctl, Catch Rate high, Avg Depth of Target 21st pctl — a short-area,
+  high-volume possession WR) vs. Jameson Williams (Target Share 21st
+  pctl, Avg Depth of Target 90th pctl, Air Yards Share high — a
+  low-volume deep-threat WR). The rendered hexagons are visibly inverse
+  of each other, not two similar-looking shapes — real signal, not noise.
+- **Mixed-position:** adding Patrick Mahomes (QB) to the pair above
+  produced two separate canvases (`cmp-radar-WR`, `cmp-radar-QB`), the WR
+  overlay unchanged, and a solo QB radar (legend correctly hidden — only
+  shown when a group has more than one eligible player) with QB's own
+  real axes (Pass Volume ~99th pctl, moderate Yards/Carry and Scramble
+  Rate, lower EPA/Dropback and Comp % Over Expected) — never merged with
+  the WR axes.
+
+---
+
 ## Design decisions worth preserving (the "why")
 
 Things that took real conversation to arrive at — a new Claude should NOT re-litigate these unless Rohan explicitly asks:
@@ -1846,7 +1918,7 @@ assumptions as facts.
 - **Activity feed panel** sizing vs matchups panel — layout issue, minor
 - **NFL sidebar** currently shows preseason week labels; should default to last completed regular-season week
 - **Build out the Python notebook pipeline** — Phases 4 (radar) and 5 (heatmap) are both done; the outline's remaining phases (6 shipping a model, further iteration) are the only ones left unstarted
-- **Comparison tab's "Profile Overlay" placeholder** still needs wiring — Phase 4's `radar` key has the data, but overlaying multiple players' radars on one Chart.js chart (vs. Player Detail's single-player radar) wasn't part of that round; see **Phase 4 findings**. No equivalent multi-player heatmap overlay was requested or built for Phase 5 either.
+- ~~Comparison tab's "Profile Overlay" placeholder still needs wiring.~~ **Done** — one real radar per position group, never merged across positions; see the multi-player radar overlay finding further down. Field Heatmap comparison was deliberately NOT built (same finding has the reasoning) — Comparison stays radar-only.
 - **`get_pbp()` still raises a raw, unguarded `ValueError` for an unpublished season in the general case** — only `scripts/weekly_update.py`'s and `07_export_json.ipynb`'s single-current-season heatmap-building callers were fixed (see **Phase 5 findings**), matching the same narrowly-scoped-fix pattern already true of `get_weekly_stats`'s equivalent 404 case (see the `src/ingest.py`-level season guard item below, which this is the same open item as, just a second exception shape).
 - **Historical champion data** — plan is to maintain a small `champions.json` file by hand for the league's history
 - **Season archives beyond 2023-2025** — 2023, 2024, and 2025 are archived and in the selector; 2021 and 2022 were deliberately skipped (roster turnover makes them less useful for draft prep, not a technical limitation). `src/ingest.py::SEASON_LEAGUE_IDS` already has both their real league_ids, and `get_archive_candidates()` was verified against all 5 seasons before scoping down (see Phase 9 findings). Adding either later is `python scripts/archive_season.py <year>` plus one new entry in `index.html`'s `SEASON_OPTIONS` — no code changes needed, just a decision to do it.

@@ -6149,6 +6149,67 @@
     const mixedPositions = positions.length > 1;
     const colors = ['#0891b2', '#dc2626', '#059669', '#7c3aed'];
 
+    // ---- Radar overlay groups: one radar PER POSITION, never merged
+    // across positions. RADAR_METRICS (src/export.py) defines a completely
+    // different 6-axis set per position -- a QB's axes are Pass Volume/Rush
+    // Volume/Yards per Carry/Scramble Rate/EPA per Dropback/CPOE, nothing
+    // like a WR's Target Share/Air Yards Share/aDOT/Catch Rate/YAC/RZ Target
+    // Share. Overlaying two positions on one radar would plot two unrelated
+    // metrics at the same vertex under one shared label -- not an
+    // approximation, just wrong. Same-position players share the identical
+    // axis set (by construction: RADAR_METRICS is keyed by position, and
+    // every compared player's radar comes from the one currently-loaded
+    // export), so within a group the overlay is real and comparable.
+    // Each player keeps the SAME color index used by the shelf cards and
+    // the weekly line chart below (colors[i], not re-indexed per group).
+    const comparedWithRadar = compared.map((p, i) => ({ p, color: colors[i], radar: getAdvancedPlayer(p.player_id)?.radar }));
+    const radarGroups = positions.map(position => {
+      const members = comparedWithRadar.filter(m => m.p.position === position);
+      return {
+        position,
+        eligible: members.filter(m => m.radar?.eligible),
+        ineligible: members.filter(m => !m.radar?.eligible),
+      };
+    });
+
+    function radarGroupHtml(group) {
+      const { position, eligible, ineligible } = group;
+      const ineligibleNote = ineligible.length ? `
+        <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 4px;">
+          ${ineligible.map(({ p, radar }) => radar
+            ? `${p.name}: only ${radar.games_played} of ${radar.min_games} games played this season -- excluded, not enough of a sample yet.`
+            : `${p.name}: no advanced data available for this season -- excluded.`
+          ).join(' ')}
+        </div>
+      ` : '';
+
+      if (eligible.length === 0) {
+        return `
+          <div style="margin-bottom: 16px;">
+            <div class="panel-note" style="margin-bottom: 6px; font-weight: 600;">${position}</div>
+            <div class="pd-placeholder" style="padding: 14px;">
+              <div class="pd-placeholder-icon">📈</div>
+              <div class="pd-placeholder-title">No eligible ${position} to profile</div>
+              ${ineligibleNote}
+            </div>
+          </div>
+        `;
+      }
+
+      const poolSize = eligible[0].radar.pool_size;
+      return `
+        <div style="margin-bottom: 18px;">
+          <div class="panel-note" style="margin-bottom: 6px; font-weight: 600;">
+            ${position} · pool: ${poolSize} startable ${position}s
+          </div>
+          <div class="radar-wrapper" style="height: 280px;">
+            <canvas id="cmp-radar-${position}"></canvas>
+          </div>
+          ${ineligibleNote}
+        </div>
+      `;
+    }
+
     // ---- Helper: best/worst class for a stat row ----
     function cellClass(values, currentVal, lowerIsBetter = false) {
       const nums = values.filter(v => v != null && !isNaN(v));
@@ -6323,7 +6384,7 @@
       </div>
     ` : '';
 
-    // ---- Charts panel: weekly line + placeholder for radar ----
+    // ---- Charts panel: weekly line + real per-position radar overlay ----
     const chartsHtml = compared.length > 0 ? `
       <div class="pd-analytics-grid" style="margin-top: 16px;">
         <div class="panel">
@@ -6338,17 +6399,13 @@
         <div class="panel">
           <div class="panel-header">
             <div class="panel-title">${mixedPositions ? 'Profile Overlay' : `${positions[0]} Profile Overlay`}</div>
-            <div class="panel-note">Coming from your custom analytics</div>
-          </div>
-          <div class="pd-placeholder">
-            <div class="pd-placeholder-icon">📈</div>
-            <div class="pd-placeholder-title">Awaiting model output</div>
-            <div class="pd-placeholder-text">
-              Radar overlay across all ${compared.length} players will render once your
-              <code>player_advanced_stats.json</code> file provides position-profile metrics
-              (target share, snap share, aDOT, YAC, etc.).
+            <div class="panel-note">
+              ${mixedPositions
+                ? 'One radar per position -- axes are position-specific, so profiles aren\'t merged across positions'
+                : 'Percentile rank vs. startable players at this position (Phase 4 model)'}
             </div>
           </div>
+          ${radarGroups.map(radarGroupHtml).join('')}
         </div>
       </div>
     ` : '';
@@ -6493,6 +6550,55 @@
           }
         });
       }
+
+      // One radar per position group (see radarGroups above) -- each gets
+      // its own canvas (cmp-radar-<position>), so this never tries to draw
+      // two positions' axes onto a shared chart.
+      radarGroups.forEach(group => {
+        if (!group.eligible.length) return;
+        const canvas = document.getElementById(`cmp-radar-${group.position}`);
+        if (!canvas) return;
+        const eligible = group.eligible; // captured per-iteration for the tooltip closure below
+        chartInstances[`cmpRadar_${group.position}`] = new Chart(canvas, {
+          type: 'radar',
+          data: {
+            labels: eligible[0].radar.axes.map(a => a.label),
+            datasets: eligible.map(({ p, color, radar }) => ({
+              label: p.name,
+              data: radar.axes.map(a => a.percentile),
+              backgroundColor: color + '33',
+              borderColor: color,
+              pointBackgroundColor: color,
+              borderWidth: 2,
+            })),
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            scales: {
+              r: {
+                min: 0, max: 100, ticks: { stepSize: 25, showLabelBackdrop: false, font: { size: 9 } },
+                pointLabels: { font: { size: 10 } },
+                grid: { color: '#e5e9ee' }, angleLines: { color: '#e5e9ee' },
+              },
+            },
+            plugins: {
+              legend: {
+                display: eligible.length > 1,
+                position: 'top', align: 'center', labels: { font: { size: 10 }, boxWidth: 10 },
+              },
+              tooltip: {
+                callbacks: {
+                  label: function(ctx) {
+                    const axis = eligible[ctx.datasetIndex].radar.axes[ctx.dataIndex];
+                    const raw = axis.raw != null ? `${axis.raw}${axis.unit}` : '—';
+                    return `${ctx.dataset.label}: ${ordinal(axis.percentile)} pctl (${raw})`;
+                  },
+                },
+              },
+            },
+          },
+        });
+      });
     }
 
     // ---- Wire up interactions ----
