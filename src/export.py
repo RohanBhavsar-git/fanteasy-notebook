@@ -886,6 +886,7 @@ def assemble_player_advanced_stats(
     crosswalk: pd.DataFrame,
     target_season: int,
     target_week: int,
+    xfp_season: int,
     seasons_trained: list[int],
     model_version: str,
     performance: dict = PERFORMANCE_BY_POSITION,
@@ -922,6 +923,18 @@ def assemble_player_advanced_stats(
 
     `heatmap` (build_heatmap_snapshot's output) is the same shape of
     {player_id: dict} mapping as `radar`, same fallback reasoning.
+
+    `xfp_season` is which season `xfp_summary`/`weekly_xfp` actually
+    describe -- NOT always `target_season`. weekly_update.py's caller
+    falls back to `target_season - 1` while the current season has zero
+    real games played yet (see its own xfp_season comment), so the same
+    export can have `meta.season == 2026` while `xfp.fp_over_expected`
+    for every player is real 2025 data. Recorded here explicitly, as its
+    own `meta.xfp_season` field, rather than left for a reader to infer
+    from `target_season` alone -- index.html's Players table reads this
+    to label the FP Over Exp column "(2025)" whenever it differs from the
+    season actually being displayed, so a real prior-season luck number
+    is never silently mistaken for describing the season on screen.
 
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
@@ -988,6 +1001,7 @@ def assemble_player_advanced_stats(
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "season": target_season,
             "week": target_week,
+            "xfp_season": xfp_season,
             "model_version": model_version,
             "seasons_trained": seasons_trained,
             "performance": performance,

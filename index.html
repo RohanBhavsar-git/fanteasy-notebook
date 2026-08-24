@@ -5341,6 +5341,22 @@
       p.myProj = myProj?.point ?? null;
       p.myProjFloor = myProj?.floor ?? null;
       p.myProjCeiling = myProj?.ceiling ?? null;
+
+      // Trend/FP Over Exp/Volatility are SEASON-level signals from the
+      // export, not tied to the selected proj week -- read unconditionally,
+      // same as the Dashboard's Usage Trending/xFP Regression panels
+      // (see their own comments for why no getMyProj-style week gate
+      // applies here). fp_over_expected/xfp_vol are already null for QB
+      // straight from the export (xFP has no passing counterpart -- see
+      // src/usage.py::add_xfp_features), so no position check is needed
+      // here to get the "dash for QBs" behavior; it falls out for free.
+      const advanced = getAdvancedPlayer(p.player_id);
+      const trendHeadline = getPlayerTrendHeadline(advanced?.trend);
+      p.trendSignal = trendHeadline?.signal ?? null;
+      p.trendDirection = trendHeadline?.direction ?? null;
+      p.trendFeature = trendHeadline?.feature ?? null;
+      p.fpOverExp = advanced?.xfp?.fp_over_expected ?? null;
+      p.volatility = advanced?.usage?.xfp_vol ?? null;
     });
 
     // Sort
@@ -5354,6 +5370,21 @@
       if (f.sortDir === 'desc') return valA > valB ? -1 : valA < valB ? 1 : 0;
       return valA < valB ? -1 : valA > valB ? 1 : 0;
     });
+
+    // FP Over Exp reads xfp.fp_over_expected, which describes meta.xfp_season
+    // -- not necessarily the displayed season. A pre-draft/off-season weekly
+    // export falls back to the prior completed season (same reason the
+    // Dashboard's xFP Regression panel shows real numbers before this
+    // season's games exist; see assemble_player_advanced_stats's docstring
+    // in src/export.py). Disambiguate the header/tooltip rather than let it
+    // silently read as "this season" when it isn't; archived seasons always
+    // match (xfp_season == season there), so this is a no-op for them.
+    const xfpSeason = state.advancedStats?.meta?.xfp_season;
+    const xfpSeasonMismatch = xfpSeason != null && season != null && Number(xfpSeason) !== Number(season);
+    const fpOverExpLabel = xfpSeasonMismatch ? `FP Over Exp (${xfpSeason})` : 'FP Over Exp';
+    const fpOverExpTooltip = xfpSeasonMismatch
+      ? `${xfpSeason} season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection. Showing ${xfpSeason} because ${season} has no games played yet. RB/WR/TE only; xFP has no passing counterpart for QBs.`
+      : `Season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection. RB/WR/TE only; xFP has no passing counterpart for QBs.`;
 
     const teamOptions = ['ALL', ...NFL_TEAMS].sort();
     const totalRostered = state.players.filter(p => p.ownerRosterId).length;
@@ -5462,6 +5493,9 @@
               <th>Owner</th>
               <th class="right" data-sort="sleeperProj" title="Sleeper's projected fantasy points for Wk ${playerWeek}">Sleeper Proj (Wk ${playerWeek}) ${f.sortBy === 'sleeperProj' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th class="right" data-sort="myProj" title="${myProjTooltip()}">My Proj (Wk ${playerWeek}, experimental) ${f.sortBy === 'myProj' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th class="right" data-sort="trendSignal" title="This player's single biggest usage-share signal this season (target/carry/snap share vs. their own baseline) — a directional read, not a prediction. Season-level, independent of the projection week above.">Trend ${f.sortBy === 'trendSignal' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th class="right" data-sort="fpOverExp" title="${fpOverExpTooltip}">${fpOverExpLabel} ${f.sortBy === 'fpOverExp' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th class="right" data-sort="volatility" title="Week-to-week swing in this player's expected points (xFP) this season, in points — not a quality rating. RB/WR/TE only; xFP has no passing counterpart for QBs.">Volatility ${f.sortBy === 'volatility' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th>Status</th>
             </tr>
           </thead>
@@ -5477,6 +5511,15 @@
                     ? `<div style="font-size: 10px; color: var(--text-muted);">${p.myProjFloor.toFixed(1)}–${p.myProjCeiling.toFixed(1)}</div>`
                     : '')
                 : '<span style="color: var(--text-muted); font-size: 11px;" title="Custom model not loaded">—</span>';
+              const trendCell = p.trendDirection
+                ? `<span style="color: ${p.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${p.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[p.trendFeature]}</span>`
+                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+              const fpOverExpCell = p.fpOverExp != null
+                ? `<span style="font-weight: 700; color: ${p.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};">${p.fpOverExp > 0 ? '+' : ''}${p.fpOverExp.toFixed(1)}</span>`
+                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+              const volatilityCell = p.volatility != null
+                ? `<span style="font-weight: 700;">${p.volatility.toFixed(1)}</span>`
+                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
               return `
                 <tr data-player-id="${p.player_id}">
                   <td>
@@ -5490,6 +5533,9 @@
                   <td style="font-size: 12px;">${isFA ? '<span class="free-agent-pill">Free Agent</span>' : getTeamName(p.ownerRosterId)}</td>
                   <td class="right">${sleeperProjCell}</td>
                   <td class="right">${myProjCell}</td>
+                  <td class="right">${trendCell}</td>
+                  <td class="right">${fpOverExpCell}</td>
+                  <td class="right">${volatilityCell}</td>
                   <td>${p.injuryStatus ? `<span class="injury-badge ${p.injuryStatus}">${p.injuryStatus}</span>` : '<span style="color: var(--success); font-size: 11px; font-weight: 600;">●  Healthy</span>'}</td>
                 </tr>
               `;

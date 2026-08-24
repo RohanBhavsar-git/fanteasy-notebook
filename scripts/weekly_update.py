@@ -368,7 +368,7 @@ def main() -> None:
 
     payload, crosswalk_report = assemble_player_advanced_stats(
         scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, heatmap, crosswalk,
-        current_season, target_week, artifact["seasons_trained"], artifact["model_version"],
+        current_season, target_week, xfp_season, artifact["seasons_trained"], artifact["model_version"],
         performance=artifact["performance"],
         caveats=CAVEATS + WEEKLY_EXTRA_CAVEATS,
     )

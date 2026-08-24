@@ -75,8 +75,13 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > `seasonDataCache` (keyed by season number, so it can't repeat the
 > `statsByWeek` week-only cache-key collision Phase 9's own first round
 > caught) that makes re-visiting an already-loaded archive instant rather
-> than re-fetching ~900 KB every time. See **Verification status**
-> near the end before treating any pipeline claim as settled.
+> than re-fetching ~900 KB every time. The Players table also now has
+> Trend/FP Over Exp/Volatility columns (Phase 9 Round 3) surfacing the same
+> per-player signals Player Detail already showed, plus a new
+> `meta.xfp_season` export field so FP Over Exp's header/tooltip say
+> plainly when it's showing last season's number instead of this season's.
+> See **Verification status** near the end before treating any pipeline
+> claim as settled.
 
 ---
 
@@ -1534,6 +1539,55 @@ players — one per new archive:**
 All of this against the real production config (unmodified `LEAGUE_ID`),
 zero new console errors.
 
+### Round 3: Players table columns (Trend, FP Over Exp, Volatility) + `meta.xfp_season`
+
+Added three sortable columns to the Players table, surfacing signals that
+already existed in the export (and already rendered on Player Detail, see
+Phase 8 Round 3) at the list level: **Trend** (`getPlayerTrendHeadline`'s
+single biggest usage-share signal, arrow + feature label), **FP Over Exp**
+(`xfp.fp_over_expected`, RB/WR/TE only), **Volatility**
+(`usage.xfp_vol`, RB/WR/TE only). All three are season-level, read
+unconditionally like the Dashboard's own Usage Trending/xFP Regression
+panels — no `getMyProj`-style week gate. Nulls sort last in both directions
+(existing comparator, unchanged) rather than ranking as zero, which matters
+here specifically because QB is a real, common, non-outlier case for these
+two columns, not a rare edge case.
+
+**Found a real inconsistency between the three new columns while verifying
+against the live pre-draft season, and treated it as a decision rather than
+silently picking a behavior.** Trend and Volatility go fully null pre-draft
+(nothing to compute from zero games). FP Over Exp does **not** — `xfp_season`
+falls back to `current_season - 1` whenever the current season has zero
+games played (a Phase 8 Round 1 design, shared by the Dashboard's xFP
+Regression panel), so a QB-excluded RB/WR/TE cell in the pre-draft 2026
+export shows a REAL 2025 number, not a dash. Flagged this explicitly rather
+than forcing a null to match the other two columns' behavior, and asked:
+keep it consistent with the Dashboard panel (show the real prior-season
+number), or force null for a cleaner "everything's empty pre-draft" story?
+**Decision: keep it consistent with the Dashboard panel** — a real number
+with clear provenance beats hiding real data to make three columns look
+uniform.
+
+**Implemented via a new `meta.xfp_season` export field**
+(`assemble_player_advanced_stats`'s now-required `xfp_season` parameter),
+rather than leaving the mismatch implicit. `index.html` compares
+`state.advancedStats.meta.xfp_season` to the displayed `state.league.season`
+and, only when they differ, appends `(<xfp_season>)` to the column header
+and swaps in a tooltip that names both seasons and explains why. Archived
+seasons always pass `season` itself as `xfp_season` (never a fallback), so
+this is a no-op there by construction — confirmed directly: 2023/2024/2025
+all render the plain header/tooltip, only the live 2026 pre-draft season
+shows `FP Over Exp (2025)` with the disambiguating tooltip, and Trend/
+Volatility still show dashes on 2026 as expected. All 4 committed exports
+(`player_advanced_stats.json`, `archive/{2023,2024,2025}.json`) regenerated
+to carry the new field.
+
+**Table width checked directly, not assumed** — the user's stated
+preference was to drop a column rather than let the table overflow. At
+1366px, 1440px, and 1920px viewports the table stayed narrower than its
+containing panel and the page itself never scrolled horizontally; no
+column needed to be dropped.
+
 ---
 
 ## Design decisions worth preserving (the "why")
@@ -1605,6 +1659,7 @@ assumptions as facts.
 | Phase 5 heatmap zones (`receiving_zone_plays()`/`passing_zone_plays()`/`rushing_zone_plays()`, `build_heatmap_snapshot()`) derive real zones from real pbp and read correctly per position | **Verified** — replayed against the real, completed 2025 season at week 10 (point-in-time-safe history, real model artifact, real pbp): 391/555 candidates eligible, real play counts reported and spot-checked (single digits up to 168 real carries for a workhorse back). Two archetype contrasts specifically requested were confirmed on real, not hand-picked, players — Tyquan Thornton (60.7% of real targets in the two Deep zones) vs. Khalil Shakir (75%+ in Short/Behind-LOS zones, near-zero deep usage) for deep-threat-vs-slot; Josh Jacobs (real red-zone-heavy rushing, checkdown-only receiving on 28 real targets) vs. Christian McCaffrey (a similar rushing shape but 80 real targets spread across 10 zones including real intermediate/deep work) for goal-line-vs-passing-down. A real production bug was caught and fixed in the process: `nflreadpy.load_pbp()` raises `ValueError` (not the already-handled ConnectionError/404 shape) for a season with no pbp published yet, surfaced by running `scripts/weekly_update.py` for real against the live pre-draft 2026 league — fixed at that one caller (and the notebook's equivalent cell), matching where `build_weekly_scored`'s own analogous tolerance already lives, not pushed into `get_pbp` itself. Frontend verified via Playwright: correct panel titles/grid counts per position, the ineligible state renders its specific games-played reason, zero new console errors across a full click-through. See **Phase 5 findings**. |
 | Season archives + selector: `get_archive_candidates()` doesn't silently drop real historical rostered players, the generated 2025 archive is well-formed, and the UI switches every panel together with no mixed-season state | **Verified** — `get_archive_candidates()` checked directly against this league's real historical rosters for all 5 completed seasons (2021-2025): `n_with_current_team == n_crosswalk_matched` for every one, vs. 46.9%-88.8% survival if `get_export_candidates()` had been reused unmodified (see the per-season table in **Phase 9 findings**). `scripts/archive_season.py 2025` generated a real, validated 921,516-byte archive (465 players, 466/1468 radar/heatmap-eligible, crosswalk match rate 99.0%). Frontend verified via Playwright against the real production config (unmodified `LEAGUE_ID`, real committed archive): defaulted to 2025 automatically (2026 has zero real games), and on 2025 every named panel (KPI cards, radar, heatmap, opportunity shares, weekly chart) reported the same real full season for Christian McCaffrey with no partial/mixed state; switching to 2026 correctly reverted radar/heatmap to "0 of 5 games" with zero 2025 data leaking through, and the standings table correctly emptied. Also caught and fixed a real latent bug in the process: `state.statsByWeek`/`state.projectionsByWeek` were cached by week number alone, which would have let one season's per-week stats silently answer for another's after a switch — fixed by clearing both caches on every season load, verified via a full click-through of every tab in both seasons plus a mid-navigation season switch, zero new console errors. See **Phase 9 findings**. |
 | Round 2: 2023/2024 archives are well-formed, `seasonDataCache` actually prevents re-fetching (not just correct by coincidence), and it can't repeat the `statsByWeek` cache-key collision bug | **Verified** — `scripts/archive_season.py` generated real, validated archives for 2023 (933,208 bytes, 467 players) and 2024 (941,250 bytes, 461 players), both with `n_with_current_team == n_crosswalk_matched` (the same fix already proven for 2025). Two more real, well-known players spot-checked: Christian McCaffrey's real 2023 Offensive Player of the Year season (95th-98th percentile across nearly every radar axis) and Saquon Barkley's real historic 2024 2000+-rushing-yard season with Philadelphia (98th percentile Touch Volume/Yards-per-Carry, but only 14th percentile Goal-Line Share — consistent with the Eagles' real, well-documented use of Jalen Hurts' own QB sneak for goal-line scoring instead). Confirmed via Playwright that switching 2023 -> 2024 -> 2023 produces byte-identical output on both visits to 2023 AND that the second visit makes zero network requests for any `/archive/` path (checked via the browser's own request log, not inferred) — `seasonDataCache` is a `Map` keyed by season number, so it can't repeat the week-number-only collision `statsByWeek`/`projectionsByWeek` had. Zero new console errors. See **Phase 9 findings**' Round 2. |
+| Round 3: Players table Trend/FP Over Exp/Volatility columns sort/render correctly, and the new `meta.xfp_season` field correctly disambiguates FP Over Exp when it doesn't match the displayed season | **Verified** — `tests/test_export.py`'s round-trip test asserts `payload["meta"]["xfp_season"]` directly (full suite: 131 passed). All 4 committed exports regenerated with the new field: live `player_advanced_stats.json` reports `meta.season: 2026, meta.xfp_season: 2025` (the pre-draft fallback case); all 3 archives report `xfp_season == season` (2023/2024/2025, no fallback for a completed season). Frontend verified via Playwright against the real production config: on 2026, the FP Over Exp header/tooltip disambiguates (`"FP Over Exp (2025)"`, tooltip naming both seasons) and the cell shows a real carried-forward number for RB/WR/TE (e.g. `+69.2`) while Trend/Volatility correctly show dashes (no such fallback exists for them); on 2023/2024/2025 the header/tooltip are the plain, no-suffix version. Also verified independently: table width stays narrower than its panel at 1366px/1440px/1920px viewports (no column needed dropping, per the explicit ask); sorting by FP Over Exp puts null (QB) rows last in both directions, confirmed both against real rendered rows and a synthetic comparator test isolating null-vs-zero-vs-real-value ordering. Zero unexplained console errors (only the pre-existing ESPN CORS block). |
 
 ## What's outstanding
 

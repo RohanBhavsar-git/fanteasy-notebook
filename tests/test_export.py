@@ -534,7 +534,7 @@ def test_assemble_and_validate_export_round_trip():
 
     payload, report = assemble_player_advanced_stats(
         scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, heatmap, crosswalk,
-        target_season=2026, target_week=1, seasons_trained=list(range(2018, 2026)),
+        target_season=2026, target_week=1, xfp_season=2025, seasons_trained=list(range(2018, 2026)),
         model_version="test-version",
     )
 
@@ -544,6 +544,7 @@ def test_assemble_and_validate_export_round_trip():
     assert payload["players"]["5001"]["xfp"]["season_xfp"] == pytest.approx(180.0)
     assert payload["meta"]["season"] == 2026
     assert payload["meta"]["week"] == 1
+    assert payload["meta"]["xfp_season"] == 2025  # deliberately != season -- the pre-draft fallback case
 
     # weekly_xfp: grouped into {week_str: xfp}, null week dropped (not
     # zero-filled), and a player with no weekly_xfp rows at all gets {}
