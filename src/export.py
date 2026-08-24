@@ -406,6 +406,37 @@ def get_archive_candidates(historical_features: pd.DataFrame, crosswalk: pd.Data
     return candidates, report
 
 
+def get_season_team_map(historical_features: pd.DataFrame, season: int) -> pd.DataFrame:
+    """
+    Team-per-season resolution for a SEASON ARCHIVE's export -- distinct
+    from get_archive_candidates' `team` column just above. That one is
+    deliberately LAST-EVER (see its own docstring): built only to give
+    build_target_week_features a non-null stub value, where current-ness
+    never matters. This answers a different question the Draft Prep view
+    actually needs: what team was this player ON DURING `season`
+    specifically. For any archived season that isn't the most recent one
+    in historical_features, "last-ever" would silently resolve to a LATER
+    team instead of that season's real one.
+
+    Resolved from the player's last real row WITHIN `season` (their
+    end-of-season team, so a single in-season trade doesn't produce two
+    conflicting answers).
+
+    Returns one row per player_id: [player_id, season_team]. A player with
+    zero real rows in `season` simply isn't a key -- callers should treat
+    a missing player_id as "no season team on file," not assume one.
+    """
+    season_rows = historical_features[historical_features["season"] == season][["player_id", "week", "team"]]
+    resolved = (
+        season_rows.sort_values(["player_id", "week"])
+        .drop_duplicates(subset=["player_id"], keep="last")[["player_id", "team"]]
+        .rename(columns={"team": "season_team"})
+        .reset_index(drop=True)
+    )
+    resolved["season_team"] = resolved["season_team"].map(normalize_team_code)
+    return resolved
+
+
 def build_target_week_features(
     historical_features: pd.DataFrame,
     candidates: pd.DataFrame,
@@ -891,6 +922,7 @@ def assemble_player_advanced_stats(
     model_version: str,
     performance: dict = PERFORMANCE_BY_POSITION,
     caveats: list = CAVEATS,
+    season_team: pd.DataFrame | None = None,
 ) -> tuple[dict, dict]:
     """
     Joins everything onto scoped_predictions and crosswalks gsis_id ->
@@ -936,6 +968,15 @@ def assemble_player_advanced_stats(
     season actually being displayed, so a real prior-season luck number
     is never silently mistaken for describing the season on screen.
 
+    `season_team` (get_season_team_map's output, [player_id, season_team])
+    is optional and archive-only -- scripts/weekly_update.py's live export
+    never passes it, so every player's "team" key there is null; a caller
+    that wants the season this player actually played for (not their
+    current Sleeper team, which the dashboard already has from the live
+    player DB) passes it explicitly. A player missing from `season_team`
+    (shouldn't happen for a real archive candidate) gets null, not a
+    KeyError.
+
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
     not just assumed.
@@ -953,6 +994,8 @@ def assemble_player_advanced_stats(
     merged = scoped_predictions.merge(usage, on="player_id", how="left")
     merged = merged.merge(trend, on="player_id", how="left")
     merged = merged.merge(xfp_summary, on="player_id", how="left")
+    if season_team is not None:
+        merged = merged.merge(season_team, on="player_id", how="left")
     n_scoped = len(merged)
     merged = merged.merge(cw[["gsis_id", "sleeper_id"]], left_on="player_id", right_on="gsis_id", how="inner")
     n_matched = len(merged)
@@ -960,6 +1003,7 @@ def assemble_player_advanced_stats(
     players = {}
     for _, row in merged.iterrows():
         players[row["sleeper_id"]] = {
+            "team": None if pd.isna(row.get("season_team")) else row["season_team"],
             "projection": {
                 "point": round(float(row["point"]), 2),
                 "floor": round(float(row["floor"]), 2),

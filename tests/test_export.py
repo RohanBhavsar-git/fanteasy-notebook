@@ -29,6 +29,7 @@ from src.export import (  # noqa: E402
     get_archive_candidates,
     get_export_candidates,
     get_export_scope,
+    get_season_team_map,
     normalize_team_code,
     position_starter_counts,
     validate_export,
@@ -102,6 +103,30 @@ def test_get_archive_candidates_uses_last_real_team_not_current_sleeper_snapshot
         "n_with_current_team": 2,   # always == n_crosswalk_matched here, by construction
         "crosswalk_match_rate": pytest.approx(2 / 3),
     }
+
+
+def test_get_season_team_map_resolves_end_of_season_team_not_last_ever():
+    """
+    Unlike get_archive_candidates' `team` (deliberately last-ever, for
+    stub-building only), get_season_team_map answers "what team was this
+    player on DURING `season`" -- scoped to that season's own rows, so a
+    player who kept playing into a LATER season still resolves to their
+    real `season` team, not whatever came after.
+    """
+    historical_features = pd.DataFrame([
+        {"player_id": "00-0001", "season": 2025, "week": 1, "team": "TB"},
+        {"player_id": "00-0001", "season": 2025, "week": 10, "team": "TB"},  # last 2025 row -- should win for 2025
+        {"player_id": "00-0001", "season": 2026, "week": 1, "team": "SF"},   # later season -- irrelevant for 2025
+        {"player_id": "00-0002", "season": 2025, "week": 3, "team": "LAR"},  # mid-season row, needs LAR->LA
+        {"player_id": "00-0002", "season": 2024, "week": 5, "team": "DAL"},  # different season -- irrelevant
+        {"player_id": "00-0003", "season": 2024, "week": 1, "team": "KC"},   # no 2025 row at all
+    ])
+
+    result = get_season_team_map(historical_features, season=2025).set_index("player_id")
+
+    assert result.loc["00-0001", "season_team"] == "TB"
+    assert result.loc["00-0002", "season_team"] == "LA"
+    assert "00-0003" not in result.index  # honestly absent, not guessed
 
 
 def test_get_export_scope_never_drops_rostered_players_below_top_n_cutoff():
@@ -540,6 +565,10 @@ def test_assemble_and_validate_export_round_trip():
 
     assert report == {"n_scoped": 2, "n_matched": 2, "match_rate": 1.0}
     assert set(payload["players"].keys()) == {"4984", "5001"}
+    # season_team wasn't passed (the live weekly_update.py path never
+    # passes it) -- every player's "team" is honestly null, not guessed.
+    assert payload["players"]["4984"]["team"] is None
+    assert payload["players"]["5001"]["team"] is None
     assert payload["players"]["4984"]["xfp"]["season_xfp"] is None  # no xfp row for this player
     assert payload["players"]["5001"]["xfp"]["season_xfp"] == pytest.approx(180.0)
     assert payload["meta"]["season"] == 2026
@@ -583,6 +612,52 @@ def test_assemble_and_validate_export_round_trip():
 
     validation = validate_export(payload, crosswalk)
     assert validation["n_players"] == 2
+
+
+def test_assemble_player_advanced_stats_wires_season_team_when_provided():
+    """
+    scripts/archive_season.py's own path: `season_team` (get_season_team_map's
+    output) is optional and merged in on player_id -- present for a real
+    archive candidate, null for one with no row in that season's map (a
+    real crosswalk/coverage gap, not assumed away).
+    """
+    player_ids = ["00-0001", "00-0002"]
+    scoped_predictions = pd.DataFrame({
+        "player_id": player_ids,
+        "point": [15.0, 10.0], "floor": [10.0, 6.0], "ceiling": [20.0, 14.0],
+    })
+    from src.usage import TREND_SOURCE_FEATURES
+    usage = pd.DataFrame({
+        "player_id": player_ids,
+        **{col: [np.nan, np.nan] for col in export_module.USAGE_EXPORT_COLUMNS},
+    })
+    trend = pd.DataFrame({
+        "player_id": player_ids,
+        **{
+            f"{prefix}{feat}{suffix}": [np.nan, np.nan]
+            for feat in TREND_SOURCE_FEATURES
+            for prefix, suffix in [("trend_", "_current"), ("", "_trend_signal"), ("", "_trend_direction")]
+        },
+    })
+    xfp_summary = pd.DataFrame({"player_id": [], "season_xfp": [], "season_actual": [], "fp_over_expected": []})
+    weekly_xfp = pd.DataFrame({"player_id": [], "week": [], "xfp": []})
+    crosswalk = pd.DataFrame({
+        "gsis_id": player_ids,
+        "sleeper_id": ["4984", "5001"],
+    })
+    season_team = pd.DataFrame({
+        "player_id": ["00-0001"],  # 00-0002 deliberately absent -- a real coverage gap
+        "season_team": ["TB"],
+    })
+
+    payload, _ = assemble_player_advanced_stats(
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, {}, {}, crosswalk,
+        target_season=2025, target_week=19, xfp_season=2025, seasons_trained=[2025],
+        model_version="test-version", season_team=season_team,
+    )
+
+    assert payload["players"]["4984"]["team"] == "TB"
+    assert payload["players"]["5001"]["team"] is None
 
 
 def test_validate_export_catches_floor_point_ceiling_violation():

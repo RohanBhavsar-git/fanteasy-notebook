@@ -6586,6 +6586,14 @@
     TE: { volume: 0, efficiency: 5 }, // Target Share, YAC / Reception
   };
 
+  // Mirrors src/export.py's SLEEPER_TO_NFLVERSE_TEAM exactly -- an
+  // archive's players[id].team comes from weekly_features (nflverse
+  // codes, via get_season_team_map), while the live player DB's team
+  // comes straight from Sleeper. Only known divergence is the Rams; keep
+  // this in lockstep with the Python constant if that ever changes.
+  const SLEEPER_TO_NFLVERSE_TEAM = { LAR: 'LA' };
+  function normalizeTeamCode(team) { return SLEEPER_TO_NFLVERSE_TEAM[team] || team; }
+
   // Returns the export JSON for an archived season, preferring
   // seasonDataCache (free if the main season selector already loaded that
   // archive) and falling back to a direct, lightweight fetch of just the
@@ -6661,9 +6669,12 @@
     // get_archive_candidates() (src/export.py) only includes players with
     // a real historical row for THIS season, so a player who entered the
     // league afterward simply isn't a key in advanced.players at all.
-    // `team` is Sleeper's CURRENT team (this endpoint isn't season-scoped)
-    // -- deliberately shown as-is rather than guessed at for the archived
-    // season, with the mismatch called out plainly in the banner below.
+    // `pd.team` is this player's REAL season team (get_season_team_map,
+    // resolved from their own last weekly_features row within THIS
+    // season) -- season-scoped, unlike the live player DB's `raw.team`
+    // (Sleeper's current snapshot, unrelated to which season is on
+    // screen). The two are compared below so a real trade since shows up
+    // as a per-player flag instead of the old blanket disclaimer.
     const totalCandidates = Object.keys(advanced.players || {}).length;
     let rows = Object.entries(advanced.players || {}).map(([playerId, pd]) => {
       const raw = playerDb[playerId];
@@ -6673,11 +6684,16 @@
       const volumeAxis = axes ? axes[condensed.volume] : null;
       const efficiencyAxis = axes ? axes[condensed.efficiency] : null;
       const trendHeadline = getPlayerTrendHeadline(pd.trend);
+      const currentTeam = raw.team || null;
+      const seasonTeam = pd.team || currentTeam || 'FA'; // pd.team missing only for a real crosswalk gap
+      const teamChanged = !!(pd.team && currentTeam && pd.team !== normalizeTeamCode(currentTeam));
       return {
         playerId,
         name: raw.full_name || `${raw.first_name || ''} ${raw.last_name || ''}`.trim() || 'Unknown',
         position: raw.position,
-        team: raw.team || 'FA',
+        team: seasonTeam,
+        currentTeam: currentTeam || 'FA',
+        teamChanged,
         seasonPts: pd.xfp?.season_actual ?? null,
         gamesPlayed: pd.radar?.games_played ?? pd.heatmap?.games_played ?? null,
         fpOverExp: pd.xfp?.fp_over_expected ?? null,
@@ -6739,9 +6755,10 @@
         usage and outcomes that already happened, meant to inform a draft, not predict one.</div>
         <div>⚠️ <strong>Rookies aren't shown</strong> -- they have no real ${season} games to describe, so they
         simply aren't in this data.</div>
-        <div>⚠️ <strong>Team shown is current, not ${season}'s</strong> -- a player who's since changed teams,
-        or whose offense/QB situation has changed, carries stats that describe a role that may no longer apply.
-        Check their real 2026 situation before trusting the number.</div>
+        <div>⚠️ <strong>Team shown is the real ${season} team.</strong> A player flagged "since moved" is on a
+        different team now -- stats that described one offense don't necessarily carry over to another. Even a
+        player who stayed put can have a changed role (new QB, new coordinator, new competition for touches) these
+        numbers can't detect.</div>
       </div>
 
       <div class="filters-bar">
@@ -6784,7 +6801,11 @@
                       <span class="pos-badge ${r.position}" style="font-size: 9px; padding: 1px 4px;">${r.position}</span>
                       <div>
                         <div style="font-weight: 600;">${r.name}</div>
-                        <div style="font-size: 11px; color: var(--text-muted);">${r.team}</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">
+                          ${r.team}${r.teamChanged
+                            ? ` <span style="color: var(--warning); font-weight: 600;" title="Now on ${r.currentTeam}">⚠ since moved to ${r.currentTeam}</span>`
+                            : ''}
+                        </div>
                       </div>
                     </div>
                   </td>

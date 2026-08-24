@@ -1685,26 +1685,38 @@ change was needed — Season Pts and Games Played are real and populated for
 all four positions, unlike FP Over Exp/Volatility which correctly dash for
 QB.
 
-**The "changed teams" caveat is a static banner, not a per-player
-computed flag — a real data limitation, stated plainly rather than
-papered over with a guess.** The export carries no team field at all
-(`assemble_player_advanced_stats`'s payload never includes one); the ONLY
-team data available client-side is `state.players[i].team`, sourced from
-`fetchPlayerDatabase()` — Sleeper's live player DB, which is NOT
-season-scoped and returns today's team regardless of which season's bundle
-requests it. This means an archived bundle's own player records carry
-IDENTICAL team data to the live bundle's (same underlying live endpoint,
-fetched fresh either way) — there is no season-accurate historical team
-signal available anywhere in the current pipeline to diff against.
-Building one would mean exporting team-per-season from nflverse data, a
-real Python pipeline change, out of scope for what was asked (a UI
-addition consuming the existing archives). Team shown is deliberately
-CURRENT (the more useful thing to show regardless), with the mismatch risk
-named explicitly in the banner rather than hidden. Rookies needed no
+**The "changed teams" caveat started as a static banner, then became a
+real per-player computed flag once the upstream data turned out to
+already exist.** The original build (above finding, since superseded)
+reasoned there was no season-accurate team signal anywhere in the
+pipeline to diff against — wrong: `get_archive_candidates()` (used to
+build the archive's stub rows) was already resolving a team from each
+candidate's own historical row, just not scoped to the archived season
+specifically (it deliberately takes the player's LAST-EVER row, correct
+only for the pipeline's most-recently-archived season by coincidence,
+silently wrong for any earlier one, e.g. 2023/2024 once those archives
+existed too). `get_season_team_map()` (`src/export.py`) fixes the scoping
+— last real row WITHIN the target season, not ever — and
+`assemble_player_advanced_stats` now exports it as `players[id].team`
+when `archive_season.py` passes it (the live weekly export still omits
+it; there's no comparable "current team" ambiguity on that path).
+`index.html` compares this real season team against
+`fetchPlayerDatabase()`'s current Sleeper team (normalizing Sleeper's
+`LAR` to nflverse's `LA` client-side, mirroring `SLEEPER_TO_NFLVERSE_TEAM`
+in `src/export.py` — Davante Adams' 2025 `LA` vs. current `LAR` would
+otherwise false-positive as a move) and renders a "since moved to X"
+marker inline per player, rather than a blanket disclaimer. The banner
+stays, narrowed to what it can't compute (a stayed-put player's role can
+still have changed — new QB, new coordinator, new competition for
+touches) plus the still-accurate rookie note. Rookies needed no
 equivalent flag: `get_archive_candidates()` only includes players with a
 real historical row for that season, so a player who entered the league
 afterward simply isn't a key in the export at all — verified structurally,
-not by filtering.
+not by filtering. Verified against the real regenerated 2023/2024/2025
+archives: Mike Evans (TB all three seasons, flagged vs. current SF),
+Davante Adams (LV→NYJ→LA across the three, each flagged against whichever
+didn't match current LAR/LA), Christian McCaffrey and Calvin Ridley
+(2024-2025) correctly unflagged as real non-movers.
 
 **Verified against the real, committed 2025 archive — top fade and
 buy-low candidates sanity-checked by real-world characterization, same
@@ -1726,11 +1738,10 @@ method as Phase 4's radar spot-checks:**
   unlucky/injury-affected year, not a decline in role." Jerry Jeudy (−58.2,
   full 17 games played) — real volume converted poorly, consistent with a
   real, well-documented weak QB situation in Cleveland. Mike Evans (−28.1,
-  only 8 games) — shown on SF, not his long-time Tampa Bay team, a live
-  demonstration of exactly why the "team shown is current, not the
-  archived season's" caveat needed to be visible, combined with an
-  injury-shortened sample the Games Played column makes visible rather
-  than hidden.
+  only 8 games) — real 2025 team TB, flagged "since moved to SF" now that
+  the team-per-season fix (above) makes that a computed fact rather than a
+  guess, combined with an injury-shortened sample the Games Played column
+  makes visible rather than hidden.
 
 **Frontend verified via Playwright against the real production config**
 (unmodified `LEAGUE_ID`, real committed archives): zero console errors

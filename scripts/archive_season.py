@@ -30,8 +30,8 @@ Run manually, per season, as new seasons complete:
 
 See src/ingest.py's SEASON_LEAGUE_IDS for which seasons are currently
 archivable (this league's real Sleeper history) and PROJECT_CONTEXT.md's
-Phase 9 findings (season archives + selector) for why only 2025 is
-actually shipped as of this writing despite 2021-2024 also existing in
+Phase 9 findings (season archives + selector) for why only 2023-2025 are
+actually shipped as of this writing despite 2021-2022 also existing in
 SEASON_LEAGUE_IDS.
 """
 
@@ -51,7 +51,7 @@ from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
     CAVEATS, assemble_player_advanced_stats, build_heatmap_snapshot, build_radar_snapshot,
     build_target_week_features, build_trend_snapshot, build_usage_snapshot, build_weekly_xfp, build_xfp_summary,
-    get_archive_candidates, get_export_scope, predict_target_week_from_artifact, validate_export,
+    get_archive_candidates, get_export_scope, get_season_team_map, predict_target_week_from_artifact, validate_export,
 )
 from src.ingest import (  # noqa: E402
     DATA_OUTPUT, SEASON_LEAGUE_IDS, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
@@ -133,6 +133,9 @@ def main() -> None:
     if candidates.empty:
         raise RuntimeError("Zero archive candidates -- aborting rather than writing an empty archive.")
 
+    season_team = get_season_team_map(weekly_features, season)
+    print(f"    season-team map: {len(season_team)} players resolved to their real {season} team")
+
     print("[4/6] Building target-week features and predicting...")
     combined_features = build_target_week_features(weekly_features, candidates, schedule_season, season, target_week)
     predictions = predict_target_week_from_artifact(combined_features, season, target_week, artifact)
@@ -171,6 +174,7 @@ def main() -> None:
         season, target_week, season, artifact["seasons_trained"], artifact["model_version"],
         performance=artifact["performance"],
         caveats=CAVEATS + ARCHIVE_EXTRA_CAVEATS,
+        season_team=season_team,
     )
     payload["simulation"] = None  # a hypothetical post-season week has no real matchups to simulate
     print(f"    crosswalk match rate: {crosswalk_report}")
