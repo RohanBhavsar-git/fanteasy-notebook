@@ -80,6 +80,16 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > per-player signals Player Detail already showed, plus a new
 > `meta.xfp_season` export field so FP Over Exp's header/tooltip say
 > plainly when it's showing last season's number instead of this season's.
+> Phase 10 (Draft Prep) is also done — a sub-view under the Draft tab,
+> alongside the existing (retrospective) Draft Board, that reviews a
+> completed season's real usage and luck for draft prep purposes.
+> Explicitly NOT a season-long forecast (this pipeline only projects one
+> week at a time) and says so in a banner, along with two caveats that
+> materially affect draft decisions: rookies aren't in the data at all,
+> and the team shown is a player's CURRENT team, not necessarily the one
+> their stats describe — see **Phase 10 findings** for why that second one
+> couldn't be a computed per-player flag with data this pipeline currently
+> has.
 > See **Verification status** near the end before treating any pipeline
 > claim as settled.
 
@@ -177,6 +187,7 @@ These are non-negotiable — they've shaped every decision we've made:
 - Owner handles from Sleeper user data
 
 ### Draft tab
+- Two sub-views (Phase 10): **Draft Board** (this league's own completed draft, retrospective) and **Draft Prep** (a completed season's real usage/luck, prospective — see below). Defaults to whichever has something to show on first visit; the choice persists across season switches.
 - Fixed team columns (never shuffle per round) with snake pick numbers conveying direction
 - **3rd Round Reversal support** — `draft.settings.reversal_round` respected; rounds 2 through reversal_round all reverse, then snake resumes
 - Real Sleeper draft picks (`/draft/{id}/picks`)
@@ -184,6 +195,7 @@ These are non-negotiable — they've shaped every decision we've made:
 - No per-pick "traded" badges (Sleeper's data produces false positives; the standalone Pick Trades panel is the honest place for that info)
 - Position distribution by round, First Off Board milestones, Position Runs panel
 - Grid uses explicit cell borders (not gap-as-border trick) for reliable gridlines regardless of content overflow
+- **Draft Prep** (Phase 10) — sortable/filterable table of a completed season's Season Pts, FP Over Exp, Volatility, condensed radar (Volume/Efficiency percentile), and end-of-season Trend, per player. Own independent season picker (archived seasons only, defaults to most recent). Explicitly framed as a season review, not a 2026 projection; two caveats shown in a banner, not buried: rookies aren't in the data, and the team shown is current, not necessarily the season's. See **Phase 10 findings**.
 
 ### Injury Report tab
 - Compact table grouped by status (IR / Out / Doubtful / Questionable / PUP / Inactive / Suspended)
@@ -1590,6 +1602,154 @@ column needed to be dropped.
 
 ---
 
+## Phase 10 findings — Draft Prep
+
+**The problem this fixes, framed the way it was asked for:** a draft needs
+season-long value ("how many points over 17 weeks"), which this pipeline
+doesn't model — Phase 6's model projects one week ahead, and a season-long
+model would be a materially different, unbuilt thing. Draft Prep doesn't
+pretend otherwise: it's explicitly a review of last season's real usage and
+luck, not a 2026 forecast, and says so in a banner rather than a footnote.
+
+**Where it lives — a sub-view under the existing Draft tab, not a new
+top-level tab.** Draft Board (this league's own completed draft,
+retrospective) and Draft Prep (last season's real usage/luck, prospective)
+are used at opposite ends of the same event and don't need separate nav
+real estate for something used briefly once a year. More concretely: the
+Draft tab is otherwise dead for most of the year — before a draft, it has
+nothing to show (confirmed live: this league's real 2026 draft is
+`pre_draft`, 0 real picks); after one, Draft Prep has nothing useful to add
+until the following off-season. Each fills exactly the other's dead time.
+Defaults to whichever sub-view actually has something to show the FIRST
+time a session visits the Draft tab (`hasDraftBoard = draft && picks.length
+> 0`) — verified both ways: with the default season (2025, which has a
+real completed draft) it opens on Draft Board; switching to 2026 (real
+`pre_draft`, 0 picks) *before* the first Draft-tab visit opens on Draft
+Prep instead. The tab choice persists across season switches once made
+(same as the pre-existing Grid/List toggle), rather than re-deciding itself
+every time — a UI preference, not a per-season computation.
+
+**Data loading deliberately bypasses `fetchAllRealData()`.** That function
+fetches a full season bundle (matchups for every week, transactions, draft
+picks, brackets, league/rosters/users) — none of which Draft Prep reads.
+`getArchivedExport()` instead fetches just two things: the archive's own
+export JSON (`SEASON_OPTIONS[...].exportPath`, ~900 KB) and the Sleeper
+player DB (`fetchPlayerDatabase()`, already cached from page load in the
+overwhelming majority of sessions) for name/position/team. It still
+opportunistically reuses `seasonDataCache` first when the main season
+selector has already loaded that archive (the common case, since
+`determineDefaultSeason()` already defaults to the most recent completed
+season whenever the live season has zero games) — so in practice this view
+usually costs zero extra network requests, and `archivedExportCache` (a
+second, lighter season-keyed cache) only fires when it hasn't.
+
+**Kept independent of the main season selector on purpose, not coupled to
+it.** Draft Prep has its own season dropdown (`state.draftPrepSeason`,
+archived seasons only, defaulting to the most recent one) rather than
+mirroring `state.selectedSeason`. Reasoning: draft prep is always about
+"last completed season," and once the live season has real games — exactly
+when the main selector's own default flips to it — that's precisely when
+pointing Draft Prep at the same season would stop being useful. Switching
+the main selector never resets Draft Prep's chosen season and vice versa;
+confirmed directly (2025 → 2024 → 2023 → 2025 in the Draft Prep dropdown
+each returned distinct, correct real data, independent of what the main
+dashboard was showing). Row click is the one place they intentionally
+reconnect: clicking a player calls `switchSeason()` on the WHOLE dashboard
+to Draft Prep's season first (if it isn't already showing it), then opens
+Player Detail — so a buy-low candidate never opens into a detail page still
+showing a different season's radar/heatmap/KPIs, the same no-mixed-state
+rule Phase 9 established everywhere else.
+
+**Condensed radar: two axes per position (volume, efficiency), chosen by a
+consistent rule, not one arbitrary choice per position.** Volume = the
+single most direct opportunity measure (Pass Attempts for QB, Touches for
+RB, Target Share for WR/TE); efficiency = the single best "how good per
+opportunity" summary stat (EPA/Dropback for QB, Yards/Carry for RB,
+YAC/Reception for WR/TE). Selected by index into `radar.axes`, which
+`build_radar_snapshot` emits in `RADAR_METRICS`' declared order (src/export.py)
+— `RADAR_CONDENSED_AXES` in `index.html` must stay in lockstep with that
+dict if it's ever reordered.
+
+**"Actual points" needed a position-independent source, and one already
+existed — checked directly rather than assumed.** `xfp.fp_over_expected`/
+`usage.xfp_vol` are RB/WR/TE only, but a first look at `xfp.season_actual`
+suggested the same gap for QB (several high-value entries showed
+`season_xfp: null` alongside a real `season_actual`). Traced to
+`build_xfp_summary` (`src/export.py`): it groups BOTH `xfp` and
+`custom_points` together, and `custom_points` is real for every position
+— QB's `season_xfp` is null (xFP has no passing counterpart) but
+`season_actual` (real `custom_points.sum()`) is not. Confirmed against the
+real 2025 archive: Patrick Mahomes (281.18 pts), Matthew Stafford (344.38),
+Dak Prescott (226.44) all carry real, correct season totals. No Python
+change was needed — Season Pts and Games Played are real and populated for
+all four positions, unlike FP Over Exp/Volatility which correctly dash for
+QB.
+
+**The "changed teams" caveat is a static banner, not a per-player
+computed flag — a real data limitation, stated plainly rather than
+papered over with a guess.** The export carries no team field at all
+(`assemble_player_advanced_stats`'s payload never includes one); the ONLY
+team data available client-side is `state.players[i].team`, sourced from
+`fetchPlayerDatabase()` — Sleeper's live player DB, which is NOT
+season-scoped and returns today's team regardless of which season's bundle
+requests it. This means an archived bundle's own player records carry
+IDENTICAL team data to the live bundle's (same underlying live endpoint,
+fetched fresh either way) — there is no season-accurate historical team
+signal available anywhere in the current pipeline to diff against.
+Building one would mean exporting team-per-season from nflverse data, a
+real Python pipeline change, out of scope for what was asked (a UI
+addition consuming the existing archives). Team shown is deliberately
+CURRENT (the more useful thing to show regardless), with the mismatch risk
+named explicitly in the banner rather than hidden. Rookies needed no
+equivalent flag: `get_archive_candidates()` only includes players with a
+real historical row for that season, so a player who entered the league
+afterward simply isn't a key in the export at all — verified structurally,
+not by filtering.
+
+**Verified against the real, committed 2025 archive — top fade and
+buy-low candidates sanity-checked by real-world characterization, same
+method as Phase 4's radar spot-checks:**
+- **Fades (scored well above what usage implied):** Puka Nacua (+75.5 over,
+  310.5 actual) and Jaxon Smith-Njigba (+61.6) — young, ascending, already
+  high-target-share WRs where a real efficiency/TD-rate outperformance
+  rides on top of legitimately elite volume, the standard "still great, but
+  some of this won't repeat" fade case. Jahmyr Gibbs (+69.2) and De'Von
+  Achane (+56.1) — explosive, big-play RBs, where long-touchdown variance
+  characteristically inflates actual points past what a touch/yardage-based
+  model predicts. Several smaller-volume names (KaVontae Turpin, Greg
+  Dortch) also surfaced — exactly the "hit a few big plays on a low-volume
+  role" case a fade list should catch, not just recognizable stars.
+- **Buy-lows (scored well below what usage implied):** Justin Jefferson
+  (−46.2 over, only 159.5 actual despite 205.7 xFP) — one of the league's
+  most talented WRs, real target volume implied by his own xFP, well below
+  his real career level; textbook "legitimately talented player having an
+  unlucky/injury-affected year, not a decline in role." Jerry Jeudy (−58.2,
+  full 17 games played) — real volume converted poorly, consistent with a
+  real, well-documented weak QB situation in Cleveland. Mike Evans (−28.1,
+  only 8 games) — shown on SF, not his long-time Tampa Bay team, a live
+  demonstration of exactly why the "team shown is current, not the
+  archived season's" caveat needed to be visible, combined with an
+  injury-shortened sample the Games Played column makes visible rather
+  than hidden.
+
+**Frontend verified via Playwright against the real production config**
+(unmodified `LEAGUE_ID`, real committed archives): zero console errors
+across a full click-through (default-tab logic in both directions, season
+switching 2025→2024→2023→2025, position filter, search, sort — including
+an isolated synthetic-array re-confirmation that the shared null-last
+comparator treats QB's null FP Over Exp/Volatility distinctly from a real
+`0`, in both sort directions, matching the Players table's own already-
+verified behavior), the pre-existing Grid/List draft-board toggle
+unaffected by the new Board/Prep toggle sharing the same `.view-toggle-btn`
+CSS class (fixed a real selector collision this surfaced — the Grid/List
+listener was matching `.view-toggle-btn` unscoped, which would have also
+matched the new toggle's buttons and corrupted `state.draftView`; scoped
+to `.view-toggle-btn[data-view]`), table width fits its panel at 1440px,
+and row click correctly drills into Player Detail after switching the
+whole dashboard to the clicked player's season.
+
+---
+
 ## Design decisions worth preserving (the "why")
 
 Things that took real conversation to arrive at — a new Claude should NOT re-litigate these unless Rohan explicitly asks:
@@ -1660,6 +1820,7 @@ assumptions as facts.
 | Season archives + selector: `get_archive_candidates()` doesn't silently drop real historical rostered players, the generated 2025 archive is well-formed, and the UI switches every panel together with no mixed-season state | **Verified** — `get_archive_candidates()` checked directly against this league's real historical rosters for all 5 completed seasons (2021-2025): `n_with_current_team == n_crosswalk_matched` for every one, vs. 46.9%-88.8% survival if `get_export_candidates()` had been reused unmodified (see the per-season table in **Phase 9 findings**). `scripts/archive_season.py 2025` generated a real, validated 921,516-byte archive (465 players, 466/1468 radar/heatmap-eligible, crosswalk match rate 99.0%). Frontend verified via Playwright against the real production config (unmodified `LEAGUE_ID`, real committed archive): defaulted to 2025 automatically (2026 has zero real games), and on 2025 every named panel (KPI cards, radar, heatmap, opportunity shares, weekly chart) reported the same real full season for Christian McCaffrey with no partial/mixed state; switching to 2026 correctly reverted radar/heatmap to "0 of 5 games" with zero 2025 data leaking through, and the standings table correctly emptied. Also caught and fixed a real latent bug in the process: `state.statsByWeek`/`state.projectionsByWeek` were cached by week number alone, which would have let one season's per-week stats silently answer for another's after a switch — fixed by clearing both caches on every season load, verified via a full click-through of every tab in both seasons plus a mid-navigation season switch, zero new console errors. See **Phase 9 findings**. |
 | Round 2: 2023/2024 archives are well-formed, `seasonDataCache` actually prevents re-fetching (not just correct by coincidence), and it can't repeat the `statsByWeek` cache-key collision bug | **Verified** — `scripts/archive_season.py` generated real, validated archives for 2023 (933,208 bytes, 467 players) and 2024 (941,250 bytes, 461 players), both with `n_with_current_team == n_crosswalk_matched` (the same fix already proven for 2025). Two more real, well-known players spot-checked: Christian McCaffrey's real 2023 Offensive Player of the Year season (95th-98th percentile across nearly every radar axis) and Saquon Barkley's real historic 2024 2000+-rushing-yard season with Philadelphia (98th percentile Touch Volume/Yards-per-Carry, but only 14th percentile Goal-Line Share — consistent with the Eagles' real, well-documented use of Jalen Hurts' own QB sneak for goal-line scoring instead). Confirmed via Playwright that switching 2023 -> 2024 -> 2023 produces byte-identical output on both visits to 2023 AND that the second visit makes zero network requests for any `/archive/` path (checked via the browser's own request log, not inferred) — `seasonDataCache` is a `Map` keyed by season number, so it can't repeat the week-number-only collision `statsByWeek`/`projectionsByWeek` had. Zero new console errors. See **Phase 9 findings**' Round 2. |
 | Round 3: Players table Trend/FP Over Exp/Volatility columns sort/render correctly, and the new `meta.xfp_season` field correctly disambiguates FP Over Exp when it doesn't match the displayed season | **Verified** — `tests/test_export.py`'s round-trip test asserts `payload["meta"]["xfp_season"]` directly (full suite: 131 passed). All 4 committed exports regenerated with the new field: live `player_advanced_stats.json` reports `meta.season: 2026, meta.xfp_season: 2025` (the pre-draft fallback case); all 3 archives report `xfp_season == season` (2023/2024/2025, no fallback for a completed season). Frontend verified via Playwright against the real production config: on 2026, the FP Over Exp header/tooltip disambiguates (`"FP Over Exp (2025)"`, tooltip naming both seasons) and the cell shows a real carried-forward number for RB/WR/TE (e.g. `+69.2`) while Trend/Volatility correctly show dashes (no such fallback exists for them); on 2023/2024/2025 the header/tooltip are the plain, no-suffix version. Also verified independently: table width stays narrower than its panel at 1366px/1440px/1920px viewports (no column needed dropping, per the explicit ask); sorting by FP Over Exp puts null (QB) rows last in both directions, confirmed both against real rendered rows and a synthetic comparator test isolating null-vs-zero-vs-real-value ordering. Zero unexplained console errors (only the pre-existing ESPN CORS block). |
+| Phase 10 Draft Prep: default-tab logic, independent season selection, condensed radar axis mapping, and the null-last sort comparator all behave correctly; the fade/buy-low signal is characterizable on real players | **Verified** — Playwright against the real production config (unmodified `LEAGUE_ID`, real committed archives): default sub-tab correctly follows `hasDraftBoard` in both directions (opens on Draft Board when the active season has a real completed draft — true for the default 2025 season; opens on Draft Prep when it doesn't — confirmed by switching to the real, `pre_draft`, 0-picks 2026 league before the Draft tab's first visit in a fresh session). Season switching 2025→2024→2023→2025 in Draft Prep's own dropdown returned distinct, correct real data each time, independent of the main season selector's own value throughout. An isolated synthetic-array test of the exact comparator confirmed nulls sort strictly last in both directions, distinct from a real `0` (same guarantee already proven for the Players table's identical comparator). Fixed one real regression this surfaced: the new Board/Prep toggle shares the `.view-toggle-btn` CSS class with the pre-existing Grid/List toggle, and the old unscoped `.view-toggle-btn` listener would have matched the new buttons too and corrupted `state.draftView` — scoped to `.view-toggle-btn[data-view]`; confirmed both toggles now operate independently with no cross-talk. `xfp.season_actual` (Season Pts) confirmed real and correctly populated for QB despite `season_xfp` being null (traced to `build_xfp_summary` summing `custom_points` and `xfp` as separate columns, not gated together) — spot-checked against Mahomes/Stafford/Prescott's real 2025 season totals, no Python change needed. Top fade candidates (Puka Nacua +75.5, Jahmyr Gibbs +69.2, De'Von Achane +56.1) and top buy-low candidates (Justin Jefferson −46.2, Jerry Jeudy −58.2, Mike Evans −28.1) from the real 2025 archive all characterize plausibly against real-world player profiles (ascending/explosive players outperforming a touch-volume model, established talents having injury/situational down years) — see **Phase 10 findings** for the full list and reasoning. Table width fits its panel at 1440px. Zero unexplained console errors throughout. |
 
 ## What's outstanding
 

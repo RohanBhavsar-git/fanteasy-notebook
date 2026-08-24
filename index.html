@@ -2537,6 +2537,9 @@
     compareIds: [],
     draftView: 'grid',
     draftFilter: { team: 'ALL', round: 'ALL', position: 'ALL' },
+    draftTab: null,          // 'board' | 'prep' -- defaulted in renderDraftView based on whether a draft board exists
+    draftPrepSeason: null,   // which ARCHIVED season Draft Prep shows -- independent of the main season selector
+    draftPrepFilters: { search: '', position: 'ALL', sortBy: 'seasonPts', sortDir: 'desc' },
     injuryFilter: { status: 'ALL', position: 'ALL', owner: 'ALL' },
     injuryRiskWeek: null,   // which week the lineup-risk panel displays; null = current week
     compareFilters: { search: '', position: 'ALL', team: 'ALL', owner: 'ALL', injury: 'ALL', sortBy: 'sleeperProj', sortDir: 'desc' },
@@ -2564,6 +2567,18 @@
   // construction: switching 2023 -> 2024 -> 2023 always reads the entry
   // stored under the key 2023, never anything cached under 2024.
   const seasonDataCache = new Map();
+
+  // Draft Prep (below, renderDraftPrepSection) needs only an archived
+  // season's export + the Sleeper player DB for name/position/team -- not
+  // the full fetchAllRealData() bundle (matchups, transactions, draft,
+  // brackets), which it never reads. archivedExportCache is a lightweight,
+  // season-keyed fallback for when seasonDataCache doesn't already have
+  // that season's bundle cached (checked first -- free reuse whenever the
+  // main season selector already loaded that archive). draftPrepFetching
+  // dedupes concurrent fetch triggers the same way statsFetching/
+  // projectionsFetching already do for their own caches.
+  const archivedExportCache = new Map();
+  const draftPrepFetching = new Set();
 
   // ============================================
   // TOAST + COMPARE HELPERS
@@ -6537,21 +6552,341 @@
     });
   }
 
+  // ----- DRAFT PREP -----
+  // Explicitly NOT a season-long forecast: the model (Phase 6/8) projects
+  // one week ahead, and there's no season-long value model in this
+  // pipeline -- that would be a materially different model this project
+  // doesn't have. This view answers a narrower, honest question instead:
+  // what did this player's REAL usage and luck look like last season?
+  // Every number here describes a season that already happened, meant to
+  // inform a draft, not predict one.
+  //
+  // Reads directly from an archived season's export (SEASON_OPTIONS'
+  // exportPath) plus the live Sleeper player DB for name/position/team --
+  // deliberately NOT the full fetchAllRealData() bundle (matchups,
+  // transactions, draft picks, brackets), none of which this view needs.
+  // Kept independent of the main season selector on purpose: draft prep
+  // is always about "last completed season" regardless of which season
+  // the rest of the dashboard happens to be showing -- which, once the
+  // live season has real games, will usually be the CURRENT season,
+  // exactly when pointing this view there would be least useful.
+
+  // Condensed radar: each position's own 6-axis RADAR_METRICS
+  // (src/export.py) reduced to one "volume" axis (how much opportunity)
+  // and one "efficiency" axis (how good with it), by INDEX into
+  // radar.axes -- build_radar_snapshot emits axes in RADAR_METRICS'
+  // declared order, so this must stay in lockstep with that dict if it
+  // ever changes. Chosen consistently across positions: volume = the
+  // single most direct opportunity measure (attempts/touches/targets),
+  // efficiency = the single best "how good per opportunity" summary stat.
+  const RADAR_CONDENSED_AXES = {
+    QB: { volume: 0, efficiency: 4 }, // Pass Volume, EPA / Dropback
+    RB: { volume: 0, efficiency: 3 }, // Touch Volume, Yards / Carry
+    WR: { volume: 0, efficiency: 4 }, // Target Share, YAC / Reception
+    TE: { volume: 0, efficiency: 5 }, // Target Share, YAC / Reception
+  };
+
+  // Returns the export JSON for an archived season, preferring
+  // seasonDataCache (free if the main season selector already loaded that
+  // archive) and falling back to a direct, lightweight fetch of just the
+  // export file otherwise -- never the full fetchAllRealData() bundle,
+  // which this view has no use for. Returns null while a fetch is in
+  // flight or hasn't been triggered yet; callers re-render once it
+  // resolves (same fetch-then-rerender pattern as fetchWeekProjections).
+  function getArchivedExport(season) {
+    const cached = seasonDataCache.get(season)?.advancedStats || archivedExportCache.get(season);
+    if (cached) return cached;
+    if (!draftPrepFetching.has(season)) {
+      draftPrepFetching.add(season);
+      const seasonOption = SEASON_OPTIONS.find(s => s.season === season);
+      fetchJSON(seasonOption.exportPath)
+        .then(data => { archivedExportCache.set(season, data); state.draftPrepError = null; })
+        .catch(err => {
+          console.error(`Draft Prep: failed to load the ${season} archive:`, err);
+          state.draftPrepError = err.message;
+        })
+        .finally(() => { draftPrepFetching.delete(season); renderView(); });
+    }
+    return null;
+  }
+
+  function renderDraftPrepSection(main, tabToggleHtml) {
+    const archivedOptions = SEASON_OPTIONS.filter(s => !s.live).slice().sort((a, b) => b.season - a.season);
+
+    if (archivedOptions.length === 0) {
+      main.innerHTML = tabToggleHtml + `
+        <div class="page-header-row"><div><div class="page-title">Draft Prep</div></div></div>
+        <div class="panel"><div class="placeholder-content">
+          <h3>📁 No completed seasons archived yet</h3>
+          <p>Draft Prep needs at least one finished season's real usage data. Check back once a season archive exists.</p>
+        </div></div>
+      `;
+      return;
+    }
+
+    // Default to the most recently COMPLETED season, independent of
+    // whatever the main season selector currently shows.
+    if (state.draftPrepSeason == null || !archivedOptions.some(o => o.season === state.draftPrepSeason)) {
+      state.draftPrepSeason = archivedOptions[0].season;
+    }
+    const season = state.draftPrepSeason;
+    const f = state.draftPrepFilters;
+
+    const advanced = getArchivedExport(season);
+    if (!advanced) {
+      main.innerHTML = tabToggleHtml + `
+        <div class="page-header-row"><div><div class="page-title">Draft Prep</div></div></div>
+        ${state.draftPrepError
+          ? `<div class="panel"><div class="placeholder-content">
+               <h3 style="color: var(--danger);">⚠️ Couldn't load the ${season} archive</h3>
+               <p>${state.draftPrepError}</p>
+             </div></div>`
+          : `<div class="loading"><div class="spinner"></div>Loading ${season} season data...</div>`}
+      `;
+      return;
+    }
+
+    if (!_playerDbCache) {
+      fetchPlayerDatabase().then(() => renderView());
+      main.innerHTML = tabToggleHtml + `
+        <div class="page-header-row"><div><div class="page-title">Draft Prep</div></div></div>
+        <div class="loading"><div class="spinner"></div>Loading player data...</div>
+      `;
+      return;
+    }
+    const playerDb = _playerDbCache;
+
+    // Every real candidate the export covers, joined to Sleeper for
+    // identity. Rookies never appear here structurally, not via a filter:
+    // get_archive_candidates() (src/export.py) only includes players with
+    // a real historical row for THIS season, so a player who entered the
+    // league afterward simply isn't a key in advanced.players at all.
+    // `team` is Sleeper's CURRENT team (this endpoint isn't season-scoped)
+    // -- deliberately shown as-is rather than guessed at for the archived
+    // season, with the mismatch called out plainly in the banner below.
+    const totalCandidates = Object.keys(advanced.players || {}).length;
+    let rows = Object.entries(advanced.players || {}).map(([playerId, pd]) => {
+      const raw = playerDb[playerId];
+      if (!raw || !RADAR_CONDENSED_AXES[raw.position]) return null; // K/DEF/unresolved -- not modeled
+      const condensed = RADAR_CONDENSED_AXES[raw.position];
+      const axes = pd.radar?.eligible ? pd.radar.axes : null;
+      const volumeAxis = axes ? axes[condensed.volume] : null;
+      const efficiencyAxis = axes ? axes[condensed.efficiency] : null;
+      const trendHeadline = getPlayerTrendHeadline(pd.trend);
+      return {
+        playerId,
+        name: raw.full_name || `${raw.first_name || ''} ${raw.last_name || ''}`.trim() || 'Unknown',
+        position: raw.position,
+        team: raw.team || 'FA',
+        seasonPts: pd.xfp?.season_actual ?? null,
+        gamesPlayed: pd.radar?.games_played ?? pd.heatmap?.games_played ?? null,
+        fpOverExp: pd.xfp?.fp_over_expected ?? null,
+        volatility: pd.usage?.xfp_vol ?? null,
+        volumePct: volumeAxis?.percentile ?? null,
+        volumeLabel: volumeAxis?.label ?? null,
+        volumeRaw: volumeAxis?.raw ?? null,
+        volumeUnit: volumeAxis?.unit ?? '',
+        efficiencyPct: efficiencyAxis?.percentile ?? null,
+        efficiencyLabel: efficiencyAxis?.label ?? null,
+        efficiencyRaw: efficiencyAxis?.raw ?? null,
+        efficiencyUnit: efficiencyAxis?.unit ?? '',
+        trendSignal: trendHeadline?.signal ?? null,
+        trendDirection: trendHeadline?.direction ?? null,
+        trendFeature: trendHeadline?.feature ?? null,
+      };
+    }).filter(Boolean);
+
+    if (f.search) rows = rows.filter(r => r.name.toLowerCase().includes(f.search.toLowerCase()));
+    if (f.position !== 'ALL') rows = rows.filter(r => r.position === f.position);
+
+    rows.sort((a, b) => {
+      let valA = a[f.sortBy], valB = b[f.sortBy];
+      // Nulls sort to the bottom regardless of direction (same convention
+      // as the Players table -- QB is a common, expected case for
+      // FP Over Exp/Volatility here, not a rare edge case).
+      if (valA == null && valB == null) return 0;
+      if (valA == null) return 1;
+      if (valB == null) return -1;
+      if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = valB.toLowerCase(); }
+      if (f.sortDir === 'desc') return valA > valB ? -1 : valA < valB ? 1 : 0;
+      return valA < valB ? -1 : valA > valB ? 1 : 0;
+    });
+
+    function sortArrow(col) { return f.sortBy === col ? (f.sortDir === 'asc' ? '↑' : '↓') : ''; }
+    function pctCell(pct, label, raw, unit) {
+      if (pct == null) return '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+      return `<span title="${label}: ${raw != null ? raw + unit : 'n/a'}">${ordinal(pct)}<span style="color: var(--text-muted); font-size: 10px;"> pctl</span></span>
+              <div style="font-size: 10px; color: var(--text-muted);">${label}</div>`;
+    }
+
+    main.innerHTML = tabToggleHtml + `
+      <div class="page-header-row">
+        <div>
+          <div class="page-title">Draft Prep</div>
+          <div class="page-subtitle">${rows.length} of ${totalCandidates} players${rows.length > 100 ? ' · showing top 100 by current sort' : ''}</div>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <label style="font-size: 12px; color: var(--text-secondary); font-weight: 600;">Season:</label>
+          <select class="filter-select" id="draft-prep-season" style="font-size: 12px;">
+            ${archivedOptions.map(o => `<option value="${o.season}"${o.season === season ? ' selected' : ''}>${o.season}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+
+      <div class="info-banner" style="border-left-color: var(--warning); align-items: flex-start; flex-direction: column; gap: 6px;">
+        <div><strong>This is a review of the ${season} season, not a 2026 projection.</strong> The model projects
+        one week at a time -- there's no season-long value model in this pipeline. Everything below describes real
+        usage and outcomes that already happened, meant to inform a draft, not predict one.</div>
+        <div>⚠️ <strong>Rookies aren't shown</strong> -- they have no real ${season} games to describe, so they
+        simply aren't in this data.</div>
+        <div>⚠️ <strong>Team shown is current, not ${season}'s</strong> -- a player who's since changed teams,
+        or whose offense/QB situation has changed, carries stats that describe a role that may no longer apply.
+        Check their real 2026 situation before trusting the number.</div>
+      </div>
+
+      <div class="filters-bar">
+        <input type="text" class="search-input" id="draft-prep-search" placeholder="Search players..." value="${f.search}" />
+        <select class="filter-select" id="draft-prep-position">
+          <option value="ALL"${f.position === 'ALL' ? ' selected' : ''}>All Positions</option>
+          ${['QB','RB','WR','TE'].map(p => `<option value="${p}"${f.position === p ? ' selected' : ''}>${p}</option>`).join('')}
+        </select>
+        <span style="font-size: 11px; color: var(--text-muted); align-self: center;">QB/RB/WR/TE only — K/DST aren't part of this project's model</span>
+      </div>
+
+      <div class="panel" style="padding: 0; overflow: hidden;">
+        <table class="players-table">
+          <thead>
+            <tr>
+              <th data-sort="name" class="${f.sortBy === 'name' ? 'sorted' : ''}">Player ${sortArrow('name')}</th>
+              <th class="right" data-sort="seasonPts" title="Real total fantasy points scored in the ${season} season, and games played -- grounding context for every column here.">Season Pts ${sortArrow('seasonPts')}</th>
+              <th class="right" data-sort="fpOverExp" title="${season} points scored above what this player's opportunity (targets, carries, field position) implied. Positive = scored more than their usage predicted — a fade candidate. Negative = scored less — a buy-low candidate. A luck indicator, not a rating. RB/WR/TE only; xFP has no passing counterpart for QBs.">FP Over Exp ${sortArrow('fpOverExp')}</th>
+              <th class="right" data-sort="volatility" title="Week-to-week swing in this player's expected points (xFP) during the ${season} season, in points. Lower = steadier floor player; higher = boom-or-bust ceiling player. RB/WR/TE only; xFP has no passing counterpart for QBs.">Volatility ${sortArrow('volatility')}</th>
+              <th class="right" data-sort="volumePct" title="Percentile rank among startable players at this position for the ${season} season's volume metric (Pass/Touch/Target Volume, by position — see the label under each value). A rank, not a rating.">Volume ${sortArrow('volumePct')}</th>
+              <th class="right" data-sort="efficiencyPct" title="Percentile rank among startable players at this position for the ${season} season's efficiency metric (EPA/Dropback, Yards/Carry, or YAC/Reception, by position — see the label under each value). A rank, not a rating.">Efficiency ${sortArrow('efficiencyPct')}</th>
+              <th class="right" data-sort="trendSignal" title="This player's single biggest usage-share signal (target/carry/snap share vs. their own baseline) over the final games of the ${season} season -- who was ascending or fading heading into the offseason. A directional read, not a prediction.">End-of-Season Trend ${sortArrow('trendSignal')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.slice(0, 100).map(r => {
+              const fpCell = r.fpOverExp != null
+                ? `<span style="font-weight: 700; color: ${r.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};">${r.fpOverExp > 0 ? '+' : ''}${r.fpOverExp.toFixed(1)}</span>`
+                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+              const volCell = r.volatility != null
+                ? `<span style="font-weight: 700;">${r.volatility.toFixed(1)}</span>`
+                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+              const trendCell = r.trendDirection
+                ? `<span style="color: ${r.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${r.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[r.trendFeature]}</span>`
+                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+              return `
+                <tr data-player-id="${r.playerId}">
+                  <td>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                      <span class="pos-badge ${r.position}" style="font-size: 9px; padding: 1px 4px;">${r.position}</span>
+                      <div>
+                        <div style="font-weight: 600;">${r.name}</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">${r.team}</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="right">
+                    <div style="font-weight: 700;">${r.seasonPts != null ? r.seasonPts.toFixed(1) : '—'}</div>
+                    <div style="font-size: 10px; color: var(--text-muted);">${r.gamesPlayed != null ? r.gamesPlayed + ' gm' : ''}</div>
+                  </td>
+                  <td class="right">${fpCell}</td>
+                  <td class="right">${volCell}</td>
+                  <td class="right">${pctCell(r.volumePct, r.volumeLabel, r.volumeRaw, r.volumeUnit)}</td>
+                  <td class="right">${pctCell(r.efficiencyPct, r.efficiencyLabel, r.efficiencyRaw, r.efficiencyUnit)}</td>
+                  <td class="right">${trendCell}</td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+
+    document.getElementById('draft-prep-season')?.addEventListener('change', (e) => {
+      state.draftPrepSeason = Number(e.target.value);
+      renderView();
+    });
+    document.getElementById('draft-prep-search')?.addEventListener('input', (e) => {
+      state.draftPrepFilters.search = e.target.value;
+      renderView();
+    });
+    document.getElementById('draft-prep-position')?.addEventListener('change', (e) => {
+      state.draftPrepFilters.position = e.target.value;
+      renderView();
+    });
+    main.querySelectorAll('table.players-table th[data-sort]').forEach(th => {
+      th.addEventListener('click', () => {
+        const col = th.dataset.sort;
+        if (f.sortBy === col) f.sortDir = f.sortDir === 'asc' ? 'desc' : 'asc';
+        else { f.sortBy = col; f.sortDir = 'desc'; }
+        renderView();
+      });
+    });
+    // Row click drills into the full Player Detail page. Switches the
+    // WHOLE dashboard to this archived season first when it isn't already
+    // showing it -- the same "no mixed-season pages" rule Phase 9 applies
+    // everywhere else, so a buy-low candidate never opens into a Player
+    // Detail page still showing a different season's radar/heatmap/KPIs.
+    main.querySelectorAll('table.players-table tr[data-player-id]').forEach(el => {
+      el.addEventListener('click', async () => {
+        if (state.selectedSeason !== season) {
+          await switchSeason(season);
+        }
+        state.activePlayerId = el.dataset.playerId;
+        renderView();
+      });
+    });
+  }
+
   // ----- DRAFT VIEW -----
   function renderDraftView(main) {
     try {
     // ---- Pull the real Sleeper draft data from state ----
     const draft = state.draft;
     const rawPicks = state.draftPicks || [];
+    const hasDraftBoard = !!draft && rawPicks.length > 0;
 
-    if (!draft || rawPicks.length === 0) {
-      main.innerHTML = `
+    // Draft Board (this league's own completed draft, retrospective) and
+    // Draft Prep (last season's real usage/luck, prospective -- see
+    // renderDraftPrepSection) are two different things that both live
+    // under "Draft" rather than splitting into a separate top-level tab:
+    // they're used at opposite ends of the same event (prep before, board
+    // after) and this tab is otherwise idle most of the year, so Draft
+    // Prep naturally fills exactly the dead time Draft Board can't cover.
+    // Defaults to whichever one actually has something to show -- a
+    // league with no published draft yet (like this one, pre-draft 2026)
+    // would otherwise land on a dead "no draft data" placeholder.
+    if (state.draftTab == null) state.draftTab = hasDraftBoard ? 'board' : 'prep';
+    const draftTabToggleHtml = `
+      <div class="view-toggle" style="margin-bottom: 16px;">
+        <button class="view-toggle-btn ${state.draftTab === 'board' ? 'active' : ''}" data-draft-tab="board">Draft Board</button>
+        <button class="view-toggle-btn ${state.draftTab === 'prep' ? 'active' : ''}" data-draft-tab="prep">Draft Prep</button>
+      </div>
+    `;
+    function wireDraftTabToggle() {
+      main.querySelectorAll('[data-draft-tab]').forEach(btn => {
+        btn.addEventListener('click', () => { state.draftTab = btn.dataset.draftTab; renderView(); });
+      });
+    }
+
+    if (state.draftTab === 'prep') {
+      renderDraftPrepSection(main, draftTabToggleHtml);
+      wireDraftTabToggle();
+      return;
+    }
+
+    if (!hasDraftBoard) {
+      main.innerHTML = draftTabToggleHtml + `
         <div class="page-header-row"><div><div class="page-title">Draft Board</div></div></div>
         <div class="panel"><div class="placeholder-content">
           <h3>📋 No draft data available</h3>
           <p>This league doesn't have a published draft, or the draft hasn't completed yet.</p>
         </div></div>
       `;
+      wireDraftTabToggle();
       return;
     }
 
@@ -6841,7 +7176,7 @@
       return `${n}th`;
     };
 
-    main.innerHTML = `
+    main.innerHTML = draftTabToggleHtml + `
       <div class="page-header-row">
         <div>
           <div class="page-title">Draft Board</div>
@@ -6901,7 +7236,8 @@
       ${runsHtml}
     `;
 
-    main.querySelectorAll('.view-toggle-btn').forEach(btn => {
+    wireDraftTabToggle();
+    main.querySelectorAll('.view-toggle-btn[data-view]').forEach(btn => {
       btn.addEventListener('click', () => { state.draftView = btn.dataset.view; renderView(); });
     });
     document.getElementById('draft-filter-team')?.addEventListener('change', (e) => { state.draftFilter.team = e.target.value; renderView(); });
@@ -6916,7 +7252,11 @@
     } catch (err) {
       console.error('Draft view error:', err);
       main.innerHTML = `
-        <div class="page-header-row"><div><div class="page-title">Draft Board</div></div></div>
+        <div class="view-toggle" style="margin-bottom: 16px;">
+          <button class="view-toggle-btn ${state.draftTab === 'board' ? 'active' : ''}" data-draft-tab="board">Draft Board</button>
+          <button class="view-toggle-btn ${state.draftTab === 'prep' ? 'active' : ''}" data-draft-tab="prep">Draft Prep</button>
+        </div>
+        <div class="page-header-row"><div><div class="page-title">${state.draftTab === 'prep' ? 'Draft Prep' : 'Draft Board'}</div></div></div>
         <div class="panel">
           <div class="placeholder-content">
             <h3 style="color: var(--danger);">⚠️ Draft view error</h3>
@@ -6925,6 +7265,9 @@
           </div>
         </div>
       `;
+      main.querySelectorAll('[data-draft-tab]').forEach(btn => {
+        btn.addEventListener('click', () => { state.draftTab = btn.dataset.draftTab; renderView(); });
+      });
     }
   }
 
