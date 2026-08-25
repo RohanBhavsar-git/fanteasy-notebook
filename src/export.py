@@ -68,8 +68,8 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from src.model import FEATURE_COLUMNS, _cast_categoricals, predict_with_models, train_final_models
-from src.simulate import simulate_matchup, simulate_season
+from src.model import FEATURE_COLUMNS, _cast_categoricals, predict_quantiles_with_models, predict_with_models, train_final_models
+from src.simulate import player_point_in_time_metrics, sample_player_week, simulate_matchup, simulate_season
 
 logger = logging.getLogger(__name__)
 
@@ -116,11 +116,33 @@ PERFORMANCE_BY_POSITION = {
 
 CAVEATS = [
     "Sleeper's projections are more accurate than this model at every position.",
-    "Floor/ceiling intervals are conformally calibrated; ceilings run conservative.",
+    "Floor/ceiling intervals are conformally calibrated; ceilings run conservative, "
+    "so boom probabilities (Monte Carlo) read a bit low for the same reason.",
     "The red_zone_share trend signal is real but noisier than snap/target/carry "
     "share -- red-zone opportunities are low-volume, and a 'rising' read reverts "
     "more often than it holds even at the validated window and threshold.",
 ]
+
+# Surfaced both in meta.caveats (above, terse) and as its own meta field
+# (fuller, for the UI to show inline right next to boom/bust/start-over-
+# replacement numbers -- same "surface it where the numbers appear" pattern
+# SIMULATION_CALIBRATION_CAVEAT/SIMULATION_ACCURACY_CAVEAT below already use
+# for the matchup-simulation block). Numbers are PROJECT_CONTEXT.md's own
+# Phase 6 CQR findings, not re-derived here: 10-90 interval coverage after
+# CQR lands at 82.6-86.0% against an 80% target (QB/RB/WR/TE respectively),
+# and the correction overshoots the ceiling more than the floor because the
+# floor was the worse-calibrated side before correction -- widening it by
+# the amount needed pulled the ceiling along with it. src/simulate.py's own
+# module docstring documents the same asymmetry for anyone sampling from
+# these quantiles directly.
+MONTE_CARLO_CALIBRATION_CAVEAT = (
+    "These probabilities come from the same CQR-calibrated quantiles as the floor/ceiling "
+    "projection. Interval coverage runs 82-86% against an 80% target, and the correction is "
+    "asymmetric: the floor was the worse-calibrated side before correction, so widening it by "
+    "the needed amount pulled the ceiling along with it, leaving ceilings more conservative "
+    "than floors. Boom rates (the upper tail) read a bit low as a result -- treat them as a "
+    "lower bound, not an exact probability."
+)
 
 # A curated subset of ROLLING_OUTPUT_COLUMNS for the `usage` block -- role
 # and workload trend, not the full ~180-column feature set. Genuinely null
@@ -923,6 +945,7 @@ def assemble_player_advanced_stats(
     performance: dict = PERFORMANCE_BY_POSITION,
     caveats: list = CAVEATS,
     season_team: pd.DataFrame | None = None,
+    player_sim_metrics: pd.DataFrame | None = None,
 ) -> tuple[dict, dict]:
     """
     Joins everything onto scoped_predictions and crosswalks gsis_id ->
@@ -977,6 +1000,14 @@ def assemble_player_advanced_stats(
     (shouldn't happen for a real archive candidate) gets null, not a
     KeyError.
 
+    `player_sim_metrics` (build_player_simulation_metrics's output:
+    player_id, game_id, boom_prob, bust_prob, thresholds, and the 5 CQR
+    quantile columns) is optional -- scripts/archive_season.py never
+    passes it, same "hypothetical week, not a real one" reasoning that
+    already keeps the top-level `simulation` block null for archives (see
+    that module's own comment). When provided, each covered player gets a
+    `monte_carlo` block; everyone else gets null, not a guessed number.
+
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
     not just assumed.
@@ -996,6 +1027,8 @@ def assemble_player_advanced_stats(
     merged = merged.merge(xfp_summary, on="player_id", how="left")
     if season_team is not None:
         merged = merged.merge(season_team, on="player_id", how="left")
+    if player_sim_metrics is not None:
+        merged = merged.merge(player_sim_metrics, on="player_id", how="left")
     n_scoped = len(merged)
     merged = merged.merge(cw[["gsis_id", "sleeper_id"]], left_on="player_id", right_on="gsis_id", how="inner")
     n_matched = len(merged)
@@ -1038,6 +1071,22 @@ def assemble_player_advanced_stats(
             "heatmap": heatmap.get(
                 row["player_id"], {"eligible": False, "games_played": 0, "min_games": MIN_GAMES_FOR_TREND}
             ),
+            "monte_carlo": (
+                None if player_sim_metrics is None or pd.isna(row.get("boom_prob"))
+                else {
+                    "boom_prob": round(float(row["boom_prob"]), 3),
+                    "bust_prob": round(float(row["bust_prob"]), 3),
+                    "thresholds": {k: round(float(v), 3) for k, v in row["thresholds"].items()},
+                    "quantiles": {
+                        "q10": round(float(row["pred_q10_cqr"]), 2),
+                        "q25": round(float(row["pred_q25_cqr"]), 2),
+                        "q50": round(float(row["pred_q50"]), 2),
+                        "q75": round(float(row["pred_q75_cqr"]), 2),
+                        "q90": round(float(row["pred_q90_cqr"]), 2),
+                    },
+                    "game_id": None if pd.isna(row.get("game_id")) else row["game_id"],
+                }
+            ),
         }
 
     payload = {
@@ -1050,6 +1099,8 @@ def assemble_player_advanced_stats(
             "seasons_trained": seasons_trained,
             "performance": performance,
             "caveats": caveats,
+            "monte_carlo_caveat": MONTE_CARLO_CALIBRATION_CAVEAT,
+            "monte_carlo_n_sims": SIMULATION_N_SIMS_MATCHUP,
         },
         "players": players,
     }
@@ -1115,6 +1166,23 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         f"or contain a negative count: {bad_heatmap_shares[:5]}"
     )
 
+    n_with_monte_carlo = sum(1 for p in players.values() if p.get("monte_carlo") is not None)
+    bad_monte_carlo = [
+        pid for pid, p in players.items()
+        if p.get("monte_carlo") is not None
+        and (
+            not (0 <= p["monte_carlo"]["boom_prob"] <= 1)
+            or not (0 <= p["monte_carlo"]["bust_prob"] <= 1)
+            or any(not (0 <= v <= 1) for v in p["monte_carlo"]["thresholds"].values())
+            or not (p["monte_carlo"]["quantiles"]["q10"] <= p["monte_carlo"]["quantiles"]["q50"]
+                    <= p["monte_carlo"]["quantiles"]["q90"])
+        )
+    ]
+    assert not bad_monte_carlo, (
+        f"{len(bad_monte_carlo)} players have an invalid monte_carlo block "
+        f"(probability outside [0, 1], or q10/q50/q90 out of order): {bad_monte_carlo[:5]}"
+    )
+
     return {
         "n_players": len(players),
         "all_keys_real_sleeper_ids": True,
@@ -1122,6 +1190,8 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         "floor_le_point_le_ceiling": True,
         "radar_percentiles_in_range": True,
         "heatmap_shares_sum_to_one": True,
+        "n_with_monte_carlo": n_with_monte_carlo,
+        "monte_carlo_probabilities_in_range": True,
     }
 
 
@@ -1175,6 +1245,102 @@ def build_team_game_id_lookup(schedule: pd.DataFrame) -> pd.DataFrame:
     home = reg[["season", "week", "home_team", "game_id"]].rename(columns={"home_team": "team"})
     away = reg[["season", "week", "away_team", "game_id"]].rename(columns={"away_team": "team"})
     return pd.concat([home, away], ignore_index=True)
+
+
+def build_player_simulation_metrics(
+    combined_features: pd.DataFrame,
+    schedule: pd.DataFrame,
+    target_season: int,
+    target_week: int,
+    artifact: dict,
+    n_sims: int = SIMULATION_N_SIMS_MATCHUP,
+) -> pd.DataFrame:
+    """
+    Per-candidate point-in-time Monte Carlo metrics (src/simulate.py's
+    player_point_in_time_metrics) PLUS the ingredients -- game_id and the
+    full 5-point CQR-calibrated quantile distribution -- every candidate
+    needs so the dashboard can run an ad-hoc start-over-replacement
+    comparison against ANY other exported candidate, not just this week's
+    real fantasy starters (build_starter_quantile_rows/
+    build_matchup_simulation's scope).
+
+    Deliberately does NOT export the raw n_sims draws themselves: at
+    ~465 exported candidates that would be millions of numbers for one
+    week's export (versus 5 quantiles + one game_id per player here). The
+    one-factor Gaussian copula src/simulate.py::sample_player_week
+    implements is small and exact, so the CLIENT can re-run its own fresh
+    Monte Carlo from these ingredients (matching game_id => correlated
+    draws, exactly like the Python-side simulator) instead of needing
+    Python's specific draws replayed -- a Monte Carlo ESTIMATE of a
+    well-defined probability doesn't need to share a random seed with
+    another estimate of the same quantity to both be valid. index.html's
+    client-side start-over-replacement mirrors this same copula in JS.
+
+    Uses predict_quantiles_with_models (src/model.py) directly rather than
+    the single point/floor/ceiling predict_with_models everything else in
+    this module uses -- the simulator's own 5-quantile input contract,
+    already used by build_simulation_block's real-matchup path, just
+    applied here to the FULL target-week candidate pool instead of one
+    week's real starters.
+
+    A candidate whose team isn't resolvable to a real game this week (bye,
+    or an unresolvable team) gets `game_id=None` in the OUTPUT -- honestly
+    "no real game to correlate with" -- but still needs SOME game_id to
+    hand sample_player_week (which correlates same-game_id rows with each
+    other): given a private, per-player synthetic id instead, so a bucket
+    of exactly one player behaves as pure idiosyncratic noise (nothing
+    else shares that id to correlate against) without special-casing
+    sample_player_week itself.
+
+    Returns: player_id, game_id (nullable), boom_prob, bust_prob,
+    thresholds (dict), pred_q10_cqr, pred_q25_cqr, pred_q50, pred_q75_cqr,
+    pred_q90_cqr -- one row per candidate with model coverage this week
+    (QB/RB/WR/TE only, same scope as every other quantile-based
+    computation in this pipeline). Empty DataFrame if there's nothing to
+    predict, mirroring predict_target_week_from_artifact's own
+    empty-input behavior.
+    """
+    empty_cols = [
+        "player_id", "game_id", "boom_prob", "bust_prob", "thresholds",
+        "pred_q10_cqr", "pred_q25_cqr", "pred_q50", "pred_q75_cqr", "pred_q90_cqr",
+    ]
+    test_mask = (combined_features["season"] == target_season) & (combined_features["week"] == target_week)
+    test_df = combined_features[test_mask]
+    quantiles = predict_quantiles_with_models(
+        test_df, artifact["models"], artifact["cqr_widen_by_10_90"], artifact["cqr_widen_by_25_75"],
+        feature_cols=artifact["feature_columns"],
+    )
+    if quantiles.empty:
+        return pd.DataFrame(columns=empty_cols)
+    quantiles = quantiles.reset_index(drop=True)
+
+    team_game_id_lookup = build_team_game_id_lookup(schedule)
+    game_id_by_team_week = dict(zip(
+        zip(team_game_id_lookup["season"], team_game_id_lookup["week"], team_game_id_lookup["team"]),
+        team_game_id_lookup["game_id"],
+    ))
+    team_by_player = dict(zip(test_df["player_id"], test_df["team"]))
+
+    resolved_game_id = quantiles["player_id"].map(team_by_player).map(
+        lambda t: game_id_by_team_week.get((target_season, target_week, t))
+    )
+    # sample_player_week correlates every row sharing one game_id -- a
+    # shared None/NaN bucket would wrongly correlate every bye-week/
+    # unresolved player with EVERY OTHER one, so each gets its own private
+    # placeholder id instead of the real (missing) one.
+    sim_game_id = resolved_game_id.where(resolved_game_id.notna(), "no_game_" + quantiles["player_id"].astype(str))
+
+    sim_input = quantiles.copy()
+    sim_input["game_id"] = sim_game_id
+    draws = sample_player_week(sim_input, n_sims=n_sims)
+    metrics = player_point_in_time_metrics(draws, quantiles["position"])
+
+    out = quantiles[["player_id", "pred_q10_cqr", "pred_q25_cqr", "pred_q50", "pred_q75_cqr", "pred_q90_cqr"]].copy()
+    out["game_id"] = resolved_game_id
+    out["boom_prob"] = [m["boom_prob"] for m in metrics]
+    out["bust_prob"] = [m["bust_prob"] for m in metrics]
+    out["thresholds"] = [m["thresholds"] for m in metrics]
+    return out[empty_cols]
 
 
 def build_starter_quantile_rows(

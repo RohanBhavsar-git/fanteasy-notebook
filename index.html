@@ -2999,6 +2999,160 @@
     return advanced.players?.[playerId]?.projection || null;
   }
 
+  // Monte Carlo block (boom/bust/thresholds/quantiles/game_id) is a
+  // WEEK-SPECIFIC forward prediction, same as getMyProj's `projection` --
+  // gated the same way (season+week must match the currently-loaded
+  // export) so a stale cached bundle for a different week never gets
+  // shown as if it described the week on screen. Archives never carry
+  // this block (scripts/archive_season.py never passes player_sim_metrics
+  // -- see src/export.py's own comment for why), so this returns null for
+  // every archived season, same as the top-level `simulation` block does.
+  function getMonteCarlo(playerId, season, week) {
+    const advanced = state.advancedStats;
+    if (!advanced || Number(advanced.meta?.season) !== Number(season) || Number(advanced.meta?.week) !== Number(week)) {
+      return null;
+    }
+    return advanced.players?.[playerId]?.monte_carlo || null;
+  }
+
+  function monteCarloCaveatText() {
+    return state.advancedStats?.meta?.monte_carlo_caveat
+      || "These are Monte Carlo estimates from the model's calibrated quantiles; ceilings run conservative, so boom rates read a bit low.";
+  }
+
+  // ---- Client-side start-over-replacement -----------------------------
+  // Reimplements src/simulate.py's one-factor Gaussian copula in JS --
+  // see build_player_simulation_metrics's docstring (src/export.py) for
+  // why the export carries each player's 5 quantiles + game_id instead of
+  // 10,000 raw draws: at ~465 exported players that's millions of numbers
+  // for one week, versus a few floats and a string per player here. The
+  // client draws its OWN fresh Monte Carlo sample from those ingredients
+  // -- a valid estimate of the same well-defined probability doesn't need
+  // to replay Python's specific random draws, only the same model (same
+  // quantile-implied marginal per player, same shared-game-factor
+  // correlation for two players who share a real game_id).
+  //
+  // GAME_ENVIRONMENT_RHO mirrors src/simulate.py's constant of the same
+  // name exactly -- keep in lockstep if that ever changes.
+  const GAME_ENVIRONMENT_RHO = 0.35;
+  const SOR_N_SIMS = 10000; // matches meta.monte_carlo_n_sims (SIMULATION_N_SIMS_MATCHUP)
+
+  // Abramowitz & Stegun 7.1.26 -- ~1e-7 max error, plenty for a Monte
+  // Carlo estimate that already carries its own sampling noise.
+  function erf(x) {
+    const sign = x < 0 ? -1 : 1;
+    x = Math.abs(x);
+    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+    const t = 1 / (1 + p * x);
+    const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+    return sign * y;
+  }
+  function normalCdf(x) { return 0.5 * (1 + erf(x / Math.SQRT2)); }
+
+  // Box-Muller standard normal sampler.
+  function sampleStandardNormal(n) {
+    const out = new Float64Array(n);
+    for (let i = 0; i < n; i += 2) {
+      let u1 = 0;
+      while (u1 === 0) u1 = Math.random(); // avoid log(0)
+      const u2 = Math.random();
+      const r = Math.sqrt(-2 * Math.log(u1));
+      out[i] = r * Math.cos(2 * Math.PI * u2);
+      if (i + 1 < n) out[i + 1] = r * Math.sin(2 * Math.PI * u2);
+    }
+    return out;
+  }
+
+  // Piecewise-linear inverse-CDF from 5 known (percentile, value) points,
+  // mirroring src/simulate.py::_inverse_quantile_row exactly -- including
+  // linear extrapolation beyond [0.10, 0.90] (a plain interpolation would
+  // silently flatten the tails, understating variance exactly where a
+  // Monte Carlo estimate needs it most).
+  const QUANTILE_POINTS = [0.10, 0.25, 0.50, 0.75, 0.90];
+  function inverseQuantileRow(u, q) {
+    const values = [q.q10, q.q25, q.q50, q.q75, q.q90];
+    if (u <= QUANTILE_POINTS[0]) {
+      const slope = (values[1] - values[0]) / (QUANTILE_POINTS[1] - QUANTILE_POINTS[0]);
+      return values[0] + slope * (u - QUANTILE_POINTS[0]);
+    }
+    if (u >= QUANTILE_POINTS[4]) {
+      const slope = (values[4] - values[3]) / (QUANTILE_POINTS[4] - QUANTILE_POINTS[3]);
+      return values[4] + slope * (u - QUANTILE_POINTS[4]);
+    }
+    for (let i = 0; i < 4; i++) {
+      if (u >= QUANTILE_POINTS[i] && u <= QUANTILE_POINTS[i + 1]) {
+        const frac = (u - QUANTILE_POINTS[i]) / (QUANTILE_POINTS[i + 1] - QUANTILE_POINTS[i]);
+        return values[i] + frac * (values[i + 1] - values[i]);
+      }
+    }
+    return q.q50; // unreachable -- QUANTILE_POINTS spans [0,1] inclusive at both ends checked above
+  }
+
+  // One player's simulated draws: z_game is SHARED across every player
+  // passed the same zGameByGameId Map with the same game_id (the whole
+  // correlation mechanism), drawn once per game and reused -- a player
+  // with a null game_id (no real game this week) gets a private z_game
+  // nothing else shares, which is mathematically identical to pure
+  // idiosyncratic noise (see build_player_simulation_metrics's docstring).
+  function samplePlayerDraws(monteCarlo, nSims, zGameByGameId) {
+    const zIdio = sampleStandardNormal(nSims);
+    let zGame;
+    const gameId = monteCarlo.game_id;
+    if (gameId != null) {
+      if (!zGameByGameId.has(gameId)) zGameByGameId.set(gameId, sampleStandardNormal(nSims));
+      zGame = zGameByGameId.get(gameId);
+    } else {
+      zGame = sampleStandardNormal(nSims);
+    }
+    const a = Math.sqrt(GAME_ENVIRONMENT_RHO), b = Math.sqrt(1 - GAME_ENVIRONMENT_RHO);
+    const draws = new Float64Array(nSims);
+    for (let i = 0; i < nSims; i++) {
+      const u = normalCdf(a * zGame[i] + b * zIdio[i]);
+      draws[i] = inverseQuantileRow(u, monteCarlo.quantiles);
+    }
+    return draws;
+  }
+
+  // How often player A outscores player B across the SAME simulated week
+  // -- the direct reason this needs simulation rather than comparing two
+  // point estimates: if A and B share a real game_id, their draws are
+  // correlated (drawn from a shared zGameByGameId Map), so a shootout or
+  // a slog moves both together, exactly like src/simulate.py's Python-side
+  // simulator. Mirrors src/simulate.py::start_over_replacement_prob's
+  // return shape.
+  function startOverReplacementProb(monteCarloA, monteCarloB, nSims = SOR_N_SIMS) {
+    if (!monteCarloA || !monteCarloB) return null;
+    const zGameByGameId = new Map();
+    const drawsA = samplePlayerDraws(monteCarloA, nSims, zGameByGameId);
+    const drawsB = samplePlayerDraws(monteCarloB, nSims, zGameByGameId);
+    let aOverB = 0, bOverA = 0;
+    for (let i = 0; i < nSims; i++) {
+      if (drawsA[i] > drawsB[i]) aOverB++;
+      else if (drawsB[i] > drawsA[i]) bOverA++;
+    }
+    return {
+      a_over_b_prob: aOverB / nSims,
+      b_over_a_prob: bOverA / nSims,
+      tie_prob: (nSims - aOverB - bOverA) / nSims,
+    };
+  }
+
+  // Memoized per (season, week, playerA, playerB) -- a fresh Monte Carlo
+  // re-run on every keystroke/re-render would both waste work and make
+  // the displayed percentage visibly jitter between renders for no
+  // reason (renderView() fires on every filter/sort/search change, not
+  // just when the compared players actually change). Cleared implicitly
+  // by the season/week prefix in the key, not by any explicit eviction --
+  // at most a few dozen entries accumulate in a session, negligible.
+  const sorCache = new Map();
+  function cachedStartOverReplacement(playerAId, monteCarloA, playerBId, monteCarloB, season, week) {
+    const key = `${season}:${week}:${playerAId}:${playerBId}`;
+    if (!sorCache.has(key)) {
+      sorCache.set(key, startOverReplacementProb(monteCarloA, monteCarloB));
+    }
+    return sorCache.get(key);
+  }
+
   // Honest caveat for "My Proj" labels, pulled from the export's own
   // meta.caveats when loaded (e.g. "Sleeper's projections are more
   // accurate than this model at every position") so the UI never implies
@@ -3295,6 +3449,84 @@
           ${shareCard('🎯', 'purple', 'Target Share', usage.target_share_ewm3, 'Of team targets')}
           ${shareCard('🔄', 'orange', 'Carry Share', trend.carry_share?.current, 'Of team carries')}
           ${shareCard('🔴', 'red', 'Red-Zone Share', trend.red_zone_share?.current, 'Of team RZ plays')}
+        </div>
+      </div>
+    `;
+  }
+
+  // Boom/Bust: per-player point-in-time Monte Carlo metrics
+  // (src/export.py's `monte_carlo` block) -- boom_prob/bust_prob plus a
+  // POSITION-SPECIFIC "P(exceeds X)" breakdown (see
+  // src/simulate.py::POSITION_THRESHOLDS -- 20 points is a big week for a
+  // TE and a middling one for a QB, so the threshold list itself differs
+  // by position, not just the labels). Stated in real points, not a
+  // standard-deviation-based volatility number -- more directly answers
+  // "how often does this player actually blow up or lay an egg" than the
+  // existing Volatility (xfp_vol) card above does.
+  //
+  // Same three-state honesty pattern as renderPositionProfilePanel: no
+  // `monte_carlo` key at all (export predates this feature, or this is an
+  // archived season -- archives never carry it, see getMonteCarlo's own
+  // comment) reads as "awaiting model output"; a real block renders the
+  // numbers plus the CQR calibration caveat inline, right where the
+  // numbers appear, not buried in a general caveats list.
+  function renderMonteCarloPanel(p, season, week) {
+    const mc = getMonteCarlo(p.player_id, season, week);
+    if (!mc) {
+      return `
+        <div class="panel" style="margin-top: 16px;">
+          <div class="panel-header">
+            <div class="panel-title">Boom / Bust</div>
+            <div class="panel-note">Monte Carlo, this week's projection</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">🎲</div>
+            <div class="pd-placeholder-title">Awaiting model output</div>
+            <div class="pd-placeholder-text">
+              Once <code>player_advanced_stats.json</code> covers this week for this player, boom/bust
+              probabilities and a threshold breakdown will appear here.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    const thresholdRows = Object.entries(mc.thresholds)
+      .sort((a, b) => Number(a[0]) - Number(b[0]))
+      .map(([t, prob]) => `
+        <div class="radar-axis-row">
+          <span class="radar-axis-label">${t}+ points</span>
+          <span class="radar-axis-pct">${(prob * 100).toFixed(0)}%</span>
+        </div>
+      `).join('');
+    return `
+      <div class="panel" style="margin-top: 16px;">
+        <div class="panel-header">
+          <div class="panel-title">Boom / Bust</div>
+          <div class="panel-note">Monte Carlo, ${state.advancedStats?.meta?.monte_carlo_n_sims?.toLocaleString() || '10,000'} draws</div>
+        </div>
+        <div class="injury-stat-grid" style="grid-template-columns: repeat(2, 1fr);">
+          <div class="injury-stat-card">
+            <div class="injury-stat-icon orange">🚀</div>
+            <div class="injury-stat-content">
+              <div class="injury-stat-label">Boom Rate</div>
+              <div class="injury-stat-value">${(mc.boom_prob * 100).toFixed(0)}%</div>
+              <div class="injury-stat-sub">Chance of a big week</div>
+            </div>
+          </div>
+          <div class="injury-stat-card">
+            <div class="injury-stat-icon red">💥</div>
+            <div class="injury-stat-content">
+              <div class="injury-stat-label">Bust Rate</div>
+              <div class="injury-stat-value">${(mc.bust_prob * 100).toFixed(0)}%</div>
+              <div class="injury-stat-sub">Chance of a dud</div>
+            </div>
+          </div>
+        </div>
+        <div class="radar-axis-list" style="margin-top: 4px;">
+          ${thresholdRows}
+        </div>
+        <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 10px;">
+          ${monteCarloCaveatText()}
         </div>
       </div>
     `;
@@ -5845,6 +6077,7 @@
       </div>
 
       ${renderOpportunitySharesPanel(p)}
+      ${renderMonteCarloPanel(p, season, currentWeek)}
 
       <div class="pd-analytics-grid">
         ${renderPositionProfilePanel(p)}
@@ -6210,6 +6443,62 @@
       `;
     }
 
+    // ---- Start-over-replacement: the one comparison that genuinely needs
+    // simulation, not just point estimates -- if two players share a real
+    // game this week their outcomes are correlated (see
+    // startOverReplacementProb above), which a naive "whose projection is
+    // higher" comparison misses entirely. Computed HERE, on demand, for
+    // every pair among the compared players (not precomputed export-side:
+    // see build_player_simulation_metrics's docstring in src/export.py for
+    // why that's infeasible for every possible pair among ~465 exported
+    // players -- this view already has "two-or-more players selected,"
+    // which is exactly the natural place to ask "who do I actually start."
+    function sorPairHtml(a, b, colorA, colorB) {
+      const mcA = getMonteCarlo(a.player_id, season, compareWeek);
+      const mcB = getMonteCarlo(b.player_id, season, compareWeek);
+      if (!mcA || !mcB) {
+        const missingNames = [!mcA ? a.name : null, !mcB ? b.name : null].filter(Boolean).join(' and ');
+        return `
+          <div style="padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-muted);">
+            <strong>${a.name}</strong> vs <strong>${b.name}</strong>: no Monte Carlo data for ${missingNames} for Wk ${compareWeek}
+            (archived seasons, or a position outside this model's QB/RB/WR/TE coverage, don't carry it).
+          </div>
+        `;
+      }
+      const result = cachedStartOverReplacement(a.player_id, mcA, b.player_id, mcB, season, compareWeek);
+      const sameGame = mcA.game_id != null && mcA.game_id === mcB.game_id;
+      const pct = (result.a_over_b_prob * 100).toFixed(0);
+      return `
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border);">
+          <div style="font-size: 13px;">
+            <span style="font-weight: 700; color: ${colorA};">${a.name}</span> over
+            <span style="font-weight: 700; color: ${colorB};">${b.name}</span>
+            ${sameGame ? '<div style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">Same real game -- correlated, not independent</div>' : ''}
+          </div>
+          <div style="font-weight: 800; font-size: 16px;">${pct}%</div>
+        </div>
+      `;
+    }
+
+    const sorPairs = [];
+    for (let i = 0; i < compared.length; i++) {
+      for (let j = i + 1; j < compared.length; j++) {
+        sorPairs.push(sorPairHtml(compared[i], compared[j], colors[i], colors[j]));
+      }
+    }
+    const startOverReplacementHtml = compared.length >= 2 ? `
+      <div class="panel" style="margin-top: 16px;">
+        <div class="panel-header">
+          <div class="panel-title">Start Over Replacement</div>
+          <div class="panel-note">Wk ${compareWeek} · % of simulated weeks the first player outscores the second</div>
+        </div>
+        ${sorPairs.join('')}
+        <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 10px;">
+          ${monteCarloCaveatText()}
+        </div>
+      </div>
+    ` : '';
+
     // ---- Helper: best/worst class for a stat row ----
     function cellClass(values, currentVal, lowerIsBetter = false) {
       const nums = values.filter(v => v != null && !isNaN(v));
@@ -6435,6 +6724,7 @@
 
       ${chartsHtml}
       ${statTableHtml}
+      ${startOverReplacementHtml}
 
       <div class="panel" style="margin-top: 16px;">
         <div class="panel-header">

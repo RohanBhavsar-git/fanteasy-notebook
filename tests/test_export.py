@@ -19,6 +19,7 @@ from src.export import (  # noqa: E402
     build_heatmap_snapshot,
     build_matchup_simulation,
     build_playoff_odds,
+    build_player_simulation_metrics,
     build_radar_snapshot,
     build_starter_quantile_rows,
     build_target_week_features,
@@ -660,6 +661,107 @@ def test_assemble_player_advanced_stats_wires_season_team_when_provided():
     assert payload["players"]["5001"]["team"] is None
 
 
+def test_build_player_simulation_metrics_resolves_game_id_and_computes_thresholds(monkeypatch):
+    """
+    A real game_id resolves via build_team_game_id_lookup (same mechanism
+    build_starter_quantile_rows already uses); a player whose team has no
+    row in this week's real schedule (a bye, here) gets game_id=None in
+    the OUTPUT -- honestly "no real game" -- even though sample_player_week
+    internally needs a non-null placeholder for its own correlation
+    bucketing (see the function's own docstring for why that's safe).
+    predict_quantiles_with_models is faked out here since exercising a
+    real trained model isn't this test's job -- src/model.py's own tests
+    already cover that function directly.
+    """
+    combined_features = pd.DataFrame([
+        {"player_id": "00-0001", "season": 2025, "week": 10, "team": "KC"},
+        {"player_id": "00-0002", "season": 2025, "week": 10, "team": "NE"},  # bye -- no schedule row this week
+        {"player_id": "00-0003", "season": 2025, "week": 9, "team": "KC"},   # wrong week -- excluded by the mask
+    ])
+    schedule = pd.DataFrame([
+        {"season": 2025, "week": 10, "game_type": "REG", "home_team": "KC", "away_team": "BUF", "game_id": "g1"},
+    ])
+
+    def fake_predict_quantiles(test_df, models, widen_1090, widen_2575, feature_cols):
+        assert set(test_df["player_id"]) == {"00-0001", "00-0002"}  # week-9 row correctly excluded upstream
+        return pd.DataFrame({
+            "player_id": test_df["player_id"].tolist(),
+            "position": ["QB", "RB"],
+            "pred_q10_cqr": [26.0, 0.0], "pred_q25_cqr": [29.0, 1.0], "pred_q50": [32.0, 2.0],
+            "pred_q75_cqr": [36.0, 4.0], "pred_q90_cqr": [40.0, 6.0],
+        })
+
+    monkeypatch.setattr(export_module, "predict_quantiles_with_models", fake_predict_quantiles)
+
+    result = build_player_simulation_metrics(
+        combined_features, schedule, target_season=2025, target_week=10,
+        artifact={"models": {}, "cqr_widen_by_10_90": {}, "cqr_widen_by_25_75": {}, "feature_columns": []},
+        n_sims=5000,
+    ).set_index("player_id")
+
+    assert result.loc["00-0001", "game_id"] == "g1"
+    assert pd.isna(result.loc["00-0002", "game_id"])
+    assert result.loc["00-0001", "boom_prob"] > 0.9   # QB distribution sits well above the 25-pt boom threshold
+    assert result.loc["00-0002", "bust_prob"] > 0.8   # RB distribution sits well below the 5-pt bust threshold
+    assert set(result.loc["00-0001", "thresholds"].keys()) == {"15", "20", "25", "30"}
+
+
+def test_assemble_player_advanced_stats_wires_monte_carlo_when_provided():
+    """
+    scripts/weekly_update.py's own path: player_sim_metrics
+    (build_player_simulation_metrics' output) is optional and merged in on
+    player_id -- present for a real candidate with model coverage, null
+    for one absent from the frame (e.g. no model coverage that week).
+    """
+    player_ids = ["00-0001", "00-0002"]
+    scoped_predictions = pd.DataFrame({
+        "player_id": player_ids,
+        "point": [15.0, 10.0], "floor": [10.0, 6.0], "ceiling": [20.0, 14.0],
+    })
+    from src.usage import TREND_SOURCE_FEATURES
+    usage = pd.DataFrame({
+        "player_id": player_ids,
+        **{col: [np.nan, np.nan] for col in export_module.USAGE_EXPORT_COLUMNS},
+    })
+    trend = pd.DataFrame({
+        "player_id": player_ids,
+        **{
+            f"{prefix}{feat}{suffix}": [np.nan, np.nan]
+            for feat in TREND_SOURCE_FEATURES
+            for prefix, suffix in [("trend_", "_current"), ("", "_trend_signal"), ("", "_trend_direction")]
+        },
+    })
+    xfp_summary = pd.DataFrame({"player_id": [], "season_xfp": [], "season_actual": [], "fp_over_expected": []})
+    weekly_xfp = pd.DataFrame({"player_id": [], "week": [], "xfp": []})
+    crosswalk = pd.DataFrame({
+        "gsis_id": player_ids,
+        "sleeper_id": ["4984", "5001"],
+    })
+    player_sim_metrics = pd.DataFrame({
+        "player_id": ["00-0001"],  # 00-0002 deliberately absent -- no model coverage that week
+        "game_id": ["g1"],
+        "boom_prob": [0.31], "bust_prob": [0.08],
+        "thresholds": [{"15": 0.62, "20": 0.31, "25": 0.09, "30": 0.02}],
+        "pred_q10_cqr": [5.2], "pred_q25_cqr": [9.8], "pred_q50": [15.2], "pred_q75_cqr": [20.9], "pred_q90_cqr": [26.2],
+    })
+
+    payload, _ = assemble_player_advanced_stats(
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, {}, {}, crosswalk,
+        target_season=2025, target_week=10, xfp_season=2025, seasons_trained=[2025],
+        model_version="test-version", player_sim_metrics=player_sim_metrics,
+    )
+
+    assert payload["players"]["4984"]["monte_carlo"] == {
+        "boom_prob": 0.31, "bust_prob": 0.08,
+        "thresholds": {"15": 0.62, "20": 0.31, "25": 0.09, "30": 0.02},
+        "quantiles": {"q10": 5.2, "q25": 9.8, "q50": 15.2, "q75": 20.9, "q90": 26.2},
+        "game_id": "g1",
+    }
+    assert payload["players"]["5001"]["monte_carlo"] is None
+    assert payload["meta"]["monte_carlo_caveat"] == export_module.MONTE_CARLO_CALIBRATION_CAVEAT
+    assert payload["meta"]["monte_carlo_n_sims"] == export_module.SIMULATION_N_SIMS_MATCHUP
+
+
 def test_validate_export_catches_floor_point_ceiling_violation():
     payload = {"players": {"4984": {
         "projection": {"point": 50.0, "floor": 10.0, "ceiling": 30.0},  # point above ceiling
@@ -675,6 +777,24 @@ def test_validate_export_catches_unknown_sleeper_id():
     }}}
     crosswalk = pd.DataFrame({"sleeper_id": ["4984"]})
     with pytest.raises(AssertionError, match="not real Sleeper IDs"):
+        validate_export(payload, crosswalk)
+
+
+def test_validate_export_catches_out_of_range_monte_carlo_probability():
+    payload = {"players": {"4984": {
+        "projection": {"point": 15.0, "floor": 10.0, "ceiling": 20.0},
+        "radar": {"eligible": False},
+        "heatmap": {"eligible": False},
+        "monte_carlo": {
+            "boom_prob": 1.4,  # invalid -- probabilities are [0, 1]
+            "bust_prob": 0.08,
+            "thresholds": {"15": 0.62},
+            "quantiles": {"q10": 5.0, "q25": 9.0, "q50": 15.0, "q75": 20.0, "q90": 26.0},
+            "game_id": "g1",
+        },
+    }}}
+    crosswalk = pd.DataFrame({"sleeper_id": ["4984"]})
+    with pytest.raises(AssertionError, match="invalid monte_carlo block"):
         validate_export(payload, crosswalk)
 
 

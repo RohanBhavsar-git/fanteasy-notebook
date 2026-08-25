@@ -74,6 +74,30 @@ QUANTILE_POINTS = np.array([0.10, 0.25, 0.50, 0.75, 0.90])
 
 GAME_ENVIRONMENT_RHO = 0.35
 
+# Point thresholds for "P(exceeds X)", one list per position -- a single
+# shared number would be meaningless across positions (20 points is a
+# huge week for a TE and a middling one for a QB). Derived from real
+# 2021-2025 weekly custom_points among fantasy-relevant-usage rows (QB:
+# attempts >= 15; RB: carries+targets >= 8; WR/TE: targets >= 4/3) --
+# roughly the 50th/75th/88th/95th percentile of that population per
+# position (see PROJECT_CONTEXT.md's Monte Carlo metrics finding for the
+# full percentile table these were checked against, not just picked to
+# look round).
+POSITION_THRESHOLDS = {
+    "QB": [15, 20, 25, 30],
+    "RB": [10, 15, 20, 25],
+    "WR": [10, 15, 20, 25],
+    "TE": [8, 12, 16, 20],
+}
+
+# "Boom" reuses each position's own 3rd threshold above (~88-93rd
+# percentile of that same real population) rather than inventing a
+# second, separately-justified cutoff. "Bust" is its own number, not just
+# the smallest threshold above -- it's a different direction (under, not
+# over) at roughly the 12-18th percentile per position.
+POSITION_BOOM_THRESHOLD_INDEX = 2
+POSITION_BUST_THRESHOLD = {"QB": 10, "RB": 5, "WR": 4, "TE": 3}
+
 
 def _ensure_monotonic_quantiles(preds: pd.DataFrame) -> pd.DataFrame:
     """
@@ -160,6 +184,99 @@ def sample_player_week(
     for i in range(n_rows):
         out[i] = _inverse_quantile_row(u[i], quantile_values[i])
     return out
+
+
+def player_point_in_time_metrics(draws: np.ndarray, positions) -> list[dict]:
+    """
+    Per-player point-in-time probabilities from an already-drawn (n_rows,
+    n_sims) Monte Carlo sample (sample_player_week's own output, or
+    simulate_matchup's per-player draws before they're summed into team
+    totals) -- row i's metrics describe row i's own MARGINAL distribution,
+    unaffected by which other rows happened to be drawn alongside it.
+    Correlation only matters for comparing two players against each other
+    (see start_over_replacement_prob below); a single player's own
+    P(exceeds X) is the same whether they were simulated next to a
+    teammate or in isolation.
+
+    Thresholds are POSITION-SPECIFIC (POSITION_THRESHOLDS/
+    POSITION_BUST_THRESHOLD above) -- see their own comments for how they
+    were picked. A position missing from POSITION_THRESHOLDS (K/DST, or
+    anything else outside this pipeline's QB/RB/WR/TE model coverage)
+    gets an honestly empty/null result, not a guessed number.
+
+    Args:
+        draws: (n_rows, n_sims) array, e.g. sample_player_week's output.
+        positions: length-n_rows sequence of each row's position.
+
+    Returns:
+        list[dict], one per row (input order preserved):
+          {"thresholds": {"15": 0.62, "20": 0.31, ...}, "boom_prob": 0.31,
+           "bust_prob": 0.08}
+        or {"thresholds": {}, "boom_prob": None, "bust_prob": None} for an
+        unmapped position.
+    """
+    positions = list(positions)
+    if len(positions) != draws.shape[0]:
+        raise ValueError(
+            f"player_point_in_time_metrics: {len(positions)} positions for {draws.shape[0]} draw rows"
+        )
+
+    out = []
+    for i, pos in enumerate(positions):
+        thresholds = POSITION_THRESHOLDS.get(pos)
+        if thresholds is None:
+            out.append({"thresholds": {}, "boom_prob": None, "bust_prob": None})
+            continue
+        row = draws[i]
+        threshold_probs = {str(t): float((row >= t).mean()) for t in thresholds}
+        out.append({
+            "thresholds": threshold_probs,
+            "boom_prob": threshold_probs[str(thresholds[POSITION_BOOM_THRESHOLD_INDEX])],
+            "bust_prob": float((row < POSITION_BUST_THRESHOLD[pos]).mean()),
+        })
+    return out
+
+
+def start_over_replacement_prob(draws_a: np.ndarray, draws_b: np.ndarray) -> dict:
+    """
+    How often player A outscores player B across the SAME simulated week
+    -- "start-over-replacement": is starting A over B actually the right
+    call, not just "whose point estimate is higher." draws_a/draws_b must
+    come from the SAME sample_player_week() call (or otherwise share
+    row-for-row trial alignment) for this to mean what it claims: two
+    players sharing a real game_id have correlated draws (see module
+    docstring), so trial-by-trial comparison reflects that shared game
+    environment -- a shootout that lifts both, or a defensive slog that
+    caps both, shows up here. Comparing two INDEPENDENT point estimates
+    (or two independently-drawn samples) misses this entirely, which is
+    the whole reason this needs simulation rather than a simple
+    point-estimate comparison.
+
+    This is the reference implementation of the underlying math --
+    index.html's client-side start-over-replacement reimplements this
+    same one-factor Gaussian copula in JS (see src/export.py's
+    build_player_simulation_metrics docstring for why raw draws aren't
+    exported and the client draws its own fresh sample instead), so this
+    function's job is to define and test the correct answer, not to run
+    in production.
+
+    Args:
+        draws_a, draws_b: (n_sims,) arrays, e.g. two rows of
+            sample_player_week()'s output, drawn together.
+
+    Returns:
+        {"a_over_b_prob": float, "b_over_a_prob": float, "tie_prob": float}
+        -- the three always sum to 1.0 (draws are continuous in practice,
+        so tie_prob is ~0, but computed honestly rather than assumed).
+    """
+    draws_a, draws_b = np.asarray(draws_a), np.asarray(draws_b)
+    if draws_a.shape != draws_b.shape:
+        raise ValueError(f"start_over_replacement_prob: shape mismatch {draws_a.shape} vs {draws_b.shape}")
+    return {
+        "a_over_b_prob": float((draws_a > draws_b).mean()),
+        "b_over_a_prob": float((draws_a < draws_b).mean()),
+        "tie_prob": float((draws_a == draws_b).mean()),
+    }
 
 
 def simulate_matchup(

@@ -16,13 +16,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.simulate import (  # noqa: E402
+    POSITION_BUST_THRESHOLD,
+    POSITION_THRESHOLDS,
     QUANTILE_COLUMNS,
     _ensure_monotonic_quantiles,
     _inverse_quantile_row,
     calibration_report,
+    player_point_in_time_metrics,
     sample_player_week,
     simulate_matchup,
     simulate_season,
+    start_over_replacement_prob,
 )
 from src.ingest import playoff_participants_from_bracket  # noqa: E402
 
@@ -105,6 +109,104 @@ def test_sample_player_week_degenerate_quantiles_produce_a_fixed_value():
     df = pd.DataFrame([_row("g1", 7.5, 7.5, 7.5, 7.5, 7.5)])
     draws = sample_player_week(df, n_sims=1000, seed=2)[0]
     assert np.all(draws == 7.5)
+
+
+def test_player_point_in_time_metrics_high_and_low_scorers_read_correctly():
+    """A QB drawn from a high-scoring distribution should show a high
+    boom_prob/low bust_prob; a QB drawn from a low-scoring one should show
+    the reverse -- checked against POSITION_THRESHOLDS' own QB numbers so
+    this test breaks (loudly) if those constants ever change without the
+    test being updated alongside them."""
+    df = pd.DataFrame([
+        _row("g1", 26.0, 29.0, 32.0, 36.0, 40.0),  # high-volume/high-ceiling QB
+        _row("g2", 0.0, 1.0, 2.0, 4.0, 6.0),        # low-volume/backup-caliber QB
+    ])
+    draws = sample_player_week(df, n_sims=20000, seed=10)
+    metrics = player_point_in_time_metrics(draws, ["QB", "QB"])
+
+    boom_threshold = str(POSITION_THRESHOLDS["QB"][2])
+    bust_threshold = POSITION_BUST_THRESHOLD["QB"]
+    assert metrics[0]["boom_prob"] > 0.9
+    assert metrics[0]["bust_prob"] < 0.05
+    assert metrics[1]["boom_prob"] < 0.05
+    assert metrics[1]["bust_prob"] > 0.9
+    assert set(metrics[0]["thresholds"].keys()) == {str(t) for t in POSITION_THRESHOLDS["QB"]}
+    assert metrics[0]["thresholds"][boom_threshold] == metrics[0]["boom_prob"]
+    assert bust_threshold < POSITION_THRESHOLDS["QB"][0]  # bust is genuinely a different, lower cutoff
+
+
+def test_player_point_in_time_metrics_thresholds_are_monotonically_decreasing():
+    """Higher thresholds must never have a higher P(exceeds) than a lower
+    one -- a real CDF guarantees this; a bug in the threshold-probability
+    computation could silently violate it."""
+    df = pd.DataFrame([_row("g1", 5.0, 9.0, 13.0, 18.0, 24.0)])
+    draws = sample_player_week(df, n_sims=20000, seed=11)
+    metrics = player_point_in_time_metrics(draws, ["RB"])
+    probs = [metrics[0]["thresholds"][str(t)] for t in POSITION_THRESHOLDS["RB"]]
+    assert probs == sorted(probs, reverse=True)
+
+
+def test_player_point_in_time_metrics_unmapped_position_is_honestly_null():
+    df = pd.DataFrame([_row("g1", 2.0, 4.0, 6.0, 8.0, 10.0)])
+    draws = sample_player_week(df, n_sims=100, seed=12)
+    metrics = player_point_in_time_metrics(draws, ["K"])
+    assert metrics[0] == {"thresholds": {}, "boom_prob": None, "bust_prob": None}
+
+
+def test_player_point_in_time_metrics_rejects_position_count_mismatch():
+    df = pd.DataFrame([_row("g1", 2.0, 4.0, 6.0, 8.0, 10.0)])
+    draws = sample_player_week(df, n_sims=100, seed=13)
+    with pytest.raises(ValueError):
+        player_point_in_time_metrics(draws, ["QB", "RB"])
+
+
+def test_start_over_replacement_prob_probabilities_sum_to_one_and_favor_the_better_player():
+    df = pd.DataFrame([
+        _row("g1", 10.0, 14.0, 18.0, 22.0, 26.0),  # clearly the stronger play
+        _row("g2", 1.0, 3.0, 5.0, 7.0, 9.0),
+    ])
+    draws = sample_player_week(df, n_sims=20000, seed=14)
+    result = start_over_replacement_prob(draws[0], draws[1])
+    total = result["a_over_b_prob"] + result["b_over_a_prob"] + result["tie_prob"]
+    assert total == pytest.approx(1.0)
+    assert result["a_over_b_prob"] > 0.9
+
+
+def test_start_over_replacement_prob_same_game_correlation_changes_the_answer():
+    """The whole point of simulating rather than comparing point estimates:
+    two players who share a real game (correlated, rho=0.35) should show a
+    MORE decisive start-over-replacement probability (further from 50/50)
+    than the SAME two marginal distributions simulated as if in different
+    games (independent). A shared game environment means A's real edge
+    over B shows up consistently trial-to-trial (both ride the same
+    shootout/slog together, so the comparison mostly reflects their real
+    gap); independent draws add EXTRA uncorrelated noise on top of that
+    gap, which is what lets the weaker player win more often by chance --
+    pulling the probability toward 0.5. (Confirmed directly, not just
+    asserted: rho=0.95 on this same pair pushes a_over_b to ~0.71 and
+    rho=0.0 pulls it to ~0.56, a clean monotonic trend.) This is the
+    property that proves correlation is actually being used, not just
+    plumbed through and ignored."""
+    same_game = pd.DataFrame([
+        _row("shared", 8.0, 11.0, 14.0, 17.0, 20.0),
+        _row("shared", 6.0, 9.5, 13.0, 16.5, 20.0),
+    ])
+    diff_game = pd.DataFrame([
+        _row("g1", 8.0, 11.0, 14.0, 17.0, 20.0),
+        _row("g2", 6.0, 9.5, 13.0, 16.5, 20.0),
+    ])
+    draws_same = sample_player_week(same_game, n_sims=200000, rho=0.35, seed=15)
+    draws_diff = sample_player_week(diff_game, n_sims=200000, rho=0.35, seed=15)
+
+    prob_same = start_over_replacement_prob(draws_same[0], draws_same[1])["a_over_b_prob"]
+    prob_diff = start_over_replacement_prob(draws_diff[0], draws_diff[1])["a_over_b_prob"]
+
+    assert abs(prob_same - 0.5) > abs(prob_diff - 0.5)
+
+
+def test_start_over_replacement_prob_rejects_shape_mismatch():
+    with pytest.raises(ValueError):
+        start_over_replacement_prob(np.zeros(10), np.zeros(20))
 
 
 def test_simulate_matchup_probabilities_sum_to_one():

@@ -221,6 +221,7 @@ These are non-negotiable — they've shaped every decision we've made:
 - **Opportunity Shares panel** (Phase 8 round 1) — plain snap %/target share/carry share/red-zone share, no interpretation layered on. Carry share and red-zone share are read from the export's `trend.<feature>.current` (no `usage.*` counterpart exists for those two); red-zone share specifically uses the properly-combined `trend.red_zone_share`, not the two separate `usage.rz_target_share_ewm3`/`rz_carry_share_ewm3` (different denominators, can't be summed — see design decisions below). Per-stat empty state ("— · No games yet") when a value is null, not a whole-panel placeholder.
 - **Position profile panel** (Phase 4) — a real 6-axis Chart.js percentile radar per position (QB/RB/WR/TE, each axis its own genuinely-informative mix of volume/share/efficiency/situational stats, not a forced identical template), percentiled against this league's real startable-player pool (`position_starter_counts()`, ported from the Weekly Production chart's own `positionStarterCount()`). A raw-value list below the chart shows the actual stat behind each percentile — "Nth percentile" is a rank among startable players at the position, explicitly labeled as such, not a 0-100 quality score. Honest "Not enough games yet" empty state (with the real games-played count) when a player hasn't cleared the games floor; the earlier "Awaiting model output" placeholder still shows for an export that predates this key entirely.
 - **Field heatmap panel** (Phase 5) — a real SVG field-zone grid per position, derived directly from play-by-play (not from any pre-aggregated feature table): receivers (WR/TE, and RB's receiving work) zoned by air-yards depth x field position, runners by direction x field position, QBs by pass location x depth. A fixed-shape grid per zone kind so two players' charts stay visually comparable — an empty cell means zero real plays there, a solidly-colored cell is a real, well-sampled tendency, and a dashed/`~`-marked cell is real but thin (below `HEATMAP_SPARSE_THRESHOLD` plays) so it's shown, not hidden, without being read as confidently as a solid one. RB gets two independent grids (rushing and receiving, matching `getHeatmapTitle()`'s "Rushing Direction & Receiving") since a carry and a target don't share a denominator. Same games-played eligibility floor and honest empty states as the radar panel above.
+- **Boom / Bust panel** — real per-player Monte Carlo metrics (see the finding below): boom/bust rate cards plus a POSITION-SPECIFIC "P(exceeds X)" threshold breakdown, stated in real points rather than a standard-deviation volatility number. The CQR calibration caveat (ceilings run conservative, so boom rates read a bit low) is shown inline in the panel itself, not just in the general `meta.caveats` list. Archive-only seasons (never carry `monte_carlo`, see `getMonteCarlo`'s own comment) get the same honest "Awaiting model output" placeholder as a pre-Phase-4 export.
 - **Weekly Production chart** — real bars, 3 reference lines toggleable via legend:
   - **Season Avg** (dashed gray, on by default) — this player's own avg
   - **Sleeper Proj** (orange line, on by default) — Sleeper's projection per week
@@ -238,6 +239,7 @@ These are non-negotiable — they've shaped every decision we've made:
   compared players (never merged across positions -- see the finding below),
   reusing each player's already-exported `radar` block, same color per
   player as the shelf cards/line chart
+- **Start Over Replacement panel** — real, per-pair Monte Carlo win probability ("% of simulated weeks the first player outscores the second") for every combination among the compared players, computed CLIENT-SIDE from each player's exported quantiles + game_id (see the Monte Carlo finding below for why draws aren't exported and the client re-runs its own copula instead). A same-real-game pair gets a visible "correlated, not independent" note; a pair missing coverage (archived season, or outside QB/RB/WR/TE) gets an honest explanation, not a guessed number.
 - Search & Add Players panel at the bottom with same filters + headshots + projection columns
 
 ---
@@ -1830,6 +1832,145 @@ a real browser via Playwright, zero console errors both times:**
   real axes (Pass Volume ~99th pctl, moderate Yards/Carry and Scramble
   Rate, lower EPA/Dropback and Comp % Over Expected) — never merged with
   the WR axes.
+
+---
+
+## Per-player Monte Carlo metrics findings
+
+**The problem this fixes:** `simulate_matchup()` already drew 10,000
+per-player samples to build each fantasy matchup's win probability, then
+summed them into team totals and discarded the individual draws --
+real, already-computed signal about each PLAYER (not just each team)
+was being thrown away. `src/simulate.py::player_point_in_time_metrics`
+and `start_over_replacement_prob` recover it: boom/bust and
+threshold probabilities from a player's own marginal draws, and a
+genuine correlation-aware win probability between any two players.
+
+**Thresholds are position-specific, derived from real data, not picked
+to look round.** Queried `weekly_scored.parquet`'s real 2021-2025
+`custom_points`, restricted to fantasy-relevant usage (QB: attempts >=
+15; RB: carries+targets >= 8; WR/TE: targets >= 4/3, respectively) to
+avoid the distribution being dragged down by one-target scrubs that
+nobody is actually deciding whether to start. Result (see
+`src/simulate.py::POSITION_THRESHOLDS`/`POSITION_BUST_THRESHOLD` for the
+exact numbers): `[15, 20, 25, 30]` for QB, `[10, 15, 20, 25]` for
+RB/WR, `[8, 12, 16, 20]` for TE, boom = each position's own 3rd
+threshold (~88-93rd percentile of that real population), bust = a
+separate, lower, position-specific cutoff (~12-18th percentile) rather
+than just the smallest "exceeds" threshold. This directly bears out the
+original framing: 20 points sits at the ~78th percentile for a QB
+(good, not exceptional) but beyond the 95th for a TE (a monster week).
+
+**Export decision: ingredients, not draws.** `start_over_replacement_prob`
+needs correlated draws between whichever TWO players the UI is looking
+at right now, which can't be precomputed for every pair (~465 exported
+candidates is over 100,000 possible pairs, and Comparison lets a user
+pick any 4 of them). Two options were on the table:
+  1. Export the raw 10,000-sample draws per player.
+  2. Export what's needed to REGENERATE an equivalent Monte Carlo
+     client-side: the 5 CQR-calibrated quantiles (already computed for
+     the simulator, just not previously exported per-candidate) plus
+     `game_id`.
+Option 1 doesn't fit this project's own economics: 465 players x 10,000
+floats is ~4.6M numbers for ONE week, versus 5 quantiles + one game_id
+(~10 numbers) per player for option 2 -- checked directly against the
+real regenerated export, the actual size difference was ~74 KB added
+for 300 players (270 KB -> 344 KB), not the tens of megabytes option 1
+would have cost. Option 2 works because `sample_player_week`'s
+one-factor Gaussian copula (module docstring, `src/simulate.py`) is a
+small, exact, and public mechanism -- a Monte Carlo ESTIMATE of a
+well-defined probability doesn't need to replay Python's specific random
+draws, only the same model. `index.html` reimplements the identical
+copula in JS (Box-Muller normal sampler, an Abramowitz-Stegun `erf`
+approximation for the normal CDF, the same piecewise-linear
+inverse-quantile function with the same tail extrapolation) and draws
+its OWN fresh sample per comparison, matching `game_id` between two
+players to correlate them exactly like the Python-side simulator.
+`GAME_ENVIRONMENT_RHO = 0.35` is duplicated as a JS constant, same
+must-stay-in-lockstep pattern as `SLEEPER_TO_NFLVERSE_TEAM`/
+`RADAR_CONDENSED_AXES` elsewhere in this file. Results are memoized
+per (season, week, playerA, playerB) client-side (`sorCache`) so the
+displayed percentage doesn't visibly jitter between re-renders that
+have nothing to do with the comparison itself (typing in a filter box,
+sorting a table).
+
+**A candidate with no resolvable real game this week (bye, or an
+unresolvable team) gets `game_id: null` in the export -- honestly "no
+real game to correlate with" -- even though `sample_player_week`
+internally needs a non-null id for its own correlation bucketing.**
+Given a private, per-player synthetic id for that internal call only
+(`build_player_simulation_metrics`, `src/export.py`); a bucket of
+exactly one player behaves as pure idiosyncratic noise since nothing
+else shares that id, so this needs no special-casing inside
+`sample_player_week` itself.
+
+**Archives never carry `monte_carlo`, same reasoning as the top-level
+`simulation` block already being null for them** — an archive's target
+week is a hypothetical week AFTER a completed season (see Phase 9
+findings); there's no real week to simulate outcomes for.
+`scripts/archive_season.py` never passes `player_sim_metrics` to
+`assemble_player_advanced_stats`; `scripts/weekly_update.py` always does
+(independent of whether real Sleeper matchups exist yet -- this covers
+the FULL candidate pool, not just this week's real fantasy starters,
+unlike `build_simulation_block`'s narrower scope).
+
+**Caveat surfaced twice, deliberately.** The general `meta.caveats` list
+got one more terse line ("...ceilings run conservative, so boom
+probabilities read a bit low"); a fuller version
+(`MONTE_CARLO_CALIBRATION_CAVEAT`, `src/export.py`) is ALSO exposed as
+its own `meta.monte_carlo_caveat` field and rendered inline directly
+under both the Boom/Bust panel and the Start Over Replacement panel --
+the numbers this describes are calibration-sensitive enough (coverage
+82.6-86.0% against an 80% target per position, ceiling correction
+overshooting more than the floor's, per the Phase 6 CQR findings above)
+that a reader shouldn't have to go hunting through a general caveats
+list to find the one line that explains why boom rates read a touch
+low.
+
+**Verified against a real, already-completed 2025 week (week 10),
+point-in-time-safe** — truncated `weekly_features.parquet` to strictly
+BEFORE week 10 (same leakage-avoidance `archive_season.py` uses for its
+stub week, just applied to a real past week instead of a hypothetical
+post-season one) before predicting, so week 10's own real outcome never
+leaked into its own prediction:
+- **Volatile vs. steady, same real week:** Jameson Williams (q10=0.3,
+  q50=8.3, q90=21.5 -- an extremely wide range relative to its own
+  median) showed bust_prob=0.252 against Christian McCaffrey's q10=7.8,
+  q50=16.0, q90=26.3 (a high floor) at bust_prob=0.027 and the highest
+  boom_prob (0.336) of the whole spot-checked group -- exactly the
+  "steady, high-floor stud vs. low-volume boom-bust flier" contrast
+  those two players' real profiles predict (matching the SAME
+  characterization the Draft Prep and radar-overlay findings above
+  independently arrived at for these two players).
+- **Correlation is actually being used, not just plumbed through and
+  ignored:** for two real same-game skill-position pairs (Josh Allen vs.
+  Dalton Kincaid, both BUF; Bo Nix vs. Michael Mayer, both DEN), the
+  start-over-replacement probability computed with their real shared
+  `game_id` (correlated) was measurably FURTHER from 50/50 than the
+  SAME two quantile profiles simulated with synthetic, forced-different
+  game ids (independent) -- 0.9704 vs. 0.9367, and 0.8995 vs. 0.8573,
+  respectively. This is the correct direction, confirmed by a targeted
+  numeric check before writing the assertion: a shared game environment
+  means a real skill gap between two players shows up CONSISTENTLY
+  trial-to-trial (both ride the same shootout or slog together), while
+  independent draws add EXTRA uncorrelated noise on top of that gap --
+  which is what lets a weaker player win more often by chance,
+  pulling the independent-case probability closer to 0.5. (Sweeping
+  rho from 0 to 0.95 on one fixed pair showed a clean monotonic trend
+  confirming this, not a coincidence of one specific pair.)
+- **Frontend verified via Playwright against the real regenerated live
+  export** (2026 week 1, `scripts/weekly_update.py` run for real,
+  300/300 candidates covered, `monte_carlo_probabilities_in_range: True`):
+  Boom/Bust panel renders real numbers plus the inline caveat on Player
+  Detail; Start Over Replacement renders a real percentage plus a "same
+  real game -- correlated" note for a real same-game pair (Christian
+  McCaffrey vs. Puka Nacua, both `2026_01_SF_LA`) and no such note for a
+  different-game pair; switching to an archived season shows the honest
+  "no Monte Carlo data" fallback rather than a stale or fabricated
+  number. Zero console errors introduced (the one pre-existing,
+  unrelated CORS failure is the NFL Schedule sidebar's live ESPN
+  scoreboard fetch, which fails under any ad-hoc local dev server
+  regardless of this feature).
 
 ---
 

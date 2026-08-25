@@ -56,9 +56,9 @@ import pandas as pd  # noqa: E402
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
     CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_heatmap_snapshot,
-    build_matchup_simulation, build_playoff_odds, build_radar_snapshot, build_starter_quantile_rows,
-    build_target_week_features, build_team_game_id_lookup, build_trend_snapshot, build_usage_snapshot,
-    build_weekly_xfp, build_xfp_summary, get_export_candidates, get_export_scope,
+    build_matchup_simulation, build_playoff_odds, build_player_simulation_metrics, build_radar_snapshot,
+    build_starter_quantile_rows, build_target_week_features, build_team_game_id_lookup, build_trend_snapshot,
+    build_usage_snapshot, build_weekly_xfp, build_xfp_summary, get_export_candidates, get_export_scope,
     predict_target_week_from_artifact, validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
@@ -366,11 +366,23 @@ def main() -> None:
     n_heatmap_eligible = sum(1 for h in heatmap.values() if h["eligible"])
     print(f"    heatmap: {n_heatmap_eligible}/{len(heatmap)} candidates eligible (>= games played floor)")
 
+    # Per-player Monte Carlo: boom/bust + threshold probabilities, plus the
+    # game_id + quantiles the dashboard needs for an ad-hoc start-over-
+    # replacement comparison between any two exported players (see
+    # build_player_simulation_metrics's own docstring for why raw draws
+    # aren't exported). Independent of build_simulation_block below -- this
+    # covers the FULL candidate pool, not just this week's real starters.
+    player_sim_metrics = build_player_simulation_metrics(
+        combined_features, schedule_current, current_season, target_week, artifact
+    )
+    print(f"    player Monte Carlo metrics: {len(player_sim_metrics)} candidates")
+
     payload, crosswalk_report = assemble_player_advanced_stats(
         scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, heatmap, crosswalk,
         current_season, target_week, xfp_season, artifact["seasons_trained"], artifact["model_version"],
         performance=artifact["performance"],
         caveats=CAVEATS + WEEKLY_EXTRA_CAVEATS,
+        player_sim_metrics=player_sim_metrics,
     )
     print(f"    crosswalk match rate: {crosswalk_report}")
 
