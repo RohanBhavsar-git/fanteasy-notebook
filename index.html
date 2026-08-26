@@ -795,6 +795,19 @@
       border: 2px solid #0a3814;
     }
     .field-svg { width: 100%; height: 100%; display: block; }
+    /* Small-multiples row (field position: red zone / midfield / backed
+       up) -- same .field-container shape repeated 2-3 times side by side,
+       each a bit narrower so the row fits without changing what each
+       diagram itself looks like. Wraps below ~480px so a small multiple
+       never gets so narrow its heat bands become unreadable. */
+    .field-multiples {
+      display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px;
+    }
+    .field-multiples .field-multiple { flex: 1 1 140px; min-width: 0; }
+    .field-multiple-caption {
+      font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
+      color: var(--text-secondary); margin-bottom: 4px; text-align: center;
+    }
     .field-legend {
       display: flex; justify-content: space-between; align-items: center;
       margin-top: 10px; font-size: 11px; color: var(--text-secondary);
@@ -3800,35 +3813,79 @@
     `;
   }
 
-  // Phase 5: Field Heatmap. Axis label text for the grid's row/column
-  // headers -- duplicated from src/usage.py's HEATMAP_ZONE_LABELS the same
-  // way TREND_FEATURE_LABELS above is duplicated from its Python
-  // counterpart: this is fixed, cosmetic display text, not business logic
-  // that could silently drift into a wrong number.
-  const HEATMAP_AXIS_LABELS = {
-    behind_los: 'Behind LOS', short: 'Short', intermediate: 'Intermediate', deep: 'Deep',
-    red_zone: 'Red Zone', midfield: 'Midfield', backfield: 'Backfield',
-    left: 'Left', middle: 'Middle', right: 'Right',
-  };
+  // Phase 5 (redesigned): Field Heatmap, as an actual football field
+  // instead of a labeled grid. The grid was accurate but abstract -- this
+  // is spatial data (depth, direction, field position), and a diagram
+  // reads it the way a real usage map should: a deep threat's heat sits
+  // visibly far from the line of scrimmage, a possession receiver's sits
+  // right on top of it, no percentages need reading to see the difference.
+  //
+  // The design problem the grid didn't solve: depth and direction map
+  // naturally onto a field graphic (they're both "where on the field, and
+  // which way"), but FIELD POSITION doesn't -- a 15-yard target looks
+  // identical whether the drive started at midfield or the opponent's 25.
+  // So depth/direction become the heat drawn ON one field diagram, and
+  // field position becomes SMALL MULTIPLES: two or three same-shape field
+  // diagrams side by side (one per field-position bin), each just showing
+  // where that situation actually happens on a real field. Passing has no
+  // field-position axis at all (its two axes are location and depth, both
+  // spatial), so it gets one full diagram with both plotted directly.
+  //
+  // Every diagram shares ONE coordinate system (FIELD_VB_W/H) regardless
+  // of how many sit in a row -- this is what keeps two players' charts
+  // (and, within one player, the red zone/midfield/backed up panels)
+  // pixel-for-pixel comparable, the same guarantee the old fixed grid made.
+  const FIELD_VB_W = 400, FIELD_VB_H = 230;
+  const FIELD_ENDZONE_W = 22;                          // px, each end zone
+  const FIELD_PLAY_W = FIELD_VB_W - FIELD_ENDZONE_W * 2; // the 100-yard field
+  const FIELD_PX_PER_YARD = FIELD_PLAY_W / 100;
+  const FIELD_TOP_MARGIN = 16; // room for the "LOS" label so it never overlaps the heat drawn just below it
+  const FIELD_PLAY_H = FIELD_VB_H - FIELD_TOP_MARGIN;
 
-  // Row/column order per zone kind. Rows run shallow/near-LOS at the
-  // bottom to downfield/deep at the top, matching real field orientation;
-  // columns run left-to-right. MUST match src/usage.py's zone_a/zone_b
-  // order for that kind (receiving: depth|field_pos; passing:
-  // location|depth; rushing: direction|field_pos) -- every zone.id from
-  // the export is exactly `${col}|${row}` as a result, so no
-  // reformatting is needed to look one up.
-  const HEATMAP_GRID_AXES = {
-    receiving: { cols: ['behind_los', 'short', 'intermediate', 'deep'], rows: ['red_zone', 'midfield', 'backfield'] },
-    passing: { cols: ['left', 'middle', 'right'], rows: ['deep', 'intermediate', 'short', 'behind_los'] },
-    rushing: { cols: ['left', 'middle', 'right'], rows: ['red_zone', 'midfield', 'backfield'] },
-  };
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // Representative yardline_100 (distance from the OPPONENT's end zone) for
+  // each field-position small multiple -- a single fixed, recognizable
+  // point inside that bin's real range (src/usage.py's HEATMAP_FIELD_POS_
+  // BINS: red_zone <=20, midfield 20-50, backfield >50), NOT a computed
+  // average. It exists only to place the line of scrimmage somewhere a
+  // viewer immediately reads as "this is the red zone one" -- the real
+  // data is the heat shading drawn around it, same as every other display
+  // anchor in this pipeline (e.g. RADAR_METRICS's axis choices).
+  const HEATMAP_FIELD_POS_PANELS = [
+    { key: 'red_zone', label: 'Red Zone', yardline100: 10 },
+    { key: 'midfield', label: 'Midfield', yardline100: 50 },
+    { key: 'backfield', label: 'Backed Up', yardline100: 80 },
+  ];
+
+  // Depth bands in yards relative to the LOS (negative = behind it) --
+  // boundaries mirror src/usage.py's HEATMAP_DEPTH_BINS exactly (0/10/20).
+  // behind_los has no real lower bound in the data (it's "anything behind
+  // the LOS"); deep has no real upper bound ("20+") -- both are capped
+  // here purely for a sane band width to draw, not a claim about the data.
+  const HEATMAP_DEPTH_BANDS = [
+    { key: 'behind_los', label: 'Behind LOS', fromYd: -6, toYd: 0 },
+    { key: 'short', label: 'Short', fromYd: 0, toYd: 10 },
+    { key: 'intermediate', label: 'Intermediate', fromYd: 10, toYd: 20 },
+    { key: 'deep', label: 'Deep', fromYd: 20, toYd: 34 },
+  ];
+
+  // Direction lanes, mapped to horizontal thirds of the field's width (top
+  // = the offense's own left, since run_location/pass_location in the raw
+  // pbp data are recorded from the OFFENSE's own perspective facing the
+  // defense -- an arbitrary but fixed, documented convention, the same
+  // kind of choice PROJECT_CONTEXT.md's spread_line sign note already is.
+  const HEATMAP_DIRECTION_LANES = [
+    { key: 'left', label: 'Left' },
+    { key: 'middle', label: 'Middle' },
+    { key: 'right', label: 'Right' },
+  ];
 
   // 3-stop lerp matching the .legend-bar gradient (rgba(255,255,255,0.1)
-  // -> #fbbf24 -> #ef4444) exactly, so the legend swatch and the cells it
+  // -> #fbbf24 -> #ef4444) exactly, so the legend swatch and the zones it
   // describes always mean the same thing. t is a zone's share relative to
   // its group's OWN highest share (not an absolute scale) -- the most-used
-  // zone for THIS player is always the hottest cell, the same way a real
+  // zone for THIS player is always the hottest one, the same way a real
   // usage map should read regardless of whether this player is high- or
   // low-volume overall.
   function heatCellColor(t) {
@@ -3840,59 +3897,214 @@
     return `rgba(${Math.round(lerp(0))}, ${Math.round(lerp(1))}, ${Math.round(lerp(2))}, ${lerp(3).toFixed(2)})`;
   }
 
-  // Builds the inner SVG markup for one heatmap group (one of "receiving"/
-  // "rushing"/"passing") as a FIXED-size grid -- every player shows the
-  // same row/column shape for a given kind, with a cell left as a faint
-  // outline (no fill, no label) when this player has zero real plays
-  // there, so a real, populated cell always stands out and two players'
-  // charts stay visually comparable at a glance. A real cell's tooltip
-  // (native SVG <title>, no JS needed) states the exact play count and
-  // share; sparse cells (< HEATMAP_SPARSE_THRESHOLD plays, per the
-  // export) get a dashed border and a small "~" mark instead of being
-  // rendered as solidly as a real trend.
-  function heatmapGroupSvg(group) {
-    const axes = HEATMAP_GRID_AXES[group.kind];
+  function heatZoneTooltip(zone, kind) {
+    return `${zone.label}: ${zone.count} play${zone.count === 1 ? '' : 's'} (${(zone.share * 100).toFixed(0)}% of this player's ${kind})${zone.sparse ? ' -- thin sample' : ''}`;
+  }
+
+  // Draws the field ITSELF -- green playing surface, darker end zones,
+  // 10-yard grid lines (bolder at the 50 for orientation), sideline/goal
+  // line borders, and the line of scrimmage as a bold dashed marker at the
+  // real yardline_100 this diagram represents. Every heat overlay below is
+  // drawn relative to the returned losX, so "the player's position on the
+  // field" is always visually literal, not implied by a label alone.
+  function fieldBackgroundSvg(yardline100) {
+    const top = FIELD_TOP_MARGIN;
+    let svg = `<rect x="0" y="${top}" width="${FIELD_VB_W}" height="${FIELD_PLAY_H}" fill="#0a3814"/>`;
+    svg += `<rect x="${FIELD_ENDZONE_W}" y="${top}" width="${FIELD_PLAY_W}" height="${FIELD_PLAY_H}" fill="#0d4f1c"/>`;
+    for (let yd = 0; yd <= 100; yd += 10) {
+      const x = FIELD_ENDZONE_W + yd * FIELD_PX_PER_YARD;
+      const isMid = yd === 50;
+      svg += `<line x1="${x}" y1="${top}" x2="${x}" y2="${FIELD_VB_H}" stroke="rgba(255,255,255,${isMid ? 0.5 : 0.2})" stroke-width="${isMid ? 1.5 : 1}"/>`;
+    }
+    svg += `<rect x="0.5" y="${top + 0.5}" width="${FIELD_VB_W - 1}" height="${FIELD_PLAY_H - 1}" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="1.5"/>`;
+    svg += `<line x1="${FIELD_ENDZONE_W}" y1="${top}" x2="${FIELD_ENDZONE_W}" y2="${FIELD_VB_H}" stroke="rgba(255,255,255,0.4)" stroke-width="1.5"/>`;
+    svg += `<line x1="${FIELD_VB_W - FIELD_ENDZONE_W}" y1="${top}" x2="${FIELD_VB_W - FIELD_ENDZONE_W}" y2="${FIELD_VB_H}" stroke="rgba(255,255,255,0.4)" stroke-width="1.5"/>`;
+
+    const losX = FIELD_ENDZONE_W + (100 - yardline100) * FIELD_PX_PER_YARD;
+    svg += `<line x1="${losX}" y1="${top}" x2="${losX}" y2="${FIELD_VB_H}" stroke="#facc15" stroke-width="3" stroke-dasharray="6,3"/>`;
+    svg += `<circle cx="${losX}" cy="${FIELD_VB_H - 8}" r="3.5" fill="#facc15"/>`;
+    // Label lives in the top margin, ABOVE the playing field entirely, so
+    // it never sits on top of a heat zone regardless of how tall that
+    // zone's box grows (a dominant zone can grow to nearly full height).
+    const losLabelLeft = losX > FIELD_VB_W / 2;
+    svg += `<text x="${losX + (losLabelLeft ? -6 : 6)}" y="11" fill="#facc15" font-size="10" font-weight="800" text-anchor="${losLabelLeft ? 'end' : 'start'}">LOS</text>`;
+    return { svg, losX };
+  }
+
+  // Every overlay below double-encodes frequency -- SIZE as well as shade
+  // (the design brief's "heat sized or shaded" taken as both, not an
+  // either/or) -- because color alone doesn't survive being rendered at
+  // small-multiple size: three panels side by side are each a third the
+  // width the old single grid had, and a color-only difference between a
+  // 6% cell and a 25% cell gets hard to see fast at that size. A SIZE
+  // difference doesn't have that problem -- a band or bar that's visibly
+  // bigger reads as "more" even in a thumbnail, which is the whole point
+  // (see this section's own verification: Shakir's short/behind-LOS bands
+  // should visibly loom over his sliver of a deep band, and vice versa for
+  // a real deep threat, without reading a single percentage).
+  const HEAT_MIN_SIZE_FRAC = 0.14; // a real-but-small zone still shows as a visible sliver, never truly invisible
+
+  // Single-axis heat (depth only) spanning the field's full width, for one
+  // field-position small multiple -- receivers have no direction data, so
+  // each depth band's HEIGHT (centered vertically) is what shows how much
+  // of this player's usage sits there; a faint full-height track behind it
+  // marks where that depth range sits on the field even when unused.
+  // `maxShare` is passed in from the whole group (every field-position
+  // panel combined) so size/color both mean the same thing across all
+  // three panels, not just within one.
+  function depthHeatOverlaySvg(losX, zoneByDepth, maxShare, kind) {
+    const fullH = FIELD_PLAY_H - 6, midY = FIELD_TOP_MARGIN + FIELD_PLAY_H / 2;
+    let svg = '';
+    HEATMAP_DEPTH_BANDS.forEach(band => {
+      const x1 = clamp(losX + band.fromYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
+      const x2 = clamp(losX + band.toYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
+      const w = Math.max(x2 - x1, 1);
+      const zone = zoneByDepth[band.key];
+      svg += `<rect x="${x1}" y="${FIELD_TOP_MARGIN + 3}" width="${w}" height="${fullH}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
+      if (!zone) return;
+      const t = zone.share / maxShare;
+      const h = fullH * (HEAT_MIN_SIZE_FRAC + (1 - HEAT_MIN_SIZE_FRAC) * t);
+      const y = midY - h / 2;
+      const fill = heatCellColor(t);
+      const dash = zone.sparse ? ' stroke-dasharray="4,3"' : '';
+      svg += `<rect x="${x1}" y="${y}" width="${w}" height="${h}" fill="${fill}" stroke="rgba(255,255,255,0.6)" stroke-width="1.5"${dash}><title>${heatZoneTooltip(zone, kind)}</title></rect>`;
+      if (w >= 18 && h >= 16) {
+        svg += `<text x="${(x1 + x2) / 2}" y="${midY + 6}" fill="white" font-size="18" font-weight="800" text-anchor="middle" pointer-events="none">${Math.round(zone.share * 100)}%</text>`;
+      }
+      if (zone.sparse) {
+        svg += `<text x="${(x1 + x2) / 2}" y="15" fill="rgba(255,255,255,0.9)" font-size="11" font-weight="800" text-anchor="middle" pointer-events="none">~</text>`;
+      }
+    });
+    return svg;
+  }
+
+  // Direction-only heat (left/middle/right lanes) for one field-position
+  // small multiple -- rushing zones carry no depth data, so each lane is
+  // drawn as a bar extending from the LOS, LENGTH proportional to share
+  // (not a fixed chunk shaded by color) -- an unused lane shows almost no
+  // colored bar at all next to a heavily-used lane's long one, which is
+  // the literal "gaps visible" this was built for. Lane POSITION (top =
+  // left, middle, bottom = right) stays fixed regardless of share -- only
+  // the bar length varies, so "which lane is which" never has to be
+  // re-read.
+  const RUSH_BAR_MIN_YARDS = 2, RUSH_BAR_MAX_YARDS = 11;
+  function directionHeatOverlaySvg(losX, zoneByDir, maxShare, kind) {
+    const laneH = (FIELD_PLAY_H - 6) / HEATMAP_DIRECTION_LANES.length;
+    const trackX2 = clamp(losX + RUSH_BAR_MAX_YARDS * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
+    let svg = '';
+    HEATMAP_DIRECTION_LANES.forEach((lane, i) => {
+      const y = FIELD_TOP_MARGIN + 3 + i * laneH, barY = y + 3, barH = laneH - 6;
+      const zone = zoneByDir[lane.key];
+      svg += `<rect x="${losX}" y="${barY}" width="${trackX2 - losX}" height="${barH}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
+      if (!zone) return;
+      const t = zone.share / maxShare;
+      const barYd = RUSH_BAR_MIN_YARDS + (RUSH_BAR_MAX_YARDS - RUSH_BAR_MIN_YARDS) * t;
+      const x2 = clamp(losX + barYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
+      const w = Math.max(x2 - losX, 2);
+      const fill = heatCellColor(t);
+      const dash = zone.sparse ? ' stroke-dasharray="4,3"' : '';
+      svg += `<rect x="${losX}" y="${barY}" width="${w}" height="${barH}" fill="${fill}" stroke="rgba(255,255,255,0.6)" stroke-width="1.5"${dash}><title>${heatZoneTooltip(zone, kind)}</title></rect>`;
+      const label = `${Math.round(zone.share * 100)}%`;
+      if (w >= 24) {
+        svg += `<text x="${losX + w / 2}" y="${barY + barH / 2 + 5}" fill="white" font-size="14" font-weight="800" text-anchor="middle" pointer-events="none">${label}</text>`;
+      } else {
+        svg += `<text x="${x2 + 4}" y="${barY + barH / 2 + 4}" fill="rgba(255,255,255,0.9)" font-size="12" font-weight="800" text-anchor="start" pointer-events="none">${label}</text>`;
+      }
+      if (zone.sparse) {
+        svg += `<text x="${losX + 4}" y="${barY + 10}" fill="rgba(255,255,255,0.9)" font-size="11" font-weight="800" text-anchor="start" pointer-events="none">~</text>`;
+      }
+    });
+    return svg;
+  }
+
+  // Full 2-D heat (location x depth) on ONE diagram -- passing is the one
+  // kind whose two real axes (direction AND depth) are both spatial, so it
+  // never needed the field-position small-multiple treatment at all: one
+  // field, one grid drawn directly on it. Position is fixed by the grid
+  // (12 real cells, each a real location x depth combination), so size
+  // here means each cell SHRINKS toward its center as share drops --
+  // a heavily-thrown zone fills its whole cell, a rarely-thrown one draws
+  // as a small, faint square inside the same footprint.
+  function passingHeatOverlaySvg(losX, zones, maxShare) {
     const zoneByKey = {};
-    group.zones.forEach(z => { zoneByKey[z.id] = z; });
-    const maxShare = Math.max(...group.zones.map(z => z.share), 0.0001);
-
-    const marginLeft = 78, marginTop = 22, marginRight = 8, marginBottom = 8;
-    const gridW = 400 - marginLeft - marginRight;
-    const gridH = 280 - marginTop - marginBottom;
-    const cellW = gridW / axes.cols.length, cellH = gridH / axes.rows.length;
-    const pad = 2;
-
-    let svg = `<rect width="400" height="280" fill="#0d4f1c"/>`;
-
-    axes.cols.forEach((col, j) => {
-      const cx = marginLeft + j * cellW + cellW / 2;
-      svg += `<text x="${cx}" y="14" fill="rgba(255,255,255,0.75)" font-size="9" font-weight="700" text-anchor="middle">${HEATMAP_AXIS_LABELS[col]}</text>`;
-    });
-    axes.rows.forEach((row, i) => {
-      const cy = marginTop + i * cellH + cellH / 2 + 3;
-      svg += `<text x="${marginLeft - 8}" y="${cy}" fill="rgba(255,255,255,0.75)" font-size="9" font-weight="700" text-anchor="end">${HEATMAP_AXIS_LABELS[row]}</text>`;
-    });
-
-    axes.rows.forEach((row, i) => {
-      axes.cols.forEach((col, j) => {
-        const x = marginLeft + j * cellW, y = marginTop + i * cellH;
-        const zone = zoneByKey[`${col}|${row}`];
-        if (!zone) {
-          svg += `<rect x="${x + pad}" y="${y + pad}" width="${cellW - pad * 2}" height="${cellH - pad * 2}" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.08)" stroke-width="1" rx="4"/>`;
-          return;
-        }
-        const fill = heatCellColor(zone.share / maxShare);
+    zones.forEach(z => { zoneByKey[z.id] = z; });
+    const laneH = (FIELD_PLAY_H - 6) / HEATMAP_DIRECTION_LANES.length;
+    let svg = '';
+    HEATMAP_DIRECTION_LANES.forEach((lane, i) => {
+      const y = FIELD_TOP_MARGIN + 3 + i * laneH;
+      HEATMAP_DEPTH_BANDS.forEach(band => {
+        const x1 = clamp(losX + band.fromYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
+        const x2 = clamp(losX + band.toYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
+        const cw = Math.max(x2 - x1, 1), ch = laneH - 2;
+        const zone = zoneByKey[`${lane.key}|${band.key}`];
+        svg += `<rect x="${x1}" y="${y}" width="${cw}" height="${ch}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
+        if (!zone) return;
+        const t = zone.share / maxShare;
+        const sizeFrac = HEAT_MIN_SIZE_FRAC + (1 - HEAT_MIN_SIZE_FRAC) * t;
+        const rw = cw * sizeFrac, rh = ch * sizeFrac;
+        const rx = x1 + (cw - rw) / 2, ry = y + (ch - rh) / 2;
+        const fill = heatCellColor(t);
         const dash = zone.sparse ? ' stroke-dasharray="3,3"' : '';
-        const tooltip = `${zone.label}: ${zone.count} play${zone.count === 1 ? '' : 's'} (${(zone.share * 100).toFixed(0)}% of this player's ${group.kind})${zone.sparse ? ' -- thin sample' : ''}`;
-        svg += `<rect x="${x + pad}" y="${y + pad}" width="${cellW - pad * 2}" height="${cellH - pad * 2}" fill="${fill}" stroke="rgba(255,255,255,0.4)" stroke-width="1"${dash} rx="4"><title>${tooltip}</title></rect>`;
-        svg += `<text x="${x + cellW / 2}" y="${y + cellH / 2 + 4}" fill="white" font-size="12" font-weight="800" text-anchor="middle" pointer-events="none">${Math.round(zone.share * 100)}%</text>`;
+        svg += `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${fill}" stroke="rgba(255,255,255,0.6)" stroke-width="1"${dash}><title>${heatZoneTooltip(zone, 'passing')}</title></rect>`;
+        if (rw >= 20 && rh >= 14) {
+          svg += `<text x="${rx + rw / 2}" y="${ry + rh / 2 + 4}" fill="white" font-size="10" font-weight="800" text-anchor="middle" pointer-events="none">${Math.round(zone.share * 100)}%</text>`;
+        }
         if (zone.sparse) {
-          svg += `<text x="${x + cellW - 7}" y="${y + 13}" fill="rgba(255,255,255,0.85)" font-size="10" font-weight="800" text-anchor="end" pointer-events="none">~</text>`;
+          svg += `<text x="${x1 + cw - 6}" y="${y + 11}" fill="rgba(255,255,255,0.9)" font-size="9" font-weight="800" text-anchor="end" pointer-events="none">~</text>`;
         }
       });
     });
-
     return svg;
+  }
+
+  // One <div class="field-container"><svg>...field diagram, wrapped with
+  // an optional caption -- shared by both the small-multiple panels and
+  // the single full-width passing diagram so they're built from the same
+  // markup shape.
+  function fieldPanelHtml(yardline100, overlaySvg, caption) {
+    const { svg: bg, losX } = fieldBackgroundSvg(yardline100);
+    return `
+      <div class="field-multiple">
+        ${caption ? `<div class="field-multiple-caption">${caption}</div>` : ''}
+        <div class="field-container">
+          <svg class="field-svg" viewBox="0 0 ${FIELD_VB_W} ${FIELD_VB_H}" xmlns="http://www.w3.org/2000/svg">${bg}${overlaySvg(losX)}</svg>
+        </div>
+      </div>
+    `;
+  }
+
+  // Builds one group's full field display -- 3 small multiples (by field
+  // position) for receiving/rushing, or 1 full diagram for passing.
+  function heatmapGroupFieldsHtml(group) {
+    const maxShare = Math.max(...group.zones.map(z => z.share), 0.0001);
+
+    if (group.kind === 'passing') {
+      // One diagram, not a row of small multiples -- passing's two real
+      // axes (location, depth) are both spatial already, so there's no
+      // field-position dimension left to split into panels. Still wrapped
+      // in .field-multiples so the same CSS handles both shapes.
+      return `<div class="field-multiples">${fieldPanelHtml(50, losX => passingHeatOverlaySvg(losX, group.zones, maxShare), null)}</div>`;
+    }
+
+    const zonesByFieldPos = {};
+    group.zones.forEach(z => {
+      const [axisA, fieldPos] = z.id.split('|');
+      (zonesByFieldPos[fieldPos] ??= {})[axisA] = z;
+    });
+
+    return `
+      <div class="field-multiples">
+        ${HEATMAP_FIELD_POS_PANELS.map(panel => {
+          const zoneByAxis = zonesByFieldPos[panel.key] || {};
+          const panelPlays = Object.values(zoneByAxis).reduce((sum, z) => sum + z.count, 0);
+          const overlay = group.kind === 'rushing'
+            ? (losX => directionHeatOverlaySvg(losX, zoneByAxis, maxShare, group.kind))
+            : (losX => depthHeatOverlaySvg(losX, zoneByAxis, maxShare, group.kind));
+          const caption = `${panel.label}${panelPlays ? ` · ${panelPlays} play${panelPlays === 1 ? '' : 's'}` : ''}`;
+          return fieldPanelHtml(panel.yardline100, overlay, caption);
+        }).join('')}
+      </div>
+    `;
   }
 
   // Three states, same honesty pattern as renderPositionProfilePanel: a
@@ -3955,9 +4167,7 @@
         </div>
         ${heatmap.groups.map(g => `
           ${multiGroup ? `<div class="heatmap-group-title">${GROUP_TITLES[g.kind] || g.kind} · ${g.total_plays} plays</div>` : ''}
-          <div class="field-container" style="margin-bottom: 10px;">
-            <svg class="field-svg" viewBox="0 0 400 280" xmlns="http://www.w3.org/2000/svg">${heatmapGroupSvg(g)}</svg>
-          </div>
+          ${heatmapGroupFieldsHtml(g)}
         `).join('')}
         <div class="field-legend">
           <span>Share of this player's ${multiGroup ? 'plays in each category' : heatmap.groups[0].kind}</span>
@@ -3967,7 +4177,9 @@
         </div>
         <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 8px;">
           ~ marks a zone with fewer than ${heatmap.sparse_threshold} real plays this season -- shown, not hidden,
-          but too thin a sample to read as a real tendency yet.
+          but too thin a sample to read as a real tendency yet. Yellow dashed line is the line of scrimmage;
+          each small field shows a different part of the field (red zone / midfield / backed up), same shape
+          every time so this player's panels -- and two players' panels side by side -- stay comparable.
         </div>
       </div>
     `;
