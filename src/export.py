@@ -699,6 +699,104 @@ def build_defense_rankings(
     return out
 
 
+def build_season_defense_rankings(historical_features: pd.DataFrame, schedule: pd.DataFrame, season: int) -> dict:
+    """
+    Season-ARCHIVE counterpart to build_defense_rankings -- a full,
+    COMPLETED season's real xFP allowed per game, per position, per team.
+
+    Deliberately NOT built by calling build_defense_strength_table at the
+    archive's stub week (one past the season's real end, the same
+    hypothetical week build_radar_snapshot/build_heatmap_snapshot already
+    use): that function's `allowed` side is point-in-time-safe by
+    construction, meaning a team's OWN value at week W reflects its games
+    STRICTLY BEFORE W -- for that mechanism to reach "the whole real
+    season," it needs a row at "one past the end" to shift() the last real
+    week's value into, which itself requires resolving that hypothetical
+    week's OPPONENT from the schedule. There isn't one -- the season is
+    over, so the stub week has no real game, and every team's `allowed`
+    row for it drops out of build_defense_strength_table entirely (no
+    match in `_team_week_opponent`). A season retrospective isn't
+    predicting anything, so there's nothing to protect from leakage here --
+    same reasoning build_xfp_summary already uses for reading REAL,
+    unshifted per-week xfp rather than the lagged `_ewm3`/`_s2d` columns:
+    "this is a season retrospective for a human reader, not a model
+    feature."
+
+    Opponent-adjusted the same single-pass way as
+    build_defense_strength_table (subtract how much stronger/weaker, on
+    average, the offenses a defense faced were than the league average),
+    just computed over the whole real season's games at once, in
+    xFP-per-game units throughout (a full-season SUM would put allowed and
+    opponent-strength on mismatched scales across teams that played
+    different numbers of real games due to a bye).
+
+    Returns the same shape as build_defense_rankings:
+    {position: [{"team", "raw_ewm3", "raw_s2d", "adj_ewm3", "adj_s2d",
+    "rank"}, ...]}, most-favorable-first. raw_ewm3 == raw_s2d and
+    adj_ewm3 == adj_s2d here -- there's no separate "recency" vs.
+    "season-to-date" distinction for a season that's already over, but the
+    same field names are kept so index.html's panel rendering needs no
+    archive-specific branch.
+    """
+    from src.usage import OPP_STRENGTH_POSITIONS, _team_week_opponent
+
+    season_rows = historical_features[
+        (historical_features["season"] == season) & historical_features["position"].isin(OPP_STRENGTH_POSITIONS)
+    ]
+    generated_weekly = (
+        season_rows.groupby(["team", "position", "week"])["xfp"].sum(min_count=1)
+        .reset_index(name="generated")
+    )
+    team_avg_generated = (
+        generated_weekly.groupby(["team", "position"])["generated"].mean()
+        .reset_index(name="avg_generated")
+    )
+    league_avg_generated = (
+        team_avg_generated.groupby("position")["avg_generated"].mean()
+    )
+
+    team_week_opp = _team_week_opponent(schedule[schedule["season"] == season])
+    allowed_weekly = generated_weekly.merge(
+        team_week_opp, on=["team", "week"], how="left"
+    ).dropna(subset=["opponent"])
+    allowed_avg = (
+        allowed_weekly.groupby(["opponent", "position"])["generated"].mean()
+        .reset_index().rename(columns={"opponent": "team", "generated": "avg_allowed"})
+    )
+
+    # Opponent adjustment: for each defense's real games this season,
+    # average the OPPONENT's own season-long per-game generated average
+    # (a stable, already-computed full-season number, not a single
+    # week's noisy value), then compare that to the league-wide average.
+    opponents_faced = allowed_weekly.merge(
+        team_avg_generated.rename(columns={"team": "team_opp", "avg_generated": "opp_avg_generated"}),
+        left_on=["team", "position"], right_on=["team_opp", "position"], how="left",
+    )
+    avg_opponent_strength = (
+        opponents_faced.groupby(["opponent", "position"])["opp_avg_generated"].mean()
+        .reset_index().rename(columns={"opponent": "team"})
+    )
+
+    out: dict = {}
+    for position in OPP_STRENGTH_POSITIONS:
+        pos_allowed = allowed_avg[allowed_avg["position"] == position].set_index("team")["avg_allowed"]
+        pos_opp_strength = avg_opponent_strength[avg_opponent_strength["position"] == position].set_index("team")["opp_avg_generated"]
+        league_avg = league_avg_generated.get(position, float("nan"))
+
+        rows = []
+        for team, allowed in pos_allowed.items():
+            sos_correction = pos_opp_strength.get(team, float("nan")) - league_avg
+            adj_allowed = allowed - sos_correction
+            rows.append({"team": team, "raw": round(float(allowed), 2), "adj": round(float(adj_allowed), 2)})
+        rows.sort(key=lambda r: r["adj"], reverse=True)
+        out[position] = [
+            {"team": r["team"], "raw_ewm3": r["raw"], "raw_s2d": r["raw"],
+             "adj_ewm3": r["adj"], "adj_s2d": r["adj"], "rank": rank}
+            for rank, r in enumerate(rows, start=1)
+        ]
+    return out
+
+
 def build_radar_snapshot(
     combined_features: pd.DataFrame,
     target_season: int,
@@ -983,6 +1081,85 @@ def build_weekly_xfp(historical_features: pd.DataFrame, target_season: int) -> p
     return season_rows.dropna(subset=["xfp"])[["player_id", "week", "xfp"]].reset_index(drop=True)
 
 
+def build_weekly_matchup(historical_features: pd.DataFrame, target_season: int) -> pd.DataFrame:
+    """
+    Per-player, per-week REAL Family 5B matchup for target_season's played
+    weeks -- the same per-row `opponent`/OPPONENT_STRENGTH_OUTPUT_COLUMNS
+    values add_opponent_strength_features already computed for that exact
+    week (the point-in-time-safe number that week's row actually used, not
+    re-derived here), plus a RANK among that same week's other opponents
+    (build_matchup_snapshot/build_defense_rankings only ever rank the one
+    upcoming target week; this ranks every played week, the same "one
+    value per already-played week" shape build_weekly_xfp already
+    established for the analogous xFP-over-time need).
+
+    This is what makes a real per-player matchup indicator possible for a
+    SEASON ARCHIVE, which has no single "current/upcoming week" the live
+    dashboard's `matchup` block relies on (see build_matchup_snapshot's
+    own docstring, and build_season_defense_rankings' for why the archive
+    stub week itself can't resolve a real opponent) -- and, for the LIVE
+    export, also lets index.html show a real matchup when browsing an
+    ALREADY-PLAYED week of the CURRENT season, not just the upcoming one.
+    Nothing here is a forecast: every value describes a game that has
+    already been played, so there's no leakage concern in reporting it
+    plainly, the same reasoning build_weekly_xfp already uses.
+
+    Ranking mechanics: for each (week, position), the DISTINCT opponents
+    that week (deduped first -- every candidate facing the same opponent
+    that week carries an identical `opp_def_xfp_allowed_adj_s2d` value, by
+    construction, so ranking the un-deduped rows would let a heavily-
+    targeted defense's rank be computed multiple times, harmlessly
+    redundant but wasteful) are ranked by `opp_def_xfp_allowed_adj_s2d`
+    descending -- same "most favorable to face first" convention as
+    build_defense_rankings. `method="min"` ties tied opponents at the
+    same rank rather than an arbitrary tiebreak order.
+
+    Rows with no resolvable opponent (a bye week) are dropped entirely,
+    same as build_weekly_xfp drops a null xfp. A row WITH a real opponent
+    but no strength rating yet (early season, or a QB row -- see the scope
+    gap in add_opponent_strength_features's own docstring) keeps its real
+    `opponent` but gets a null rank -- a real fact (who they played) is
+    never hidden just because a derived rating doesn't exist for it.
+
+    Returns: player_id, week, opponent, opp_def_xfp_allowed_ewm3/_s2d/
+    _adj_ewm3/_adj_s2d, rank, pool_size -- one row per (player, played
+    week with a real opponent). Can be empty.
+
+    `historical_features` can genuinely have NO `opponent` column at all --
+    scripts/weekly_update.py's own real pre-draft/week-1 case, where
+    `raw_current` is a truly empty (zero-column) frame and the artifact's
+    `history_seed` never carries Family 5B columns forward across a season
+    boundary by design (see src/pipeline.py::HISTORY_SEED_COLUMNS's own
+    comment -- this family resets every season, same as Family 6, so there
+    is nothing legitimate to seed). Handled explicitly here rather than
+    letting a bare KeyError surface from `.dropna(subset=["opponent"])`.
+    """
+    from src.usage import OPPONENT_STRENGTH_OUTPUT_COLUMNS
+
+    output_cols = ["player_id", "week", "opponent"] + OPPONENT_STRENGTH_OUTPUT_COLUMNS + ["rank", "pool_size"]
+    if "opponent" not in historical_features.columns:
+        return pd.DataFrame(columns=output_cols)
+
+    season_rows = historical_features[historical_features["season"] == target_season]
+    base = season_rows.dropna(subset=["opponent"])[
+        ["player_id", "week", "position", "opponent"] + OPPONENT_STRENGTH_OUTPUT_COLUMNS
+    ].reset_index(drop=True)
+
+    distinct = base.dropna(subset=["opp_def_xfp_allowed_adj_s2d"]).drop_duplicates(
+        subset=["week", "position", "opponent"]
+    ).copy()
+    distinct["rank"] = (
+        distinct.groupby(["week", "position"])["opp_def_xfp_allowed_adj_s2d"]
+        .rank(ascending=False, method="min").astype(int)
+    )
+    distinct["pool_size"] = distinct.groupby(["week", "position"])["opponent"].transform("size")
+
+    return base.merge(
+        distinct[["week", "position", "opponent", "rank", "pool_size"]],
+        on=["week", "position", "opponent"], how="left",
+    )
+
+
 # ==========================================================================
 # STEP 4: scope -- real 2026 rosters, union top ~300 by point projection
 # ==========================================================================
@@ -1028,6 +1205,7 @@ def assemble_player_advanced_stats(
     player_sim_metrics: pd.DataFrame | None = None,
     matchup: pd.DataFrame | None = None,
     defense_rankings: dict | None = None,
+    weekly_matchup: pd.DataFrame | None = None,
 ) -> tuple[dict, dict]:
     """
     Joins everything onto scoped_predictions and crosswalks gsis_id ->
@@ -1091,16 +1269,25 @@ def assemble_player_advanced_stats(
     `monte_carlo` block; everyone else gets null, not a guessed number.
 
     `matchup` (build_matchup_snapshot's output) and `defense_rankings`
-    (build_defense_rankings's output) are Family 5B's opponent-defensive-
-    strength wiring -- both optional for the same "hypothetical week"
-    reason as player_sim_metrics. `defense_rankings` is used here only to
-    look up each player's OWN opponent's rank at their OWN position (a
-    number that means nothing without the other 31 teams to compare
-    against, which is why it isn't just another column merged onto
-    `matchup`) -- the full table is ALSO written into the payload as its
-    own top-level `defense_rankings` key (sibling to `players`), for the
-    dashboard's standalone "which defenses are favorable this week" panel,
-    which needs the whole league, not one player's opponent.
+    (build_defense_rankings's or build_season_defense_rankings's output)
+    are Family 5B's opponent-defensive-strength wiring -- both optional for
+    the same "hypothetical week" reason as player_sim_metrics.
+    `defense_rankings` is used here only to look up each player's OWN
+    opponent's rank at their OWN position (a number that means nothing
+    without the other 31 teams to compare against, which is why it isn't
+    just another column merged onto `matchup`) -- the full table is ALSO
+    written into the payload as its own top-level `defense_rankings` key
+    (sibling to `players`), for the dashboard's standalone "which defenses
+    are favorable this week" panel, which needs the whole league, not one
+    player's opponent.
+
+    `weekly_matchup` (build_weekly_matchup's output) is grouped into
+    {player_id: {week_str: matchup_dict}} the same way `weekly_xfp` is --
+    a REAL per-played-week matchup history, same field shape as the single
+    `matchup` block, so a season archive (which has no single "current
+    week" for `matchup` itself to describe -- see build_matchup_snapshot's
+    docstring) can still show a real matchup for whichever week a reader
+    is looking at.
 
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
@@ -1113,6 +1300,35 @@ def assemble_player_advanced_stats(
         for player_id, group in weekly_xfp.dropna(subset=["xfp"]).groupby("player_id"):
             weekly_xfp_by_player[player_id] = {
                 str(int(w)): round(float(x), 2) for w, x in zip(group["week"], group["xfp"])
+            }
+
+    # {player_id: {week_str: matchup_dict}} -- same shape/field names as
+    # the single upcoming-week `matchup` block below, one per REAL played
+    # week instead of one for the target week. Lets index.html show a real
+    # matchup for a season archive (no single "current week" exists there)
+    # or for an already-played week of a live, in-progress season.
+    weekly_matchup_by_player = {}
+    if weekly_matchup is not None and not weekly_matchup.empty:
+        for player_id, group in weekly_matchup.groupby("player_id"):
+            weekly_matchup_by_player[player_id] = {
+                str(int(row["week"])): {
+                    "opponent": row["opponent"],
+                    "def_xfp_allowed_ewm3": (
+                        None if pd.isna(row["opp_def_xfp_allowed_ewm3"]) else round(float(row["opp_def_xfp_allowed_ewm3"]), 2)
+                    ),
+                    "def_xfp_allowed_s2d": (
+                        None if pd.isna(row["opp_def_xfp_allowed_s2d"]) else round(float(row["opp_def_xfp_allowed_s2d"]), 2)
+                    ),
+                    "def_xfp_allowed_adj_ewm3": (
+                        None if pd.isna(row["opp_def_xfp_allowed_adj_ewm3"]) else round(float(row["opp_def_xfp_allowed_adj_ewm3"]), 2)
+                    ),
+                    "def_xfp_allowed_adj_s2d": (
+                        None if pd.isna(row["opp_def_xfp_allowed_adj_s2d"]) else round(float(row["opp_def_xfp_allowed_adj_s2d"]), 2)
+                    ),
+                    "rank": None if pd.isna(row["rank"]) else int(row["rank"]),
+                    "pool_size": None if pd.isna(row["pool_size"]) else int(row["pool_size"]),
+                }
+                for _, row in group.iterrows()
             }
 
     # {(position, team): rank} -- flattened once here rather than looked up
@@ -1170,6 +1386,7 @@ def assemble_player_advanced_stats(
                 ),
             },
             "weekly_xfp": weekly_xfp_by_player.get(row["player_id"], {}),
+            "weekly_matchup": weekly_matchup_by_player.get(row["player_id"], {}),
             "radar": radar.get(
                 row["player_id"], {"eligible": False, "games_played": 0, "min_games": MIN_GAMES_FOR_TREND}
             ),
@@ -1321,6 +1538,18 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         f"{len(bad_matchup_ranks)} players have a matchup.rank outside [1, pool_size]: {bad_matchup_ranks[:5]}"
     )
 
+    bad_weekly_matchup_ranks = [
+        pid for pid, p in players.items()
+        if any(
+            m["rank"] is not None and not (1 <= m["rank"] <= m["pool_size"])
+            for m in (p.get("weekly_matchup") or {}).values()
+        )
+    ]
+    assert not bad_weekly_matchup_ranks, (
+        f"{len(bad_weekly_matchup_ranks)} players have a weekly_matchup entry with rank outside "
+        f"[1, pool_size]: {bad_weekly_matchup_ranks[:5]}"
+    )
+
     defense_rankings = payload.get("defense_rankings") or {}
     bad_defense_rankings = [
         position for position, teams in defense_rankings.items()
@@ -1331,6 +1560,7 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
     )
 
     n_with_matchup = sum(1 for p in players.values() if p.get("matchup") is not None)
+    n_with_weekly_matchup = sum(1 for p in players.values() if p.get("weekly_matchup"))
     return {
         "n_players": len(players),
         "all_keys_real_sleeper_ids": True,
@@ -1342,6 +1572,8 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         "monte_carlo_probabilities_in_range": True,
         "n_with_matchup": n_with_matchup,
         "matchup_ranks_valid": True,
+        "n_with_weekly_matchup": n_with_weekly_matchup,
+        "weekly_matchup_ranks_valid": True,
         "defense_rankings_positions": list(defense_rankings.keys()),
     }
 

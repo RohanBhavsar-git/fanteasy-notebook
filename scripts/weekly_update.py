@@ -59,7 +59,7 @@ from src.export import (  # noqa: E402
     build_heatmap_snapshot, build_matchup_simulation, build_matchup_snapshot, build_playoff_odds,
     build_player_simulation_metrics, build_radar_snapshot, build_starter_quantile_rows,
     build_target_week_features, build_team_game_id_lookup, build_trend_snapshot, build_usage_snapshot,
-    build_weekly_xfp, build_xfp_summary, get_export_candidates, get_export_scope,
+    build_weekly_matchup, build_weekly_xfp, build_xfp_summary, get_export_candidates, get_export_scope,
     predict_target_week_from_artifact, validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
@@ -322,6 +322,15 @@ def main() -> None:
     weekly_xfp = build_weekly_xfp(historical_features, current_season)
     print(f"    weekly xfp: {len(weekly_xfp)} (player, week) rows for season {current_season}")
 
+    # Real per-played-week matchup history for THIS season (empty in the
+    # real pre-draft/week-1 case this run actually hits) -- lets a reader
+    # browsing an already-played week of the LIVE season see that week's
+    # real matchup, same shape/purpose as scripts/archive_season.py's own
+    # use of this for a completed season. `matchup` above stays the single
+    # UPCOMING-week block; this is the historical complement.
+    weekly_matchup = build_weekly_matchup(historical_features, current_season)
+    print(f"    weekly matchup: {len(weekly_matchup)} (player, week) rows for season {current_season}")
+
     print("[5/7] Scoping to real rosters + top free agents, assembling JSON...")
     rosters_raw = get_sleeper_rosters(DEFAULT_LEAGUE_ID, refresh=True)
     rostered_sleeper_ids = {pid for r in rosters_raw for pid in (r.get("players") or [])}
@@ -390,6 +399,7 @@ def main() -> None:
         player_sim_metrics=player_sim_metrics,
         matchup=matchup,
         defense_rankings=defense_rankings,
+        weekly_matchup=weekly_matchup,
     )
     print(f"    crosswalk match rate: {crosswalk_report}")
 

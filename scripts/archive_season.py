@@ -50,8 +50,9 @@ import pandas as pd  # noqa: E402
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
     CAVEATS, assemble_player_advanced_stats, build_heatmap_snapshot, build_radar_snapshot,
-    build_target_week_features, build_trend_snapshot, build_usage_snapshot, build_weekly_xfp, build_xfp_summary,
-    get_archive_candidates, get_export_scope, get_season_team_map, predict_target_week_from_artifact, validate_export,
+    build_season_defense_rankings, build_target_week_features, build_trend_snapshot, build_usage_snapshot,
+    build_weekly_matchup, build_weekly_xfp, build_xfp_summary, get_archive_candidates, get_export_scope,
+    get_season_team_map, predict_target_week_from_artifact, validate_export,
 )
 from src.ingest import (  # noqa: E402
     DATA_OUTPUT, SEASON_LEAGUE_IDS, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
@@ -149,6 +150,8 @@ def main() -> None:
     trend = build_trend_snapshot(combined_features, season, target_week)
     xfp_summary = build_xfp_summary(weekly_features, season)
     weekly_xfp = build_weekly_xfp(weekly_features, season)
+    weekly_matchup = build_weekly_matchup(weekly_features, season)
+    print(f"    weekly matchup: {len(weekly_matchup)} (player, week) rows for season {season}")
 
     print("[5/6] Building radar + heatmap (real pbp for the season)...")
     radar = build_radar_snapshot(combined_features, season, target_week, league["roster_positions"], len(rosters_raw))
@@ -159,6 +162,19 @@ def main() -> None:
     heatmap = build_heatmap_snapshot(combined_features, pbp_season, season, target_week)
     n_heatmap_eligible = sum(1 for h in heatmap.values() if h["eligible"])
     print(f"    heatmap: {n_heatmap_eligible}/{len(heatmap)} candidates eligible")
+
+    # Family 5B: a full, real, COMPLETED season's defense rankings --
+    # NOT build_defense_rankings at the stub week (see
+    # build_season_defense_rankings's own docstring for why that would
+    # come back empty: the stub week has no real schedule game to resolve
+    # an opponent from). The single upcoming-week `matchup` block has no
+    # coherent retrospective meaning for an archive either (same "a
+    # hypothetical week that never happened isn't a real thing to compute"
+    # reasoning already applied to `simulation` below) and is deliberately
+    # left null -- `weekly_matchup` above is what gives an archive a REAL
+    # per-player matchup, one per actually-played week instead.
+    defense_rankings = build_season_defense_rankings(weekly_features, schedule_season, season)
+    print(f"    defense rankings: { {pos: len(teams) for pos, teams in defense_rankings.items()} } teams ranked (of 32) per position")
 
     print("[6/6] Scoping, assembling, validating, writing...")
     rostered_sleeper_ids = {pid for r in rosters_raw for pid in (r.get("players") or [])}
@@ -175,6 +191,8 @@ def main() -> None:
         performance=artifact["performance"],
         caveats=CAVEATS + ARCHIVE_EXTRA_CAVEATS,
         season_team=season_team,
+        defense_rankings=defense_rankings,
+        weekly_matchup=weekly_matchup,
     )
     payload["simulation"] = None  # a hypothetical post-season week has no real matchups to simulate
     print(f"    crosswalk match rate: {crosswalk_report}")

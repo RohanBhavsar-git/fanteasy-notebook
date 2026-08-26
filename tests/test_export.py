@@ -23,10 +23,12 @@ from src.export import (  # noqa: E402
     build_playoff_odds,
     build_player_simulation_metrics,
     build_radar_snapshot,
+    build_season_defense_rankings,
     build_starter_quantile_rows,
     build_target_week_features,
     build_team_game_id_lookup,
     build_trend_snapshot,
+    build_weekly_matchup,
     build_weekly_xfp,
     build_xfp_summary,
     get_archive_candidates,
@@ -281,6 +283,140 @@ def test_build_matchup_snapshot_returns_target_week_only():
     p2 = out.set_index("player_id").loc["p2"]
     assert p2["opponent"] == "SF"
     assert p2["opp_def_xfp_allowed_adj_s2d"] == pytest.approx(22.0)
+
+
+def test_build_season_defense_rankings_opponent_adjustment_isolates_true_defense_quality():
+    """
+    A deterministic, hand-worked round robin: 4 teams (A, B, D identical
+    offenses generating 10 xFP/gm to WR every week; C a much stronger
+    offense generating 30) play every other team once over 3 weeks. By
+    construction, A/B/C/D's TRUE defensive quality is identical -- the
+    only thing that differs between them is which mix of opponents they
+    happened to face, and C is the only team that never has to face
+    itself. Raw "allowed" should show C looking artificially better
+    (10.0/gm, since it faced only weak-offense opponents) and A/B/D
+    looking artificially worse (16.67/gm, since each faced the strong C
+    offense once) -- exactly what the opponent adjustment exists to
+    correct. After adjustment, all four should land on the SAME number
+    (15.0 = the true, schedule-independent, league-average defense
+    quality here), confirming the adjustment does real, correct work, not
+    just that it changes some numbers.
+    """
+    schedule = pd.DataFrame([
+        {"season": 2025, "week": 1, "game_type": "REG", "home_team": "A", "away_team": "B"},
+        {"season": 2025, "week": 1, "game_type": "REG", "home_team": "C", "away_team": "D"},
+        {"season": 2025, "week": 2, "game_type": "REG", "home_team": "A", "away_team": "C"},
+        {"season": 2025, "week": 2, "game_type": "REG", "home_team": "B", "away_team": "D"},
+        {"season": 2025, "week": 3, "game_type": "REG", "home_team": "A", "away_team": "D"},
+        {"season": 2025, "week": 3, "game_type": "REG", "home_team": "B", "away_team": "C"},
+    ])
+    rows = []
+    for week in (1, 2, 3):
+        for team, xfp in [("A", 10.0), ("B", 10.0), ("C", 30.0), ("D", 10.0)]:
+            rows.append({"season": 2025, "week": week, "team": team, "position": "WR", "xfp": xfp})
+    historical = pd.DataFrame(rows)
+
+    result = build_season_defense_rankings(historical, schedule, season=2025)
+    wr = {row["team"]: row for row in result["WR"]}
+
+    assert wr["C"]["raw_s2d"] == pytest.approx(10.0)       # never faced its own strong-offense twin
+    assert wr["A"]["raw_s2d"] == pytest.approx(16.67, abs=0.01)
+    assert wr["B"]["raw_s2d"] == pytest.approx(16.67, abs=0.01)
+    assert wr["D"]["raw_s2d"] == pytest.approx(16.67, abs=0.01)
+
+    for team in ("A", "B", "C", "D"):
+        assert wr[team]["adj_s2d"] == pytest.approx(15.0, abs=0.01), (
+            f"{team}: adjustment should equalize all four teams' TRUE (schedule-independent) defense quality"
+        )
+
+    ranks = sorted(row["rank"] for row in result["WR"])
+    assert ranks == [1, 2, 3, 4]
+    assert len(result["RB"]) == 0 and len(result["TE"]) == 0  # no RB/TE rows in this fixture -- honestly empty
+
+
+def test_build_weekly_matchup_ranks_per_week_position_snapshot_and_dedupes_shared_opponents():
+    """
+    build_weekly_matchup is what gives a SEASON ARCHIVE (no single
+    "current week" the live `matchup` block can describe) a real,
+    per-played-week matchup history. Three things checked against a small
+    hand-built fixture:
+      - rank is computed WITHIN each (week, position) snapshot, not
+        globally -- the same opponent value at a later week must not be
+        compared against an earlier week's pool.
+      - two players facing the SAME opponent in the SAME week (a common
+        case -- e.g. two WRs on the same team) get the SAME rank, not two
+        different ranks from being counted twice in the pool.
+      - a row with a real opponent but no strength rating yet (the QB
+        scope gap, or just too early in a season) keeps its real
+        `opponent` and gets a null rank rather than being dropped or
+        crashing -- a real fact isn't hidden just because a derived
+        rating doesn't exist for it. A row with NO opponent at all (a
+        bye) is dropped entirely.
+    """
+    historical = pd.DataFrame([
+        # Week 5, WR: three distinct opponents X (best) > Y > Z (worst);
+        # p1 and p4 both face X and must land on the SAME rank.
+        {"player_id": "p1", "season": 2025, "week": 5, "position": "WR", "opponent": "X",
+         "opp_def_xfp_allowed_ewm3": 29.0, "opp_def_xfp_allowed_s2d": 28.0,
+         "opp_def_xfp_allowed_adj_ewm3": 29.5, "opp_def_xfp_allowed_adj_s2d": 30.0},
+        {"player_id": "p4", "season": 2025, "week": 5, "position": "WR", "opponent": "X",
+         "opp_def_xfp_allowed_ewm3": 29.0, "opp_def_xfp_allowed_s2d": 28.0,
+         "opp_def_xfp_allowed_adj_ewm3": 29.5, "opp_def_xfp_allowed_adj_s2d": 30.0},
+        {"player_id": "p2", "season": 2025, "week": 5, "position": "WR", "opponent": "Y",
+         "opp_def_xfp_allowed_ewm3": 19.0, "opp_def_xfp_allowed_s2d": 18.0,
+         "opp_def_xfp_allowed_adj_ewm3": 19.5, "opp_def_xfp_allowed_adj_s2d": 20.0},
+        {"player_id": "p3", "season": 2025, "week": 5, "position": "WR", "opponent": "Z",
+         "opp_def_xfp_allowed_ewm3": 9.0, "opp_def_xfp_allowed_s2d": 8.0,
+         "opp_def_xfp_allowed_adj_ewm3": 9.5, "opp_def_xfp_allowed_adj_s2d": 10.0},
+        # QB scope gap: real opponent, no rating -- keeps opponent, null rank.
+        {"player_id": "p5", "season": 2025, "week": 5, "position": "QB", "opponent": "X",
+         "opp_def_xfp_allowed_ewm3": np.nan, "opp_def_xfp_allowed_s2d": np.nan,
+         "opp_def_xfp_allowed_adj_ewm3": np.nan, "opp_def_xfp_allowed_adj_s2d": np.nan},
+        # Bye week: no opponent at all -- dropped entirely.
+        {"player_id": "p6", "season": 2025, "week": 5, "position": "WR", "opponent": np.nan,
+         "opp_def_xfp_allowed_ewm3": np.nan, "opp_def_xfp_allowed_s2d": np.nan,
+         "opp_def_xfp_allowed_adj_ewm3": np.nan, "opp_def_xfp_allowed_adj_s2d": np.nan},
+        # Week 6, WR: a DIFFERENT, independent pool -- Y2 must rank #1 of
+        # its own week's pool even though its value (20.0) equals week 5's
+        # Y, not week 5's X -- proves ranking doesn't leak across weeks.
+        {"player_id": "p1", "season": 2025, "week": 6, "position": "WR", "opponent": "Y2",
+         "opp_def_xfp_allowed_ewm3": 19.0, "opp_def_xfp_allowed_s2d": 18.0,
+         "opp_def_xfp_allowed_adj_ewm3": 19.5, "opp_def_xfp_allowed_adj_s2d": 20.0},
+    ])
+
+    result = build_weekly_matchup(historical, target_season=2025)
+
+    assert set(zip(result["player_id"], result["week"])) == {
+        ("p1", 5), ("p4", 5), ("p2", 5), ("p3", 5), ("p5", 5), ("p1", 6),
+    }  # p6 (bye) dropped entirely
+
+    by_player = result.set_index(["player_id", "week"])
+    assert by_player.loc[("p1", 5), "rank"] == 1
+    assert by_player.loc[("p4", 5), "rank"] == 1  # same opponent, same week -> same rank, not double-counted
+    assert by_player.loc[("p2", 5), "rank"] == 2
+    assert by_player.loc[("p3", 5), "rank"] == 3
+    assert by_player.loc[("p1", 5), "pool_size"] == 3  # X, Y, Z -- 3 DISTINCT opponents, p4 not double-counted
+
+    assert by_player.loc[("p5", 5), "opponent"] == "X"  # QB: real opponent kept
+    assert pd.isna(by_player.loc[("p5", 5), "rank"])     # ...but no rating to rank
+
+    assert by_player.loc[("p1", 6), "rank"] == 1  # independent pool -- ranks #1 of week 6, not compared to week 5
+
+
+def test_build_weekly_matchup_handles_missing_opponent_column():
+    """
+    scripts/weekly_update.py's real pre-draft/week-1 case: `raw_current`
+    is a truly empty (zero-column) frame and the artifact's history_seed
+    never carries Family 5B columns across a season boundary (see
+    src/pipeline.py::HISTORY_SEED_COLUMNS), so `historical_features` can
+    have NO `opponent` column at all -- must return an honestly empty
+    frame with the right columns, not raise a bare KeyError.
+    """
+    historical = pd.DataFrame({"player_id": [], "season": [], "week": [], "position": [], "team": []})
+    result = build_weekly_matchup(historical, target_season=2026)
+    assert result.empty
+    assert "opponent" in result.columns
+    assert "rank" in result.columns
 
 
 def test_build_defense_rankings_ranks_most_favorable_first_and_omits_thin_teams(monkeypatch):

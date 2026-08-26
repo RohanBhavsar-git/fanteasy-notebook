@@ -3016,17 +3016,34 @@
     return advanced.players?.[playerId]?.monte_carlo || null;
   }
 
-  // Family 5B's per-player matchup block is a WEEK-SPECIFIC read (this
-  // week's real opponent + that opponent's current rank), same as
-  // getMyProj/getMonteCarlo above -- gated the same way so a player-row
-  // badge never shows a stale opponent for a week that isn't the one on
-  // screen.
+  // Family 5B's per-player matchup block is a WEEK-SPECIFIC read. Two
+  // sources, checked in order:
+  //   1. `matchup` -- the single UPCOMING-week block, gated on
+  //      meta.season/meta.week matching (same pattern as getMyProj/
+  //      getMonteCarlo) so a stale opponent never shows for a week that
+  //      isn't the one the loaded export actually describes.
+  //   2. `weekly_matchup[week]` -- a REAL, already-played week's matchup
+  //      (src/export.py::build_weekly_matchup), which exists for any
+  //      season/week this player actually played, live or archived. This
+  //      is what lets a SEASON ARCHIVE show a real matchup at all -- an
+  //      archive's own `matchup` is always null (there's no "upcoming
+  //      week" for a season that's already over -- see
+  //      build_matchup_snapshot's own docstring), and it's also what lets
+  //      a live, in-progress season show a real matchup for an
+  //      already-played week, not just the next one.
+  // Nothing here needs a season check for #2 -- weekly_matchup is keyed
+  // by week number within whichever season's export is currently loaded,
+  // the same implicit scoping every other per-week field in this payload
+  // (weekly_xfp, the game log) already relies on.
   function getMatchup(playerId, season, week) {
     const advanced = state.advancedStats;
-    if (!advanced || Number(advanced.meta?.season) !== Number(season) || Number(advanced.meta?.week) !== Number(week)) {
-      return null;
+    if (!advanced) return null;
+    const player = advanced.players?.[playerId];
+    if (!player) return null;
+    if (Number(advanced.meta?.season) === Number(season) && Number(advanced.meta?.week) === Number(week)) {
+      if (player.matchup) return player.matchup;
     }
-    return advanced.players?.[playerId]?.matchup || null;
+    return player.weekly_matchup?.[String(week)] || null;
   }
 
   function monteCarloCaveatText() {
