@@ -55,10 +55,11 @@ import pandas as pd  # noqa: E402
 
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
-    CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_heatmap_snapshot,
-    build_matchup_simulation, build_playoff_odds, build_player_simulation_metrics, build_radar_snapshot,
-    build_starter_quantile_rows, build_target_week_features, build_team_game_id_lookup, build_trend_snapshot,
-    build_usage_snapshot, build_weekly_xfp, build_xfp_summary, get_export_candidates, get_export_scope,
+    CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_defense_rankings,
+    build_heatmap_snapshot, build_matchup_simulation, build_matchup_snapshot, build_playoff_odds,
+    build_player_simulation_metrics, build_radar_snapshot, build_starter_quantile_rows,
+    build_target_week_features, build_team_game_id_lookup, build_trend_snapshot, build_usage_snapshot,
+    build_weekly_xfp, build_xfp_summary, get_export_candidates, get_export_scope,
     predict_target_week_from_artifact, validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
@@ -301,6 +302,10 @@ def main() -> None:
 
     usage = build_usage_snapshot(combined_features, current_season, target_week)
     trend = build_trend_snapshot(combined_features, current_season, target_week)
+    matchup = build_matchup_snapshot(combined_features, current_season, target_week)
+    defense_rankings = build_defense_rankings(combined_features, schedule_current, current_season, target_week)
+    n_ranked = {pos: len(teams) for pos, teams in defense_rankings.items()}
+    print(f"    defense rankings: {n_ranked} teams ranked (of 32) per position")
 
     # Most recently COMPLETED season's xFP retrospective while nothing has
     # been played yet this season (raw_current empty); once real games
@@ -383,6 +388,8 @@ def main() -> None:
         performance=artifact["performance"],
         caveats=CAVEATS + WEEKLY_EXTRA_CAVEATS,
         player_sim_metrics=player_sim_metrics,
+        matchup=matchup,
+        defense_rankings=defense_rankings,
     )
     print(f"    crosswalk match rate: {crosswalk_report}")
 

@@ -479,7 +479,8 @@ def build_target_week_features(
     splitting into folds, not after.
     """
     from src.usage import (
-        ROLLING_SOURCE_COLUMNS, add_context_features, add_rolling_features, add_trend_features,
+        ROLLING_SOURCE_COLUMNS, add_context_features, add_opponent_strength_features,
+        add_rolling_features, add_trend_features,
     )
 
     stub = candidates.copy()
@@ -490,6 +491,14 @@ def build_target_week_features(
 
     combined = pd.concat([historical_features, stub], ignore_index=True, sort=False)
     combined = add_context_features(combined, schedule)
+    # Needs xfp -- already real for every historical row and NaN on the
+    # stub row (from the ROLLING_SOURCE_COLUMNS fill above, xfp included) --
+    # same reasoning as add_context_features just above: the stub row's own
+    # (team, target_week) contributes nothing to the team-position-week
+    # aggregate build_defense_strength_table computes, but the opponent's
+    # REAL prior weeks already in historical_features are exactly what the
+    # stub row's own opp_def_xfp_allowed_* values end up reflecting.
+    combined = add_opponent_strength_features(combined, schedule)
     combined = add_rolling_features(combined)
     # Phase 3' trend signal -- downstream of the model's own feature set
     # (add_trend_features's outputs are never added to FEATURE_COLUMNS), so
@@ -617,6 +626,77 @@ def build_trend_snapshot(combined_features: pd.DataFrame, target_season: int, ta
     )
     out = combined_features.loc[test_mask, cols].reset_index(drop=True)
     return out.rename(columns={f"{f}_ewm3": f"trend_{f}_current" for f in TREND_SOURCE_FEATURES})
+
+
+def build_matchup_snapshot(combined_features: pd.DataFrame, target_season: int, target_week: int) -> pd.DataFrame:
+    """
+    Family 5B (opponent defensive strength): the target week's `opponent`
+    and OPPONENT_STRENGTH_OUTPUT_COLUMNS, one row per player -- this IS
+    the model's own input for RB/WR/TE, not a separate computation, same
+    "this IS the model's own input" pattern as build_usage_snapshot.
+    `opponent` itself is populated for QB too (it comes from the real
+    schedule, not from xfp) even though the four strength columns are
+    null for QB -- see add_opponent_strength_features's own scope-gap
+    docstring note (no expected-passing-points model exists to rate a
+    defense against opposing QBs).
+    """
+    from src.usage import OPPONENT_STRENGTH_OUTPUT_COLUMNS
+
+    test_mask = (combined_features["season"] == target_season) & (combined_features["week"] == target_week)
+    cols = ["player_id", "opponent"] + OPPONENT_STRENGTH_OUTPUT_COLUMNS
+    return combined_features.loc[test_mask, cols].reset_index(drop=True)
+
+
+def build_defense_rankings(
+    combined_features: pd.DataFrame, schedule: pd.DataFrame, target_season: int, target_week: int
+) -> dict:
+    """
+    Every team's CURRENT (as of target_week -- i.e. reflecting only real
+    games strictly before target_week) opponent-adjusted xFP allowed, per
+    OPP_STRENGTH_POSITIONS position, ranked most-favorable-to-face first
+    (highest adj_s2d = allows the most = best matchup for an offensive
+    player at that position). Powers the dashboard's standalone "which
+    defenses are favorable/unfavorable this week" panel; build_matchup_
+    snapshot above covers the per-player indicator, this covers the
+    league-wide view neither a per-player frame nor a per-player dict can
+    show on its own.
+
+    Ranked on allowed_adj_s2d (season-to-date, opponent-adjusted) rather
+    than the recency-weighted ewm3 variant -- same "a season-characterizing
+    read wants the more stable input" reasoning RADAR_METRICS's own choice
+    of _s2d over _ewm3 already uses for the position-profile radar. Both
+    raw and adjusted, both ewm3 and s2d, ride along per team so the UI can
+    show the full picture, not just the one number used to sort.
+
+    Returns: {position: [{"team", "raw_ewm3", "raw_s2d", "adj_ewm3",
+    "adj_s2d", "rank"}, ...]}, sorted most-favorable-first. A team with
+    fewer than the implicit games-played floor this season simply isn't
+    in the list yet -- not enough history to rank it honestly, the same
+    absence-means-no-data convention as everywhere else in this pipeline
+    (not a fabricated rank).
+    """
+    from src.usage import OPP_STRENGTH_POSITIONS, build_defense_strength_table
+
+    table = build_defense_strength_table(combined_features, schedule)
+    week_rows = table[(table["season"] == target_season) & (table["week"] == target_week)]
+
+    out: dict = {}
+    for position in OPP_STRENGTH_POSITIONS:
+        pos_rows = week_rows[
+            (week_rows["position"] == position) & week_rows["allowed_adj_s2d"].notna()
+        ].sort_values("allowed_adj_s2d", ascending=False)
+        out[position] = [
+            {
+                "team": row["team"],
+                "raw_ewm3": round(float(row["allowed_ewm3"]), 2),
+                "raw_s2d": round(float(row["allowed_s2d"]), 2),
+                "adj_ewm3": round(float(row["allowed_adj_ewm3"]), 2),
+                "adj_s2d": round(float(row["allowed_adj_s2d"]), 2),
+                "rank": rank,
+            }
+            for rank, (_, row) in enumerate(pos_rows.iterrows(), start=1)
+        ]
+    return out
 
 
 def build_radar_snapshot(
@@ -946,6 +1026,8 @@ def assemble_player_advanced_stats(
     caveats: list = CAVEATS,
     season_team: pd.DataFrame | None = None,
     player_sim_metrics: pd.DataFrame | None = None,
+    matchup: pd.DataFrame | None = None,
+    defense_rankings: dict | None = None,
 ) -> tuple[dict, dict]:
     """
     Joins everything onto scoped_predictions and crosswalks gsis_id ->
@@ -1008,6 +1090,18 @@ def assemble_player_advanced_stats(
     that module's own comment). When provided, each covered player gets a
     `monte_carlo` block; everyone else gets null, not a guessed number.
 
+    `matchup` (build_matchup_snapshot's output) and `defense_rankings`
+    (build_defense_rankings's output) are Family 5B's opponent-defensive-
+    strength wiring -- both optional for the same "hypothetical week"
+    reason as player_sim_metrics. `defense_rankings` is used here only to
+    look up each player's OWN opponent's rank at their OWN position (a
+    number that means nothing without the other 31 teams to compare
+    against, which is why it isn't just another column merged onto
+    `matchup`) -- the full table is ALSO written into the payload as its
+    own top-level `defense_rankings` key (sibling to `players`), for the
+    dashboard's standalone "which defenses are favorable this week" panel,
+    which needs the whole league, not one player's opponent.
+
     Returns (payload, crosswalk_report) -- crosswalk_report has
     {"n_scoped", "n_matched", "match_rate"} so the match rate gets reported,
     not just assumed.
@@ -1021,6 +1115,15 @@ def assemble_player_advanced_stats(
                 str(int(w)): round(float(x), 2) for w, x in zip(group["week"], group["xfp"])
             }
 
+    # {(position, team): rank} -- flattened once here rather than looked up
+    # per player from the nested {position: [...]} shape build_defense_
+    # rankings returns.
+    rank_lookup = {}
+    if defense_rankings:
+        for position, teams in defense_rankings.items():
+            for entry in teams:
+                rank_lookup[(position, entry["team"])] = {"rank": entry["rank"], "pool_size": len(teams)}
+
     cw = crosswalk.dropna(subset=["gsis_id", "sleeper_id"]).drop_duplicates(subset=["gsis_id"])
     merged = scoped_predictions.merge(usage, on="player_id", how="left")
     merged = merged.merge(trend, on="player_id", how="left")
@@ -1029,6 +1132,8 @@ def assemble_player_advanced_stats(
         merged = merged.merge(season_team, on="player_id", how="left")
     if player_sim_metrics is not None:
         merged = merged.merge(player_sim_metrics, on="player_id", how="left")
+    if matchup is not None:
+        merged = merged.merge(matchup, on="player_id", how="left")
     n_scoped = len(merged)
     merged = merged.merge(cw[["gsis_id", "sleeper_id"]], left_on="player_id", right_on="gsis_id", how="inner")
     n_matched = len(merged)
@@ -1087,6 +1192,29 @@ def assemble_player_advanced_stats(
                     "game_id": None if pd.isna(row.get("game_id")) else row["game_id"],
                 }
             ),
+            "matchup": (
+                None if matchup is None or pd.isna(row.get("opponent"))
+                else {
+                    "opponent": row["opponent"],
+                    "def_xfp_allowed_ewm3": (
+                        None if pd.isna(row.get("opp_def_xfp_allowed_ewm3"))
+                        else round(float(row["opp_def_xfp_allowed_ewm3"]), 2)
+                    ),
+                    "def_xfp_allowed_s2d": (
+                        None if pd.isna(row.get("opp_def_xfp_allowed_s2d"))
+                        else round(float(row["opp_def_xfp_allowed_s2d"]), 2)
+                    ),
+                    "def_xfp_allowed_adj_ewm3": (
+                        None if pd.isna(row.get("opp_def_xfp_allowed_adj_ewm3"))
+                        else round(float(row["opp_def_xfp_allowed_adj_ewm3"]), 2)
+                    ),
+                    "def_xfp_allowed_adj_s2d": (
+                        None if pd.isna(row.get("opp_def_xfp_allowed_adj_s2d"))
+                        else round(float(row["opp_def_xfp_allowed_adj_s2d"]), 2)
+                    ),
+                    **(rank_lookup.get((row["position"], row["opponent"])) or {"rank": None, "pool_size": None}),
+                }
+            ),
         }
 
     payload = {
@@ -1103,6 +1231,7 @@ def assemble_player_advanced_stats(
             "monte_carlo_n_sims": SIMULATION_N_SIMS_MATCHUP,
         },
         "players": players,
+        "defense_rankings": defense_rankings,
     }
     crosswalk_report = {
         "n_scoped": n_scoped, "n_matched": n_matched,
@@ -1183,6 +1312,25 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         f"(probability outside [0, 1], or q10/q50/q90 out of order): {bad_monte_carlo[:5]}"
     )
 
+    bad_matchup_ranks = [
+        pid for pid, p in players.items()
+        if p.get("matchup") and p["matchup"]["rank"] is not None
+        and not (1 <= p["matchup"]["rank"] <= p["matchup"]["pool_size"])
+    ]
+    assert not bad_matchup_ranks, (
+        f"{len(bad_matchup_ranks)} players have a matchup.rank outside [1, pool_size]: {bad_matchup_ranks[:5]}"
+    )
+
+    defense_rankings = payload.get("defense_rankings") or {}
+    bad_defense_rankings = [
+        position for position, teams in defense_rankings.items()
+        if sorted(t["rank"] for t in teams) != list(range(1, len(teams) + 1))
+    ]
+    assert not bad_defense_rankings, (
+        f"defense_rankings ranks aren't a clean 1..N sequence for: {bad_defense_rankings}"
+    )
+
+    n_with_matchup = sum(1 for p in players.values() if p.get("matchup") is not None)
     return {
         "n_players": len(players),
         "all_keys_real_sleeper_ids": True,
@@ -1192,6 +1340,9 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         "heatmap_shares_sum_to_one": True,
         "n_with_monte_carlo": n_with_monte_carlo,
         "monte_carlo_probabilities_in_range": True,
+        "n_with_matchup": n_with_matchup,
+        "matchup_ranks_valid": True,
+        "defense_rankings_positions": list(defense_rankings.keys()),
     }
 
 

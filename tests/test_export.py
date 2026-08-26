@@ -16,8 +16,10 @@ import src.export as export_module  # noqa: E402
 from src.export import (  # noqa: E402
     assemble_player_advanced_stats,
     assemble_simulation_block,
+    build_defense_rankings,
     build_heatmap_snapshot,
     build_matchup_simulation,
+    build_matchup_snapshot,
     build_playoff_odds,
     build_player_simulation_metrics,
     build_radar_snapshot,
@@ -257,6 +259,61 @@ def test_build_trend_snapshot_renames_ewm3_columns_to_avoid_usage_collision():
     p2 = out[out["player_id"] == "p2"].iloc[0]
     assert p2["trend_target_share_current"] == pytest.approx(0.25)
     assert p2["target_share_trend_direction"] == "falling"
+
+
+def test_build_matchup_snapshot_returns_target_week_only():
+    combined = pd.DataFrame({
+        "player_id": ["p1", "p1", "p2"],
+        "season": [2025, 2026, 2026],
+        "week": [17, 1, 1],
+        "opponent": ["KC", "DEN", "SF"],
+        "opp_def_xfp_allowed_ewm3": [30.0, np.nan, 25.0],
+        "opp_def_xfp_allowed_s2d": [28.0, np.nan, 24.0],
+        "opp_def_xfp_allowed_adj_ewm3": [29.0, np.nan, 23.0],
+        "opp_def_xfp_allowed_adj_s2d": [27.0, np.nan, 22.0],
+    })
+    out = build_matchup_snapshot(combined, target_season=2026, target_week=1)
+
+    assert set(out["player_id"]) == {"p1", "p2"}  # only the target week
+    p1 = out.set_index("player_id").loc["p1"]
+    assert p1["opponent"] == "DEN"
+    assert pd.isna(p1["opp_def_xfp_allowed_ewm3"])  # null this early in a new season, not a bug
+    p2 = out.set_index("player_id").loc["p2"]
+    assert p2["opponent"] == "SF"
+    assert p2["opp_def_xfp_allowed_adj_s2d"] == pytest.approx(22.0)
+
+
+def test_build_defense_rankings_ranks_most_favorable_first_and_omits_thin_teams(monkeypatch):
+    """
+    build_defense_rankings' own job: filter to the target week, sort each
+    position's teams by allowed_adj_s2d descending (highest allowed = most
+    favorable matchup for an offensive player at that position), and
+    number them 1..N. The underlying opponent-adjustment math is covered
+    by tests/test_no_leakage.py -- this isolates build_defense_rankings'
+    own plumbing by substituting a small, fully-controlled defense-
+    strength table via monkeypatch rather than building enough real weeks
+    of history for the real function to produce non-null values.
+    """
+    fake_table = pd.DataFrame([
+        {"team": "AAA", "position": "WR", "season": 2025, "week": 5,
+         "allowed_ewm3": 30.0, "allowed_s2d": 28.0, "allowed_adj_ewm3": 29.0, "allowed_adj_s2d": 27.0},
+        {"team": "BBB", "position": "WR", "season": 2025, "week": 5,
+         "allowed_ewm3": 10.0, "allowed_s2d": 12.0, "allowed_adj_ewm3": 9.0, "allowed_adj_s2d": 11.0},
+        {"team": "CCC", "position": "WR", "season": 2025, "week": 5,  # not enough history yet -- must be dropped
+         "allowed_ewm3": np.nan, "allowed_s2d": np.nan, "allowed_adj_ewm3": np.nan, "allowed_adj_s2d": np.nan},
+        {"team": "AAA", "position": "WR", "season": 2025, "week": 4,  # a different week -- must be excluded
+         "allowed_ewm3": 1.0, "allowed_s2d": 1.0, "allowed_adj_ewm3": 1.0, "allowed_adj_s2d": 999.0},
+    ])
+    monkeypatch.setattr("src.usage.build_defense_strength_table", lambda df, schedule: fake_table)
+
+    result = build_defense_rankings(pd.DataFrame(), pd.DataFrame(), target_season=2025, target_week=5)
+
+    assert list(result.keys()) == ["RB", "WR", "TE"]  # every OPP_STRENGTH_POSITIONS key present
+    assert result["RB"] == []  # no rows at all for RB in the fake table -- honestly empty, not fabricated
+    assert [row["team"] for row in result["WR"]] == ["AAA", "BBB"]  # CCC dropped, AAA (most allowed) first
+    assert [row["rank"] for row in result["WR"]] == [1, 2]
+    assert result["WR"][0]["adj_s2d"] == pytest.approx(27.0)
+    assert result["WR"][0]["raw_ewm3"] == pytest.approx(30.0)
 
 
 # ==========================================================================
@@ -659,6 +716,80 @@ def test_assemble_player_advanced_stats_wires_season_team_when_provided():
 
     assert payload["players"]["4984"]["team"] == "TB"
     assert payload["players"]["5001"]["team"] is None
+
+
+def test_assemble_player_advanced_stats_wires_matchup_and_defense_rankings():
+    """
+    `matchup` and `defense_rankings` are both optional, same "hypothetical
+    week" pattern as player_sim_metrics/simulation. When provided: a
+    player's own opponent/strength values are merged in from `matchup`,
+    `matchup.rank`/`pool_size` are looked up from `defense_rankings` by
+    (position, opponent) -- NOT just merged as another column, since a
+    rank means nothing without the other teams to compare against -- and
+    the full `defense_rankings` table rides along at the payload's top
+    level for the dashboard's standalone panel. A QB gets a real
+    `opponent` (it comes from the schedule, not from xfp) but null
+    strength fields and null rank -- the same disclosed scope gap as
+    everywhere else Family 5B appears.
+    """
+    player_ids = ["00-0001", "00-0002"]
+    scoped_predictions = pd.DataFrame({
+        "player_id": player_ids, "position": ["QB", "WR"],
+        "point": [20.0, 12.0], "floor": [10.0, 6.0], "ceiling": [30.0, 18.0],
+    })
+    from src.usage import TREND_SOURCE_FEATURES
+    usage = pd.DataFrame({
+        "player_id": player_ids,
+        **{col: [np.nan, np.nan] for col in export_module.USAGE_EXPORT_COLUMNS},
+    })
+    trend = pd.DataFrame({
+        "player_id": player_ids,
+        **{
+            f"{prefix}{feat}{suffix}": [np.nan, np.nan]
+            for feat in TREND_SOURCE_FEATURES
+            for prefix, suffix in [("trend_", "_current"), ("", "_trend_signal"), ("", "_trend_direction")]
+        },
+    })
+    xfp_summary = pd.DataFrame({"player_id": [], "season_xfp": [], "season_actual": [], "fp_over_expected": []})
+    weekly_xfp = pd.DataFrame({"player_id": [], "week": [], "xfp": []})
+    crosswalk = pd.DataFrame({"gsis_id": player_ids, "sleeper_id": ["4984", "5001"]})
+    matchup = pd.DataFrame({
+        "player_id": player_ids,
+        "opponent": ["KC", "SF"],
+        "opp_def_xfp_allowed_ewm3": [np.nan, 24.0],
+        "opp_def_xfp_allowed_s2d": [np.nan, 22.0],
+        "opp_def_xfp_allowed_adj_ewm3": [np.nan, 23.0],
+        "opp_def_xfp_allowed_adj_s2d": [np.nan, 21.0],
+    })
+    defense_rankings = {
+        "WR": [{"team": "SF", "raw_ewm3": 24.0, "raw_s2d": 22.0, "adj_ewm3": 23.0, "adj_s2d": 21.0, "rank": 1},
+               {"team": "DAL", "raw_ewm3": 10.0, "raw_s2d": 9.0, "adj_ewm3": 9.5, "adj_s2d": 8.0, "rank": 2}],
+        "RB": [], "TE": [],
+    }
+
+    payload, _ = assemble_player_advanced_stats(
+        scoped_predictions, usage, trend, xfp_summary, weekly_xfp, {}, {}, crosswalk,
+        target_season=2026, target_week=1, xfp_season=2025, seasons_trained=[2026],
+        model_version="test-version", matchup=matchup, defense_rankings=defense_rankings,
+    )
+
+    qb_matchup = payload["players"]["4984"]["matchup"]
+    assert qb_matchup["opponent"] == "KC"
+    assert qb_matchup["def_xfp_allowed_ewm3"] is None  # QB scope gap, not a bug
+    assert qb_matchup["rank"] is None
+    assert qb_matchup["pool_size"] is None
+
+    wr_matchup = payload["players"]["5001"]["matchup"]
+    assert wr_matchup["opponent"] == "SF"
+    assert wr_matchup["def_xfp_allowed_adj_s2d"] == pytest.approx(21.0)
+    assert wr_matchup["rank"] == 1
+    assert wr_matchup["pool_size"] == 2
+
+    assert payload["defense_rankings"] == defense_rankings
+
+    validation = validate_export(payload, crosswalk)
+    assert validation["n_with_matchup"] == 2
+    assert validation["defense_rankings_positions"] == ["WR", "RB", "TE"]
 
 
 def test_build_player_simulation_metrics_resolves_game_id_and_computes_thresholds(monkeypatch):

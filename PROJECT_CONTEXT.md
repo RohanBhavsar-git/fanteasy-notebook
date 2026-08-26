@@ -89,7 +89,21 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > and the team shown is a player's CURRENT team, not necessarily the one
 > their stats describe — see **Phase 10 findings** for why that second one
 > couldn't be a computed per-player flag with data this pipeline currently
-> has.
+> has. Family 5B (opponent defensive strength by position, deferred from
+> the original Family 5 spec) is also done — `src/usage.py`'s
+> `add_opponent_strength_features`/`build_defense_strength_table` reuse
+> xFP's own bucket-rate machinery aggregated to the defense side (not raw
+> points allowed), opponent-adjusted via a single-pass schedule-strength
+> correction rather than a full iterative solve, wired into
+> `FEATURE_COLUMNS` and a new `matchup`/`defense_rankings` export pair.
+> Walk-forward re-validation shows a small real MAE improvement for WR/TE,
+> no meaningful effect for QB (null by construction) or RB — checked, not
+> assumed, and reported honestly rather than rounded up. New Dashboard
+> "Matchup Ratings" panel, Players-table Matchup column, and a Player
+> Detail matchup line, all Playwright-verified against the real live
+> dashboard. See **Family 5B findings**. The committed exports themselves
+> don't carry the new keys yet — that needs one more real retrain/export
+> run, tracked in **What's outstanding**.
 > See **Verification status** near the end before treating any pipeline
 > claim as settled.
 
@@ -295,7 +309,7 @@ See `NOTEBOOK_OUTLINE.md` for the full 8-phase roadmap. Summary:
 |---|---|---|
 | 1 | Data ingestion — `src/ingest.py` + `01_data_ingestion.ipynb` | **Done** — runs clean, all sources cached to `data/raw/` |
 | 2a | Custom scoring — `src/features.py` + `02_custom_scoring.ipynb` | **Done** — 100% validated against Sleeper's actual results |
-| 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 6-10 (Phase 6 model A/B + quantile/SHAP/CQR, Phase 6.5 game-environment + season simulation) are all done — see **Phase 6 findings** and **Phase 6.5 findings**. Remaining work is Phase 7 (JSON export) and Phase 8 (automation), plus anything beyond this spec's original 10-step list (e.g. championship/bracket odds). |
+| 2b | Usage + efficiency features from pbp | Steps 1-5 of 10 **done** (`src/usage.py` + `03_usage_features.ipynb`) — see **Phase 2b progress** below. Steps 6-10 (Phase 6 model A/B + quantile/SHAP/CQR, Phase 6.5 game-environment + season simulation) are all done — see **Phase 6 findings** and **Phase 6.5 findings**. Family 5B (opponent defensive strength by position — deferred from the original Family 5 spec) is also **done** — `src/usage.py::add_opponent_strength_features`/`build_defense_strength_table`, wired into `FEATURE_COLUMNS` and a new `matchup`/`defense_rankings` export pair. See **Family 5B findings** below. Remaining work beyond this spec's original 10-step list is anything like championship/bracket odds. |
 | 3' | Usage trend signal — replaces role classification (see `NOTEBOOK_OUTLINE.md`'s Phase 3') | **Done** — `src/usage.py` Family 7 (`add_trend_features`, `get_usage_trend_leaders`) + `04_usage_trends.ipynb`. Window (3-week EWM half-life) and direction threshold (z > 0.25) both validated against real hold-vs-revert data, not assumed — see **Phase 3' findings** below. Wired into Phase 7's export as a new `trend` key. |
 | 4 | Radar metrics — 0-100 percentile normalization within position | **Done** — `src/export.py`'s `RADAR_METRICS`/`position_starter_counts()`/`build_radar_snapshot()`, wired into the export as a new `radar` key and rendered as a real Chart.js radar on Player Detail. See **Phase 4 findings** below. |
 | 5 | Heatmap zones — field-location frequency tables | **Done** — `src/usage.py`'s `receiving_zone_plays`/`passing_zone_plays`/`rushing_zone_plays` (real pbp bucketing) plus `src/export.py`'s `build_heatmap_snapshot()`, wired into the export as a new `heatmap` key and rendered as a real SVG field-zone grid on Player Detail. See **Phase 5 findings** below. |
@@ -321,9 +335,10 @@ The dashboard already has integration hooks waiting. Search `state.advancedStats
 - `add_situational_features(df, pbp)` — red-zone/goal-line volume, third-down and two-minute target share
 - `add_context_features(df, schedule)` — `is_home`, spread, implied team total, weather
 - `add_xfp_features(df, pbp, scoring_settings)` — expected fantasy points from a bucketed opportunity-value rate table
+- `add_opponent_strength_features(df, schedule)` — Family 5B, opponent defensive strength by position; see **Family 5B findings** below
 - `add_rolling_features(df)` — `_ewm3`/`_s2d`/`_vol` trailing summaries of every continuous feature above, plus `games_played`, `snap_share_delta_3wk`, and `prev_season_*` baselines
 
-**Leakage-test approach.** `tests/test_no_leakage.py` (34 tests) pairs two patterns per family:
+**Leakage-test approach.** `tests/test_no_leakage.py` (54 tests) pairs two patterns per family:
 - **Black-box future-truncation** — build the table twice, once with weeks after a boundary removed from the source data, and assert weeks at/before the boundary are unchanged. Catches a feature looking forward.
 - **White-box perturbation tests** — for xFP's rate table and the rolling aggregates, future-truncation alone can't prove a feature excludes its OWN week, because removing week N's row also destroys real same-week information the feature legitimately needs (a player's actual opportunities that week; week N's own value that week N+1 needs to see). Instead these tests perturb one real value to an extreme outlier and confirm the SAME week's derived feature is unaffected while the NEXT week's is. Step 4 (rolling aggregates) got the most coverage of any step for exactly this reason — it's where a shift(1) mistake would do the most damage.
 
@@ -335,6 +350,148 @@ The dashboard already has integration hooks waiting. Search `state.advancedStats
 - `prev_season_*` holds last season's full-season average for a core subset of role/opportunity features and does **not** reset at the season boundary the way in-season rolling features do — an entire prior season can't leak forward.
 
 Step 5 (`03_usage_features.ipynb`, exercising the full table) is also done. Phase 6 (projection model) was picked up next, investigated, and concluded rather than shipped — see **Phase 6 findings** below. Steps 8-10 (quantile floor/ceiling, `src/simulate.py`, calibration/playoff-odds) remain open, contingent on what happens with Phase 6 next.
+
+---
+
+## Family 5B findings — opponent defensive strength (Aug 2026)
+
+The original Family 5 spec named this and deferred it to "step 4" (which
+became `add_rolling_features` instead) and it was never picked back up:
+"Opponent defensive strength by position, computed on prior weeks only —
+fantasy points allowed to RB/WR/TE, opponent-adjusted if practical." Built
+now as `src/usage.py::add_opponent_strength_features`/
+`build_defense_strength_table`, wired into `src/model.py::FEATURE_COLUMNS`
+and a new `matchup` (per-player) / `defense_rankings` (league-wide) pair in
+`src/export.py`, rendered on the dashboard as a "Matchup Ratings" panel
+(Dashboard), a Matchup column (Players table), and a matchup line
+(Player Detail's Opportunity Shares panel).
+
+**The metric is xFP allowed, not raw points allowed — reusing, not
+re-deriving.** For each defense, in each week, the metric sums the SAME
+per-play bucket-rate `xfp` `add_xfp_features` already computes (a
+league-average expected value per opportunity type), aggregated to the
+DEFENSE side instead of the player side. This was a design choice made
+before any code was written, not discovered afterward: a defense that gave
+up one lucky 70-yard broken-tackle score would look worse under raw points
+than the opportunity it actually conceded, and xFP already exists in this
+pipeline specifically to strip that kind of variance out.
+
+**QB is out of scope, for the same reason `xfp` itself is null for QB
+rows.** xFP's bucket-rate model only covers targets and carries, built
+entirely from the receiver's/rusher's own expected value — there is no
+equivalent model for a QB's own passing production (a completely different
+scoring path: yards/TDs, not receptions/carries). "How many xFP does this
+defense allow to opposing QBs" has no honest answer under this design, so
+`OPP_STRENGTH_POSITIONS = ("RB", "WR", "TE")` and every QB row is null,
+disclosed rather than silently skipped — fixing this would mean building a
+second, independent expected-passing-points model, not extending this one.
+
+**Opponent adjustment is a single-pass schedule-strength correction, not a
+full iterative simultaneous-rating solve (Massey/Colley-style).** For each
+defense, at each week: average the TRAILING offensive strength (each
+opponent's own `generated_s2d`, evaluated as of the week that specific game
+was played — already point-in-time-safe on its own) of every team it has
+faced so far this season, compare that average to the league-wide average
+offensive strength at that same point in time, and subtract the difference
+from the defense's raw "allowed" number. Chosen over an iterative solve
+deliberately: an iterative method needs many games to converge and is hard
+to keep point-in-time-safe with as few as 1-3 prior games in an early-season
+fold, where this feature is used the most (that's exactly when a manager
+most wants a matchup read and has the least data to build one from). A
+single pass is transparent, cheap, and tractable at this data volume — "if
+practical" from the spec, not "if perfect." Checked directly, not assumed:
+across all of 2018-2025, the correction has mean −0.31, std 3.11 points, and
+moves the raw "allowed" number by more than half a point on 76.9% of
+eligible rows — a real, non-trivial adjustment, not a no-op that happened to
+ship anyway.
+
+**Point-in-time mechanics reuse the exact `add_rolling_features` recipe**
+(window the raw per-team-week value with pandas' native ewm/expanding, then
+`shift(1)` the whole result within the group), generalized from
+`(player_id, season)` groups to `(team, position, season)` groups — a
+defense is a scheme, not an individual, but the same "role changes across an
+offseason, so reset every September" reasoning from Family 6 applies. Row-
+based like every other `_ewm3` in this pipeline (a bye week is a missing
+row, not a zero). Both the raw allowed value and the SOS-adjustment
+computation need their OWN prior games before either is defined, so the
+adjusted columns (`opp_def_xfp_allowed_adj_ewm3`/`_adj_s2d`) go null-to-
+populated slightly later in a season than the raw ones
+(`opp_def_xfp_allowed_ewm3`/`_s2d`) — checked directly on real 2018-2025
+data, both are fully populated from around week 6 onward, the same floor
+every other trailing signal in this pipeline already settles at.
+
+**Leakage tests (`tests/test_no_leakage.py`, 8 new tests, 54 total in the
+file now)** follow the file's own established two-pattern approach: black-
+box future-truncation (parametrized over the same 4 season/week boundaries
+every other family uses) and a white-box perturbation test analogous to
+`test_rolling_features_shift_excludes_own_week` — perturbing one real
+team's `xfp` at a specific week to an extreme outlier and confirming every
+player facing that SAME opponent in that SAME week (including the
+perturbed player's own row) is unaffected, while a player facing that same
+opponent in its NEXT game IS affected one week later. This function's extra
+layer of indirection (a defense's own trailing value depends on its
+opponents' trailing values, which depend on THEIR opponents' trailing
+values) made this the highest-risk-of-a-subtle-shift-bug family since
+Family 6's own rolling aggregates, so it got the same level of test
+coverage, plus one more: a direct check that the opponent-adjustment
+correction's SIGN is right (a defense with an above-average-strength
+schedule gets its raw "allowed" number reduced, not increased, and vice
+versa) — not just that the plumbing runs.
+
+**Real-2025 spot check, not just a leakage-clean value.** Season-long
+(unshifted, for readability — not the point-in-time-safe columns the model
+trains on) xFP allowed reads plausibly against real 2025 defensive
+reputations: Denver and Kansas City (both real, reputationally sound
+defenses) land among the fewest xFP allowed to RB; Buffalo and the Chargers
+(both known for zone coverage that limits tight ends) land among the fewest
+allowed to TE; Cincinnati — a defense with real, widely-reported struggles
+for most of 2025 — lands at #1 most xFP allowed to TE, but notably NOT among
+the worst against WR (bottom-5 allowed there instead), a specific,
+position-differentiated finding a single overall defensive-rank number
+couldn't produce. A plausibility check on a handful of teams, not a
+certification of every team's number — see `03_usage_features.ipynb`
+section 3.7 for the full table and reasoning.
+
+**Does it actually help the model? Checked, not assumed — and the answer is
+mixed, honestly reported rather than rounded up.** Re-ran walk-forward
+validation (identical methodology and 2024-2025 eval window to the
+published Phase 6 numbers) with vs. without the four new columns added to
+`FEATURE_COLUMNS`:
+
+| Position | MAE without | MAE with | Delta |
+|---|---|---|---|
+| QB | 6.3553 | 6.3553 | 0.0000 (no change — expected, null by construction) |
+| RB | 4.1703 | 4.1712 | +0.0008 (negligible, noise) |
+| WR | 3.9486 | 3.9386 | **−0.0100** (small real improvement) |
+| TE | 3.0314 | 3.0135 | **−0.0179** (small real improvement) |
+
+Matchup turns out to matter more for the two positions whose production is
+most tied to man/zone coverage matchups (WR/TE) than for RB, whose fantasy
+output leans more on volume and game script than on which individual
+defenders it faces — a plausible story, not assumed going in, and consistent
+with "matchup is the most-cited factor in fantasy advice and it may well be
+weaker than its reputation" being partly true here: real, but small, and
+position-dependent rather than universal. Shipped anyway (both as a model
+feature for all four positions, gated null for QB, and as the dashboard
+panels/indicator) because a small real gain plus a genuinely new analytical
+surface (the standalone Matchup Ratings panel didn't exist in any form
+before) both individually clear the bar for shipping — the RB/QB non-result
+is disclosed here, not hidden.
+
+**Frontend verified via Playwright** against the real, live dashboard (real
+Sleeper data; 2026 is real pre-draft, so the app's own existing season-
+selector fallback showed the 2025 archive by default — a fake-but-realistic
+`player_advanced_stats.json`/archive export was intercepted at the network
+layer for exactly this feature's fields, everything else came from real
+Sleeper/ESPN calls): the Dashboard's new "Matchup Ratings" panel renders
+real favorable/tough lists per position with working RB/WR/TE tab
+switching; the Players table's new "Matchup" column correctly shows a
+favorability badge for a real player (Justin Jefferson, real Sleeper
+player_id `6794`) when the selected week matches the export's own week, and
+correctly shows `—` (not stale data) when it doesn't — the same season/week
+gating pattern `getMyProj`/`getMonteCarlo` already use, applied here via a
+new `getMatchup()`; Player Detail's Opportunity Shares panel shows the same
+gated matchup line. Zero new console errors across the full click-through.
 
 ---
 
@@ -2044,6 +2201,7 @@ assumptions as facts.
 | Season archives + selector: `get_archive_candidates()` doesn't silently drop real historical rostered players, the generated 2025 archive is well-formed, and the UI switches every panel together with no mixed-season state | **Verified** — `get_archive_candidates()` checked directly against this league's real historical rosters for all 5 completed seasons (2021-2025): `n_with_current_team == n_crosswalk_matched` for every one, vs. 46.9%-88.8% survival if `get_export_candidates()` had been reused unmodified (see the per-season table in **Phase 9 findings**). `scripts/archive_season.py 2025` generated a real, validated 921,516-byte archive (465 players, 466/1468 radar/heatmap-eligible, crosswalk match rate 99.0%). Frontend verified via Playwright against the real production config (unmodified `LEAGUE_ID`, real committed archive): defaulted to 2025 automatically (2026 has zero real games), and on 2025 every named panel (KPI cards, radar, heatmap, opportunity shares, weekly chart) reported the same real full season for Christian McCaffrey with no partial/mixed state; switching to 2026 correctly reverted radar/heatmap to "0 of 5 games" with zero 2025 data leaking through, and the standings table correctly emptied. Also caught and fixed a real latent bug in the process: `state.statsByWeek`/`state.projectionsByWeek` were cached by week number alone, which would have let one season's per-week stats silently answer for another's after a switch — fixed by clearing both caches on every season load, verified via a full click-through of every tab in both seasons plus a mid-navigation season switch, zero new console errors. See **Phase 9 findings**. |
 | Round 2: 2023/2024 archives are well-formed, `seasonDataCache` actually prevents re-fetching (not just correct by coincidence), and it can't repeat the `statsByWeek` cache-key collision bug | **Verified** — `scripts/archive_season.py` generated real, validated archives for 2023 (933,208 bytes, 467 players) and 2024 (941,250 bytes, 461 players), both with `n_with_current_team == n_crosswalk_matched` (the same fix already proven for 2025). Two more real, well-known players spot-checked: Christian McCaffrey's real 2023 Offensive Player of the Year season (95th-98th percentile across nearly every radar axis) and Saquon Barkley's real historic 2024 2000+-rushing-yard season with Philadelphia (98th percentile Touch Volume/Yards-per-Carry, but only 14th percentile Goal-Line Share — consistent with the Eagles' real, well-documented use of Jalen Hurts' own QB sneak for goal-line scoring instead). Confirmed via Playwright that switching 2023 -> 2024 -> 2023 produces byte-identical output on both visits to 2023 AND that the second visit makes zero network requests for any `/archive/` path (checked via the browser's own request log, not inferred) — `seasonDataCache` is a `Map` keyed by season number, so it can't repeat the week-number-only collision `statsByWeek`/`projectionsByWeek` had. Zero new console errors. See **Phase 9 findings**' Round 2. |
 | Round 3: Players table Trend/FP Over Exp/Volatility columns sort/render correctly, and the new `meta.xfp_season` field correctly disambiguates FP Over Exp when it doesn't match the displayed season | **Verified** — `tests/test_export.py`'s round-trip test asserts `payload["meta"]["xfp_season"]` directly (full suite: 131 passed). All 4 committed exports regenerated with the new field: live `player_advanced_stats.json` reports `meta.season: 2026, meta.xfp_season: 2025` (the pre-draft fallback case); all 3 archives report `xfp_season == season` (2023/2024/2025, no fallback for a completed season). Frontend verified via Playwright against the real production config: on 2026, the FP Over Exp header/tooltip disambiguates (`"FP Over Exp (2025)"`, tooltip naming both seasons) and the cell shows a real carried-forward number for RB/WR/TE (e.g. `+69.2`) while Trend/Volatility correctly show dashes (no such fallback exists for them); on 2023/2024/2025 the header/tooltip are the plain, no-suffix version. Also verified independently: table width stays narrower than its panel at 1366px/1440px/1920px viewports (no column needed dropping, per the explicit ask); sorting by FP Over Exp puts null (QB) rows last in both directions, confirmed both against real rendered rows and a synthetic comparator test isolating null-vs-zero-vs-real-value ordering. Zero unexplained console errors (only the pre-existing ESPN CORS block). |
+| Family 5B opponent defensive strength (`add_opponent_strength_features`/`build_defense_strength_table`) is leakage-free, its opponent-adjustment sign is correct, and it measurably (if modestly) improves WR/TE walk-forward MAE | **Verified** — 8 new leakage tests pass (future-truncation + a same-week/next-week perturbation test, same two-pattern approach as every other family; 54 tests total in `tests/test_no_leakage.py`), plus a direct sign check on the opponent-adjustment correction using real 2018-2025 data. Walk-forward MAE (2024-2025 eval window, same methodology as the published Phase 6 table): QB unchanged (null by construction), RB +0.0008 (noise), WR −0.0100, TE −0.0179 — a small but real gain for WR/TE, no meaningful effect for QB/RB. Real-2025 spot check (season-long xFP allowed) reads plausibly against known defensive reputations (Denver/Kansas City low RB-allowed, Buffalo/Chargers low TE-allowed, Cincinnati #1 TE-allowed but NOT bottom-5 WR-allowed). Frontend (Dashboard's Matchup Ratings panel, Players table's Matchup column, Player Detail's matchup line) verified via Playwright against the real live dashboard with only the export payload intercepted — zero new console errors, correct season/week gating (a real player, Sleeper id `6794`, showed a real favorability badge when the displayed week matched the export's week and `—` when it didn't). See **Family 5B findings**. |
 | Phase 10 Draft Prep: default-tab logic, independent season selection, condensed radar axis mapping, and the null-last sort comparator all behave correctly; the fade/buy-low signal is characterizable on real players | **Verified** — Playwright against the real production config (unmodified `LEAGUE_ID`, real committed archives): default sub-tab correctly follows `hasDraftBoard` in both directions (opens on Draft Board when the active season has a real completed draft — true for the default 2025 season; opens on Draft Prep when it doesn't — confirmed by switching to the real, `pre_draft`, 0-picks 2026 league before the Draft tab's first visit in a fresh session). Season switching 2025→2024→2023→2025 in Draft Prep's own dropdown returned distinct, correct real data each time, independent of the main season selector's own value throughout. An isolated synthetic-array test of the exact comparator confirmed nulls sort strictly last in both directions, distinct from a real `0` (same guarantee already proven for the Players table's identical comparator). Fixed one real regression this surfaced: the new Board/Prep toggle shares the `.view-toggle-btn` CSS class with the pre-existing Grid/List toggle, and the old unscoped `.view-toggle-btn` listener would have matched the new buttons too and corrupted `state.draftView` — scoped to `.view-toggle-btn[data-view]`; confirmed both toggles now operate independently with no cross-talk. `xfp.season_actual` (Season Pts) confirmed real and correctly populated for QB despite `season_xfp` being null (traced to `build_xfp_summary` summing `custom_points` and `xfp` as separate columns, not gated together) — spot-checked against Mahomes/Stafford/Prescott's real 2025 season totals, no Python change needed. Top fade candidates (Puka Nacua +75.5, Jahmyr Gibbs +69.2, De'Von Achane +56.1) and top buy-low candidates (Justin Jefferson −46.2, Jerry Jeudy −58.2, Mike Evans −28.1) from the real 2025 archive all characterize plausibly against real-world player profiles (ascending/explosive players outperforming a touch-volume model, established talents having injury/situational down years) — see **Phase 10 findings** for the full list and reasoning. Table width fits its panel at 1440px. Zero unexplained console errors throughout. |
 
 ## What's outstanding
@@ -2064,6 +2222,7 @@ assumptions as facts.
 - **Historical champion data** — plan is to maintain a small `champions.json` file by hand for the league's history
 - **Season archives beyond 2023-2025** — 2023, 2024, and 2025 are archived and in the selector; 2021 and 2022 were deliberately skipped (roster turnover makes them less useful for draft prep, not a technical limitation). `src/ingest.py::SEASON_LEAGUE_IDS` already has both their real league_ids, and `get_archive_candidates()` was verified against all 5 seasons before scoping down (see Phase 9 findings). Adding either later is `python scripts/archive_season.py <year>` plus one new entry in `index.html`'s `SEASON_OPTIONS` — no code changes needed, just a decision to do it.
 - **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
+- **The committed exports (`data/output/player_advanced_stats.json` and `data/output/archive/*.json`) don't have Family 5B's `matchup`/`defense_rankings` keys yet** — they were generated before this session's work. `retrain.yml`'s next run will pick up the new `FEATURE_COLUMNS` automatically (no code change needed there); `weekly-update.yml`'s next run (or a manual `scripts/archive_season.py <year>` re-run per archive) will populate `matchup`/`defense_rankings` for real. The Playwright verification for this feature used a fake-but-realistic intercepted payload for exactly this reason — see **Family 5B findings**.
 
 ---
 

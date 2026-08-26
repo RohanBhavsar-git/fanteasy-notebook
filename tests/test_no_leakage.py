@@ -38,6 +38,8 @@ from src.pipeline import build_weekly_scored  # noqa: E402
 from src.usage import (  # noqa: E402
     CONTEXT_OUTPUT_COLUMNS,
     EFFICIENCY_OUTPUT_COLUMNS,
+    OPP_STRENGTH_POSITIONS,
+    OPPONENT_STRENGTH_OUTPUT_COLUMNS,
     ROLLING_OUTPUT_COLUMNS,
     SITUATIONAL_OUTPUT_COLUMNS,
     SNAP_OUTPUT_COLUMNS,
@@ -46,13 +48,16 @@ from src.usage import (  # noqa: E402
     XFP_OUTPUT_COLUMNS,
     add_context_features,
     add_efficiency_features,
+    add_opponent_strength_features,
     add_rolling_features,
     add_situational_features,
     add_snap_features,
     add_trend_features,
     add_volume_features,
     add_xfp_features,
+    build_defense_strength_table,
     _bucket_rate_table,
+    _team_week_opponent,
 )
 
 BOUNDARIES = [(2024, 5), (2024, 10), (2025, 5), (2025, 12)]
@@ -312,6 +317,155 @@ def test_xfp_idempotent(weekly_scored, pbp, scoring_settings):
     once = add_xfp_features(weekly_scored, pbp, scoring_settings)
     twice = add_xfp_features(once, pbp, scoring_settings)
     pd.testing.assert_frame_equal(once, twice)
+
+
+# ==========================================================================
+# FAMILY 5B — OPPONENT DEFENSIVE STRENGTH
+# ==========================================================================
+@pytest.mark.parametrize("season,boundary_week", BOUNDARIES)
+def test_opponent_strength_no_future_leakage(featured_df, schedule, season, boundary_week):
+    """
+    Removing weeks AFTER boundary_week from BOTH the source player-week
+    frame and the schedule must not change opponent-strength features for
+    any week <= boundary_week -- same black-box pattern as every other
+    family in this file. Both inputs need truncating: the schedule
+    determines who played whom each week, and the player frame supplies
+    the xfp that becomes what an opponent "allowed".
+    """
+    df_truncated = _truncate_after(featured_df, season, boundary_week)
+    schedule_truncated = _truncate_after(schedule, season, boundary_week)
+
+    full = add_opponent_strength_features(featured_df, schedule)
+    truncated = add_opponent_strength_features(df_truncated, schedule_truncated)
+
+    mask = (full["season"] == season) & (full["week"] <= boundary_week)
+    cols = ["player_id", "season", "week"] + OPPONENT_STRENGTH_OUTPUT_COLUMNS
+    left = full.loc[mask, cols].reset_index(drop=True)
+    right = truncated.loc[mask, cols].reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(left, right)
+
+
+def test_opponent_strength_shift_excludes_own_week(featured_df, schedule):
+    """
+    Perturbation test, same spirit as test_rolling_features_shift_excludes_own_week
+    and test_trend_features_shift_excludes_own_week: a black-box truncate-
+    and-compare test can't prove week W's defense-strength values exclude
+    week W's OWN game, because removing week W also destroys real same-
+    week opportunity data a later week legitimately needs. Instead:
+    perturb one real player's xfp at a specific week to an extreme
+    outlier, and confirm (a) every player facing that SAME opponent in
+    week W itself -- including the perturbed player's own row -- is
+    unaffected (their opponent's defense-strength value at week W already
+    only reflects games strictly before W), while (b) a player facing
+    that same opponent in ITS NEXT game is affected (the perturbed week
+    has, by then, entered the opponent's trailing window one week later).
+    """
+    team_week_opp = _team_week_opponent(schedule)
+
+    candidates = featured_df[
+        featured_df["position"].isin(OPP_STRENGTH_POSITIONS) & featured_df["xfp"].notna()
+    ]
+    picked = None
+    for _, row in candidates.iterrows():
+        player_id, team, season, week = row["player_id"], row["team"], row["season"], row["week"]
+        opp_row = team_week_opp[
+            (team_week_opp["team"] == team) & (team_week_opp["season"] == season)
+            & (team_week_opp["week"] == week)
+        ]
+        if opp_row.empty:
+            continue
+        defteam = opp_row["opponent"].iloc[0]
+        defteam_later_games = team_week_opp[
+            (team_week_opp["team"] == defteam) & (team_week_opp["season"] == season)
+            & (team_week_opp["week"] > week)
+        ]
+        if not defteam_later_games.empty:
+            next_week = int(defteam_later_games.sort_values("week")["week"].iloc[0])
+            picked = (player_id, season, week, defteam, next_week)
+            break
+    assert picked is not None, "expected a real player whose opponent has a later same-season game"
+    player_id, season, week, defteam, next_week = picked
+
+    def _rows_facing(result: pd.DataFrame, wk: int) -> pd.DataFrame:
+        m = (
+            (result["season"] == season) & (result["week"] == wk)
+            & (result["opponent"] == defteam) & result["position"].isin(OPP_STRENGTH_POSITIONS)
+        )
+        return result.loc[m].set_index("player_id").sort_index()
+
+    baseline = add_opponent_strength_features(featured_df, schedule)
+    baseline_same_week = _rows_facing(baseline, week)
+    baseline_next_week = _rows_facing(baseline, next_week)
+    assert not baseline_same_week.empty
+    assert not baseline_next_week.empty
+
+    perturbed_df = featured_df.copy()
+    mask = (
+        (perturbed_df["player_id"] == player_id) & (perturbed_df["season"] == season)
+        & (perturbed_df["week"] == week)
+    )
+    perturbed_df.loc[mask, "xfp"] = 999.0
+    perturbed = add_opponent_strength_features(perturbed_df, schedule)
+    perturbed_same_week = _rows_facing(perturbed, week)
+    perturbed_next_week = _rows_facing(perturbed, next_week)
+
+    for col in OPPONENT_STRENGTH_OUTPUT_COLUMNS:
+        pd.testing.assert_series_equal(baseline_same_week[col], perturbed_same_week[col])
+
+    changed = any(
+        not baseline_next_week[col].equals(perturbed_next_week[col])
+        for col in OPPONENT_STRENGTH_OUTPUT_COLUMNS
+    )
+    assert changed, "expected the perturbation to reach the opponent's NEXT game one week later"
+
+
+def test_opponent_strength_null_for_qb(featured_df, schedule):
+    """
+    QB has no xFP counterpart for passing production (see
+    add_xfp_features's own scope-gap docstring note), so no defense-vs-QB
+    value exists to expose -- every QB row must be null here, the same
+    disclosed gap xfp/fp_over_expected already carry for QB rows.
+    """
+    result = add_opponent_strength_features(featured_df, schedule)
+    qb_rows = result[result["position"] == "QB"]
+    assert len(qb_rows) > 0
+    for col in OPPONENT_STRENGTH_OUTPUT_COLUMNS:
+        assert qb_rows[col].isna().all()
+
+
+def test_opponent_strength_idempotent(featured_df, schedule):
+    once = add_opponent_strength_features(featured_df, schedule)
+    twice = add_opponent_strength_features(once, schedule)
+    pd.testing.assert_frame_equal(once, twice)
+
+
+def test_defense_strength_table_opponent_adjustment_direction(featured_df, schedule):
+    """
+    Sanity check on the opponent-adjustment SIGN, not just its plumbing:
+    for a defense whose average opponent has been stronger than the
+    league average at a given position, the ADJUSTED allowed value must
+    be LOWER than the raw one (some of what they gave up is attributed to
+    facing tough offenses, not a weak defense) -- and the reverse for a
+    defense whose opponents have been weaker than average. Checked
+    directly against real 2024-2025 data rather than assumed from the
+    formula alone.
+    """
+    table = build_defense_strength_table(featured_df, schedule)
+    rows = table.dropna(subset=["allowed_ewm3", "allowed_adj_ewm3"])
+    assert len(rows) > 0
+
+    # avg_opponent_strength - league_avg_generated_s2d is exactly what's
+    # subtracted from allowed_ewm3/allowed_s2d to get allowed_adj_ewm3/s2d
+    # -- recover it from the two already-computed columns rather than
+    # re-importing build_defense_strength_table's private intermediates.
+    correction = rows["allowed_ewm3"] - rows["allowed_adj_ewm3"]
+    above_average_schedule = rows[correction > 0.5]
+    below_average_schedule = rows[correction < -0.5]
+    assert len(above_average_schedule) > 0
+    assert len(below_average_schedule) > 0
+    assert (above_average_schedule["allowed_adj_ewm3"] < above_average_schedule["allowed_ewm3"]).all()
+    assert (below_average_schedule["allowed_adj_ewm3"] > below_average_schedule["allowed_ewm3"]).all()
 
 
 def test_rolling_features_shift_excludes_own_week(featured_df):

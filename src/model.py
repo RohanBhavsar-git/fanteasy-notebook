@@ -60,13 +60,25 @@ import pandas as pd
 import shap
 from scipy.stats import spearmanr
 
-from src.usage import CONTEXT_OUTPUT_COLUMNS, ROLLING_OUTPUT_COLUMNS
+from src.usage import CONTEXT_OUTPUT_COLUMNS, OPPONENT_STRENGTH_OUTPUT_COLUMNS, ROLLING_OUTPUT_COLUMNS
 
 logger = logging.getLogger(__name__)
 
 POSITIONS = ("QB", "RB", "WR", "TE")
 
-FEATURE_COLUMNS = list(ROLLING_OUTPUT_COLUMNS) + list(CONTEXT_OUTPUT_COLUMNS)
+# OPPONENT_STRENGTH_OUTPUT_COLUMNS (Family 5B -- opponent defensive
+# strength by position) is, like CONTEXT_OUTPUT_COLUMNS, a describes-
+# THIS-WEEK'S-MATCHUP family rather than a describes-the-player-over-time
+# one: each value already IS a trailing, shift(1)-safe summary of the
+# player's OPPONENT (not the player), so it's used as-is here rather than
+# being fed through Family 6's rolling treatment a second time -- doing
+# that would average together different opponents across different weeks,
+# the same reason CONTEXT_OUTPUT_COLUMNS itself is excluded from
+# ROLLING_SOURCE_COLUMNS (see usage.py's comment on that exclusion). Null
+# for QB by construction -- see add_opponent_strength_features's docstring.
+FEATURE_COLUMNS = (
+    list(ROLLING_OUTPUT_COLUMNS) + list(CONTEXT_OUTPUT_COLUMNS) + list(OPPONENT_STRENGTH_OUTPUT_COLUMNS)
+)
 
 TARGET_BASELINE_OUTPUT_COLUMNS = ["baseline_season_to_date_avg", "baseline_trailing_3wk_avg"]
 

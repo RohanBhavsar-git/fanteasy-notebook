@@ -1115,6 +1115,256 @@ def add_xfp_features(
 
 
 # ==========================================================================
+# FAMILY 5B — OPPONENT DEFENSIVE STRENGTH (Family 5 addendum)
+# ==========================================================================
+# PHASE_2B_6_SPEC.md's Family 5 named this and deferred it: "Opponent
+# defensive strength by position, computed on prior weeks only -- fantasy
+# points allowed to RB/WR/TE, opponent-adjusted if practical." QB is out of
+# scope here for the SAME reason it's out of scope for xFP itself (see
+# add_xfp_features's docstring): xFP only has a bucket-rate model for
+# targets and carries, built entirely from the receiver's/rusher's own
+# expected value -- there is no equivalent model for a QB's passing
+# production (yards/TDs, a completely different scoring path), so "how many
+# xFP does this defense allow to opposing QBs" has no honest answer under
+# this design. Fixing that means a second, independent expected-passing-
+# points model (bucketed by down/distance/field position the way targets
+# and carries are), not an extension of this one -- out of scope here, not
+# silently skipped: no QB column below is ever populated, the same
+# disclosed-gap pattern xfp/fp_over_expected already use for QB rows.
+#
+# The metric: for each defense, in each week, the xFP (NOT raw actual
+# points) that the OPPOSING team's RB/WR/TE group generated that week.
+# Reuses `xfp` exactly as add_xfp_features already computes it (a
+# league-average bucket rate applied to real opportunities), rather than
+# raw custom_points allowed -- for the same reason xfp exists at all: a
+# defense that gave up one lucky 70-yard broken-tackle score looks worse
+# than the opportunity it actually conceded, and a defense that forced an
+# incompletion on a wide-open deep shot looks better than the dangerous
+# look it actually allowed. xFP measures the opportunity, not the bounce.
+#
+# Point-in-time mechanics: identical recipe to add_rolling_features (window
+# the raw per-team-week value with pandas' native ewm/expanding, then
+# shift(1) the whole result within the group) but grouped by (team,
+# position, season) instead of (player_id, season) -- a defense is a
+# scheme, not an individual, but the same "role changes across an
+# offseason, so reset at the season boundary" reasoning from Family 6
+# applies here too (new coordinator, new personnel). Row-based like every
+# other _ewm3 in this module, not calendar-based -- a bye week is simply a
+# missing row, not a zero.
+#
+# Opponent adjustment: a single-pass schedule-strength correction, not a
+# full iterative simultaneous-rating solve (e.g. Massey/Colley-style). An
+# iterative method needs many games to converge and is hard to keep
+# point-in-time-safe with as few as 1-3 prior games in an early-season
+# fold; a single pass is transparent, cheap, and tractable at this data
+# volume -- "opponent-adjusted if practical" from the spec, not "if
+# perfect". For each defense, at each week: average the TRAILING offensive
+# strength (each opponent's own generated_s2d, evaluated AS OF the week
+# that game was played -- already point-in-time-safe on its own) of every
+# team it has faced so far this season, compare that average to the
+# league-wide average offensive strength at that same point in time, and
+# subtract the difference from the defense's raw allowed number. A defense
+# that has faced unusually strong offenses gets its raw "allowed" number
+# reduced by exactly how much stronger those offenses were than average; a
+# defense that has faced unusually weak ones gets it increased.
+OPP_STRENGTH_POSITIONS = ("RB", "WR", "TE")
+
+OPPONENT_STRENGTH_OUTPUT_COLUMNS = [
+    "opp_def_xfp_allowed_ewm3", "opp_def_xfp_allowed_s2d",
+    "opp_def_xfp_allowed_adj_ewm3", "opp_def_xfp_allowed_adj_s2d",
+]
+
+
+def _team_week_opponent(schedule: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per (team, season, week): the opponent that team faced that week, built
+    by stacking the home/away perspective of each schedule row (same
+    stacking idiom as _team_week_context). No row for a team's bye week --
+    the team simply doesn't appear for that (season, week).
+    """
+    sched = schedule[schedule["game_type"] == "REG"]
+    shared = ["season", "week"]
+    home = sched[["home_team", "away_team"] + shared].rename(
+        columns={"home_team": "team", "away_team": "opponent"}
+    )
+    away = sched[["home_team", "away_team"] + shared].rename(
+        columns={"away_team": "team", "home_team": "opponent"}
+    )
+    return pd.concat([home, away], ignore_index=True)
+
+
+def _rolling_team_position(long_df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """
+    Adds `{value_col}_ewm3`/`{value_col}_s2d` to long_df -- the same
+    window-then-shift(1) recipe as add_rolling_features, generalized from
+    (player_id, season) groups to (team, position, season) groups.
+    long_df must have team, position, season, week, and value_col, with one
+    row per (team, position, season, week) -- not one row per player.
+    """
+    sorted_df = long_df.sort_values(["team", "position", "season", "week"])
+    group_keys = [sorted_df["team"], sorted_df["position"], sorted_df["season"]]
+    grouped = sorted_df.groupby(["team", "position", "season"], sort=False)
+
+    def _shift_within_group(s: pd.Series) -> pd.Series:
+        return s.groupby(group_keys, sort=False).shift(1)
+
+    ewm_raw = grouped[value_col].ewm(halflife=EWM_HALFLIFE, min_periods=1).mean().droplevel([0, 1, 2])
+    s2d_raw = grouped[value_col].expanding().mean().droplevel([0, 1, 2])
+
+    new_cols = pd.DataFrame({
+        f"{value_col}_ewm3": _shift_within_group(ewm_raw).reindex(long_df.index),
+        f"{value_col}_s2d": _shift_within_group(s2d_raw).reindex(long_df.index),
+    }, index=long_df.index)
+    return pd.concat([long_df, new_cols], axis=1)
+
+
+def build_defense_strength_table(df: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per (team, position, season, week) for position in OPP_STRENGTH_POSITIONS:
+    this team's own trailing OFFENSIVE xFP output at that position
+    (generated_ewm3/generated_s2d -- also the input to the opponent
+    adjustment below), this team's trailing DEFENSIVE xFP allowed to that
+    position (allowed_ewm3/allowed_s2d -- the raw "how good is this
+    defense" metric), and the opponent-adjusted version of the allowed
+    metric (allowed_adj_ewm3/allowed_adj_s2d). Public (not
+    underscore-prefixed): src/export.py calls this directly to build the
+    "which defenses are favorable this week" panel, a per-TEAM ranking
+    that add_opponent_strength_features's per-PLAYER join below doesn't
+    expose on its own.
+
+    Args:
+        df: player-week frame with player_id, position, team, season,
+            week, xfp (i.e. df after add_xfp_features has already run).
+        schedule: from get_schedule() -- used only to know who played whom
+            each week, not for any Vegas/weather column.
+
+    Returns:
+        team, position, season, week, generated_ewm3, generated_s2d,
+        allowed_ewm3, allowed_s2d, allowed_adj_ewm3, allowed_adj_s2d.
+        Null wherever the team has fewer than the required prior in-season
+        games at that position -- same season-boundary reset and null
+        semantics as add_rolling_features.
+    """
+    required = ["player_id", "position", "team", "season", "week", "xfp"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"build_defense_strength_table: df is missing columns {missing}")
+
+    pos_df = df[df["position"].isin(OPP_STRENGTH_POSITIONS)]
+    generated = (
+        pos_df.groupby(["team", "position", "season", "week"])["xfp"]
+        .sum(min_count=1)
+        .reset_index(name="generated")
+    )
+    generated = _rolling_team_position(generated, "generated")
+
+    team_week_opp = _team_week_opponent(schedule)
+
+    # This team's own opponent-that-week's generated total becomes what
+    # THIS team's defense allowed that week -- reusing the already-
+    # point-in-time-safe generated_ewm3/generated_s2d (below) as the
+    # offense's own "how good are they" read at the time of that specific
+    # game, before this function applies its OWN shift(1) again for the
+    # defense's trailing "allowed" trend.
+    allowed_raw = generated.merge(
+        team_week_opp, on=["team", "season", "week"], how="left"
+    )[["opponent", "position", "season", "week", "generated"]].rename(
+        columns={"opponent": "team", "generated": "allowed"}
+    )
+    allowed_raw = allowed_raw.dropna(subset=["team"])
+    allowed = _rolling_team_position(allowed_raw, "allowed")
+
+    # Opponent adjustment: for each of a defense's own games so far this
+    # season, look up that week's OPPONENT's own generated_s2d (their
+    # offensive strength as of that game -- already point-in-time-safe,
+    # since generated_s2d itself never sees that team's own future).
+    # Average those across the defense's games so far (shift(1)-safe
+    # expanding mean, same _rolling_team_position recipe as everything
+    # else here) to get "how strong were the offenses this defense has
+    # faced, on average, as of this week" -- compared below against the
+    # league-wide average at that same point in time.
+    positions_df = pd.DataFrame({"position": list(OPP_STRENGTH_POSITIONS)})
+    team_week_opp_pos = team_week_opp.merge(positions_df, how="cross")
+    opp_strength_per_game = team_week_opp_pos.merge(
+        generated[["team", "position", "season", "week", "generated_s2d"]]
+        .rename(columns={"team": "opponent", "generated_s2d": "opp_offense_strength"}),
+        on=["opponent", "position", "season", "week"], how="left",
+    )
+    opp_strength_per_game = _rolling_team_position(opp_strength_per_game, "opp_offense_strength")
+    avg_opponent_strength = opp_strength_per_game[
+        ["team", "position", "season", "week", "opp_offense_strength_s2d"]
+    ].rename(columns={"opp_offense_strength_s2d": "avg_opponent_strength"})
+
+    league_avg = (
+        generated.groupby(["position", "season", "week"])["generated_s2d"]
+        .mean()
+        .reset_index(name="league_avg_generated_s2d")
+    )
+
+    out = allowed.merge(
+        generated[["team", "position", "season", "week", "generated_ewm3", "generated_s2d"]],
+        on=["team", "position", "season", "week"], how="outer",
+    )
+    out = out.merge(avg_opponent_strength, on=["team", "position", "season", "week"], how="left")
+    out = out.merge(league_avg, on=["position", "season", "week"], how="left")
+
+    sos_correction = out["avg_opponent_strength"] - out["league_avg_generated_s2d"]
+    out["allowed_adj_ewm3"] = out["allowed_ewm3"] - sos_correction
+    out["allowed_adj_s2d"] = out["allowed_s2d"] - sos_correction
+
+    return out[["team", "position", "season", "week",
+                "generated_ewm3", "generated_s2d",
+                "allowed_ewm3", "allowed_s2d",
+                "allowed_adj_ewm3", "allowed_adj_s2d"]]
+
+
+def add_opponent_strength_features(df: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add OPPONENT_STRENGTH_OUTPUT_COLUMNS: how strong THIS WEEK's opponent's
+    defense has trailingly been against players at THIS PLAYER'S OWN
+    position, from build_defense_strength_table. Also adds `opponent`
+    (that week's opposing team code) -- descriptive metadata for the
+    export layer, deliberately NOT a model feature (raw team identity, not
+    a computed strength signal) and so not part of
+    OPPONENT_STRENGTH_OUTPUT_COLUMNS.
+
+    Idempotent: existing output columns are dropped before recomputing.
+
+    Args:
+        df: player-week frame with player_id, position, team, season,
+            week, xfp (i.e. df after add_xfp_features has already run).
+        schedule: from get_schedule().
+
+    Returns:
+        Copy of df with `opponent` and OPPONENT_STRENGTH_OUTPUT_COLUMNS
+        added. Null for every QB row (scope gap -- see this section's
+        module-level comment) and for a team's bye week (no opponent that
+        week), the same "real absence of data, not a bug" convention as
+        everywhere else in this pipeline.
+    """
+    required = ["player_id", "position", "team", "season", "week", "xfp"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"add_opponent_strength_features: df is missing columns {missing}")
+
+    out = df.drop(columns=[c for c in OPPONENT_STRENGTH_OUTPUT_COLUMNS + ["opponent"] if c in df.columns])
+
+    team_week_opp = _team_week_opponent(schedule)
+    out = out.merge(team_week_opp, on=["team", "season", "week"], how="left")
+
+    defense_table = build_defense_strength_table(df, schedule).rename(columns={
+        "team": "opponent",
+        "allowed_ewm3": "opp_def_xfp_allowed_ewm3",
+        "allowed_s2d": "opp_def_xfp_allowed_s2d",
+        "allowed_adj_ewm3": "opp_def_xfp_allowed_adj_ewm3",
+        "allowed_adj_s2d": "opp_def_xfp_allowed_adj_s2d",
+    })[["opponent", "position", "season", "week"] + OPPONENT_STRENGTH_OUTPUT_COLUMNS]
+
+    out = out.merge(defense_table, on=["opponent", "position", "season", "week"], how="left")
+    return out
+
+
+# ==========================================================================
 # FIELD HEATMAP ZONES (Phase 5) — display-only, never a model feature
 # ==========================================================================
 # Deliberately SEPARATE bin definitions from the xFP buckets above, built

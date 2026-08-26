@@ -49,6 +49,7 @@ from src.usage import (
     ROLLING_SOURCE_COLUMNS,
     add_context_features,
     add_efficiency_features,
+    add_opponent_strength_features,
     add_rolling_features,
     add_situational_features,
     add_snap_features,
@@ -185,6 +186,12 @@ def build_raw_features(
     df = add_situational_features(df, pbp)
     df = add_context_features(df, schedule)
     df = add_xfp_features(df, pbp, scoring_settings)
+    # Needs xfp (just above) as input -- see add_opponent_strength_features's
+    # own docstring. Resets every season by construction (no cross-season
+    # carryover, same as Family 6), so a single-season call here is fully
+    # sufficient -- unlike xFP's own rate table, this doesn't need multiple
+    # prior seasons of pbp to be reliable during weekly-only inference.
+    df = add_opponent_strength_features(df, schedule)
     return df
 
 

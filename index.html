@@ -2547,6 +2547,7 @@
     compareWeek: null,    // null = current week; otherwise a specific week to compare projections/stats for
     playerFilters: { search: '', position: 'ALL', team: 'ALL', owner: 'ALL', injury: 'ALL', sortBy: 'sleeperProj', sortDir: 'desc' },
     playerWeek: null,        // null = current week; otherwise the projection week the Players list shows
+    matchupPanelPosition: 'WR', // which position tab the Dashboard's Matchup Ratings panel shows
   };
 
   let chartInstances = {};
@@ -3015,6 +3016,19 @@
     return advanced.players?.[playerId]?.monte_carlo || null;
   }
 
+  // Family 5B's per-player matchup block is a WEEK-SPECIFIC read (this
+  // week's real opponent + that opponent's current rank), same as
+  // getMyProj/getMonteCarlo above -- gated the same way so a player-row
+  // badge never shows a stale opponent for a week that isn't the one on
+  // screen.
+  function getMatchup(playerId, season, week) {
+    const advanced = state.advancedStats;
+    if (!advanced || Number(advanced.meta?.season) !== Number(season) || Number(advanced.meta?.week) !== Number(week)) {
+      return null;
+    }
+    return advanced.players?.[playerId]?.matchup || null;
+  }
+
   function monteCarloCaveatText() {
     return state.advancedStats?.meta?.monte_carlo_caveat
       || "These are Monte Carlo estimates from the model's calibrated quantiles; ceilings run conservative, so boom rates read a bit low.";
@@ -3379,6 +3393,138 @@
     `;
   }
 
+  // ---- Family 5B: opponent defensive strength -- how many xFP a defense
+  // has trailingly allowed to a position, opponent-adjusted. Reads
+  // state.advancedStats.defense_rankings (league-wide, one list per
+  // position, most-favorable-to-face first) for the standalone panel, and
+  // state.advancedStats.players[id].matchup (this week's own opponent +
+  // that opponent's rank) for the per-player indicator. QB is honestly
+  // absent from defense_rankings entirely and null in every player's own
+  // matchup.rank -- there's no expected-passing-points model to rate a
+  // defense against opposing QBs (see src/usage.py's own scope-gap note),
+  // not a rendering bug.
+  function getDefenseRankings(position) {
+    return state.advancedStats?.defense_rankings?.[position] || [];
+  }
+
+  // Tercile split of a rank within its pool -- "favorable" (top third,
+  // allows the most, best matchup for an offensive player at this
+  // position), "tough" (bottom third), "neutral" (the middle). A simple,
+  // explainable cut rather than a model-derived threshold -- this is a
+  // display tier, not a feature.
+  function matchupFavorability(rank, poolSize) {
+    if (rank == null || !poolSize) return null;
+    const pct = (rank - 1) / poolSize; // 0 = most favorable, ~1 = toughest
+    if (pct < 1 / 3) return { tier: 'favorable', label: 'Favorable', color: 'var(--success)', icon: '🟢' };
+    if (pct > 2 / 3) return { tier: 'tough', label: 'Tough', color: 'var(--danger)', icon: '🔴' };
+    return { tier: 'neutral', label: 'Neutral', color: 'var(--text-muted)', icon: '⚪' };
+  }
+
+  // Compact badge for a player row / opportunity shares panel -- honest
+  // "—" when this week's opponent isn't known yet, the position is QB (no
+  // rating exists to show), or the displayed week isn't the export's own
+  // week (see getMatchup's gating), not a fabricated neutral reading.
+  function matchupIndicatorHtml(playerId, season, week) {
+    const m = getMatchup(playerId, season, week);
+    if (!m || !m.opponent) return '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+    const fav = matchupFavorability(m.rank, m.pool_size);
+    if (!fav) {
+      return `<span style="color: var(--text-muted); font-size: 11px;" title="No matchup rating for this position/week">vs ${m.opponent}</span>`;
+    }
+    return `
+      <span style="font-size: 12px; white-space: nowrap;" title="${fav.label} matchup vs ${m.opponent} — ranked ${m.rank} of ${m.pool_size} defenses allowed to this position (most-favorable-first)">
+        ${fav.icon} <span style="color: ${fav.color}; font-weight: 600;">vs ${m.opponent}</span>
+      </span>
+    `;
+  }
+
+  function defenseRankRowHtml(entry, poolSize) {
+    const fav = matchupFavorability(entry.rank, poolSize);
+    return `
+      <div class="kpi-card">
+        <div class="kpi-icon ${fav?.tier === 'favorable' ? 'trend' : 'target'}">${fav ? fav.icon : '⚪'}</div>
+        <div class="kpi-content">
+          <div class="kpi-label">${entry.team} <span style="color: var(--text-muted); font-weight: 400;">#${entry.rank} of ${poolSize}</span></div>
+          <div class="kpi-value">${entry.adj_s2d.toFixed(1)} xFP/gm</div>
+          <div class="kpi-sub">opponent-adjusted, season-to-date</div>
+        </div>
+      </div>
+    `;
+  }
+
+  const MATCHUP_PANEL_POSITIONS = ['RB', 'WR', 'TE'];
+
+  function renderMatchupPanel() {
+    const advanced = state.advancedStats;
+    const pos = MATCHUP_PANEL_POSITIONS.includes(state.matchupPanelPosition) ? state.matchupPanelPosition : 'WR';
+    const rankings = advanced ? getDefenseRankings(pos) : [];
+    const poolSize = rankings.length;
+
+    const tabsHtml = `
+      <div style="display: flex; gap: 6px; margin-bottom: 12px;">
+        ${MATCHUP_PANEL_POSITIONS.map(p => `
+          <button class="filter-select" data-matchup-pos="${p}" style="padding: 4px 14px; cursor: pointer; ${p === pos ? 'background: var(--accent); color: #fff; border-color: var(--accent);' : ''}">${p}</button>
+        `).join('')}
+      </div>
+    `;
+
+    let body;
+    if (!advanced) {
+      body = `
+        <div class="pd-placeholder">
+          <div class="pd-placeholder-icon">🛡️</div>
+          <div class="pd-placeholder-title">Awaiting model output</div>
+          <div class="pd-placeholder-text">
+            Once <code>player_advanced_stats.json</code> loads, this panel will show which defenses are
+            allowing the most/least expected fantasy points per position this week.
+          </div>
+        </div>
+      `;
+    } else if (poolSize === 0) {
+      body = `
+        <div class="pd-placeholder">
+          <div class="pd-placeholder-icon">🛡️</div>
+          <div class="pd-placeholder-title">No matchup ratings yet for ${pos}</div>
+          <div class="pd-placeholder-text">
+            Every defense needs a handful of its own games played this season before a rating exists —
+            this populates from around Week 6 onward, the same floor every other trailing signal in this
+            dashboard uses.
+          </div>
+        </div>
+      `;
+    } else {
+      const favorable = rankings.slice(0, 5);
+      const tough = rankings.slice(-5).reverse();
+      body = `
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+          <div>
+            <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--success); margin-bottom: 8px;">🟢 Favorable matchups</div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              ${favorable.map(e => defenseRankRowHtml(e, poolSize)).join('')}
+            </div>
+          </div>
+          <div>
+            <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--danger); margin-bottom: 8px;">🔴 Tough matchups</div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              ${tough.map(e => defenseRankRowHtml(e, poolSize)).join('')}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Matchup Ratings</div>
+          <div class="panel-note">xFP allowed by position, opponent-adjusted · RB/WR/TE only</div>
+        </div>
+        ${tabsHtml}
+        ${body}
+      </div>
+    `;
+  }
+
   // Player Detail's plain opportunity-share readout -- no radar, no
   // percentile, no interpretation, just the trailing numbers themselves.
   // Snap %/Target Share come from the export's `usage` block; Carry Share
@@ -3390,7 +3536,7 @@
   // metric), not usage.rz_target_share_ewm3/rz_carry_share_ewm3 separately
   // -- those two have different denominators and can't be added together,
   // see PROJECT_CONTEXT.md's design decisions.
-  function renderOpportunitySharesPanel(p) {
+  function renderOpportunitySharesPanel(p, season, week) {
     const advanced = getAdvancedPlayer(p.player_id);
     if (!advanced) {
       return `
@@ -3437,6 +3583,22 @@
          </div>`
       : `<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">No usage trend yet this season</div>`;
 
+    // Family 5B matchup line -- how this week's real opponent rates
+    // against this player's own position, opponent-adjusted. Gated on
+    // season/week the same way getMyProj/getMonteCarlo are (see
+    // getMatchup's own comment) so a stale week's opponent is never shown
+    // as if it described the week on screen.
+    const matchup = getMatchup(p.player_id, season, week);
+    const matchupFav = matchup ? matchupFavorability(matchup.rank, matchup.pool_size) : null;
+    const matchupLineHtml = !matchup || !matchup.opponent
+      ? `<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">No real matchup for this week yet</div>`
+      : matchupFav
+        ? `<div style="font-size: 12px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; margin-bottom: 12px;">
+             <span>${matchupFav.icon}</span>
+             <span>vs ${matchup.opponent} — <span style="color: ${matchupFav.color}; font-weight: 700;">${matchupFav.label}</span> matchup (#${matchup.rank} of ${matchup.pool_size} defenses, opponent-adjusted)</span>
+           </div>`
+        : `<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">vs ${matchup.opponent} — no matchup rating for this position</div>`;
+
     return `
       <div class="panel">
         <div class="panel-header">
@@ -3444,6 +3606,7 @@
           <div class="panel-note">Trailing 3-week usage, as of last update</div>
         </div>
         ${trendLineHtml}
+        ${matchupLineHtml}
         <div class="injury-stat-grid">
           ${shareCard('🏃', 'blue', 'Snap %', usage.offense_pct_ewm3, 'Of offensive snaps')}
           ${shareCard('🎯', 'purple', 'Target Share', usage.target_share_ewm3, 'Of team targets')}
@@ -4980,11 +5143,20 @@
         ${renderUsageTrendingPanel()}
         ${renderXfpPanel()}
       </div>
+      <div style="margin-top: 16px;">
+        ${renderMatchupPanel()}
+      </div>
     `;
 
     main.querySelectorAll('[data-player-id]').forEach(el => {
       el.addEventListener('click', () => {
         state.activePlayerId = el.dataset.playerId;
+        renderView();
+      });
+    });
+    main.querySelectorAll('[data-matchup-pos]').forEach(el => {
+      el.addEventListener('click', () => {
+        state.matchupPanelPosition = el.dataset.matchupPos;
         renderView();
       });
     });
@@ -5605,6 +5777,14 @@
       p.trendFeature = trendHeadline?.feature ?? null;
       p.fpOverExp = advanced?.xfp?.fp_over_expected ?? null;
       p.volatility = advanced?.usage?.xfp_vol ?? null;
+
+      // Matchup IS tied to the selected proj week (opponent changes every
+      // week), unlike the season-level signals just above -- getMatchup
+      // returns null outright unless playerWeek matches the export's own
+      // meta.week, same gating getMyProj already applies for p.myProj.
+      const matchup = getMatchup(p.player_id, season, playerWeek);
+      p.matchupRank = matchup?.rank ?? null;
+      p.matchupPoolSize = matchup?.pool_size ?? null;
     });
 
     // Sort
@@ -5738,6 +5918,7 @@
               <th data-sort="name" class="${f.sortBy === 'name' ? 'sorted' : ''}">Player ${f.sortBy === 'name' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th data-sort="position" class="${f.sortBy === 'position' ? 'sorted' : ''}">Pos ${f.sortBy === 'position' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th data-sort="team" class="${f.sortBy === 'team' ? 'sorted' : ''}">NFL ${f.sortBy === 'team' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th data-sort="matchupRank" title="How many expected fantasy points (xFP) this week's opponent has trailingly allowed to this player's position, opponent-adjusted and ranked against the other 31 defenses. RB/WR/TE only -- no rating exists for QB (see the panel below for why).">Matchup ${f.sortBy === 'matchupRank' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th>Owner</th>
               <th class="right" data-sort="sleeperProj" title="Sleeper's projected fantasy points for Wk ${playerWeek}">Sleeper Proj (Wk ${playerWeek}) ${f.sortBy === 'sleeperProj' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th class="right" data-sort="myProj" title="${myProjTooltip()}">My Proj (Wk ${playerWeek}, experimental) ${f.sortBy === 'myProj' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
@@ -5778,6 +5959,7 @@
                   </td>
                   <td><span class="pos-badge ${p.position}">${p.position}</span></td>
                   <td>${p.team || 'FA'}</td>
+                  <td>${matchupIndicatorHtml(p.player_id, season, playerWeek)}</td>
                   <td style="font-size: 12px;">${isFA ? '<span class="free-agent-pill">Free Agent</span>' : getTeamName(p.ownerRosterId)}</td>
                   <td class="right">${sleeperProjCell}</td>
                   <td class="right">${myProjCell}</td>
@@ -6076,7 +6258,7 @@
         </div>
       </div>
 
-      ${renderOpportunitySharesPanel(p)}
+      ${renderOpportunitySharesPanel(p, season, currentWeek)}
       ${renderMonteCarloPanel(p, season, currentWeek)}
 
       <div class="pd-analytics-grid">
