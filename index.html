@@ -788,22 +788,30 @@
     .radar-axis-raw { color: var(--text-primary); font-weight: 700; text-align: right; white-space: nowrap; }
     .radar-axis-pct { color: var(--text-muted); font-size: 11px; text-align: right; min-width: 66px; white-space: nowrap; }
 
-    /* Field heatmap */
+    /* Field heatmap -- portrait: depth is the data's long axis (LOS near
+       the bottom, depth running up), so the diagram's long axis matches it
+       instead of stretching a landscape field across mostly-empty yardage. */
     .field-container {
       position: relative; background: #0d4f1c; border-radius: 8px;
-      padding: 0; overflow: hidden; aspect-ratio: 1.4;
+      padding: 0; overflow: hidden; aspect-ratio: 170 / 300;
       border: 2px solid #0a3814;
     }
     .field-svg { width: 100%; height: 100%; display: block; }
     /* Small-multiples row (field position: red zone / midfield / backed
-       up) -- same .field-container shape repeated 2-3 times side by side,
-       each a bit narrower so the row fits without changing what each
-       diagram itself looks like. Wraps below ~480px so a small multiple
-       never gets so narrow its heat bands become unreadable. */
+       up) -- same .field-container shape repeated 2-3 times side by side.
+       flex-basis 0 with flex-grow divides the panel's full width evenly
+       between them (so they fill the panel instead of sitting small in the
+       middle of it); min-width sets the wrap point below which a portrait
+       field would get too narrow to read. */
     .field-multiples {
       display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px;
     }
-    .field-multiples .field-multiple { flex: 1 1 140px; min-width: 0; }
+    .field-multiples .field-multiple { flex: 1 1 0; min-width: 100px; }
+    /* The single passing diagram doesn't need the whole row's width --
+       unlike the 3-up field-position panels, letting it stretch to fill
+       would just make one portrait field absurdly tall. */
+    .field-multiples-single { justify-content: center; }
+    .field-multiples-single .field-multiple { flex: 0 1 240px; }
     .field-multiple-caption {
       font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
       color: var(--text-secondary); margin-bottom: 4px; text-align: center;
@@ -3835,14 +3843,36 @@
   // of how many sit in a row -- this is what keeps two players' charts
   // (and, within one player, the red zone/midfield/backed up panels)
   // pixel-for-pixel comparable, the same guarantee the old fixed grid made.
-  const FIELD_VB_W = 400, FIELD_VB_H = 230;
-  const FIELD_ENDZONE_W = 22;                          // px, each end zone
-  const FIELD_PLAY_W = FIELD_VB_W - FIELD_ENDZONE_W * 2; // the 100-yard field
-  const FIELD_PX_PER_YARD = FIELD_PLAY_W / 100;
-  const FIELD_TOP_MARGIN = 16; // room for the "LOS" label so it never overlaps the heat drawn just below it
-  const FIELD_PLAY_H = FIELD_VB_H - FIELD_TOP_MARGIN;
+  // Portrait, not landscape: depth (where a target/carry happens relative
+  // to the LOS) is the data's long axis, so it gets the long axis of the
+  // diagram. The old landscape field spanned the full 100-yard length of
+  // a real field, but every band this data actually covers (-6 to 34 yd
+  // off the LOS) lived inside one ~40-yard slice of it -- the rest was
+  // green nobody's usage ever touched. This window crops to that slice
+  // (with a little padding) instead of the whole field, and the LOS sits
+  // at a FIXED spot near the bottom of every panel -- it's not placed at
+  // yardline100's real position on a 100-yard field anymore, since that's
+  // exactly the placement that wasted the space. yardline100 still does
+  // one job: if the opponent's goal line falls inside this window (i.e.
+  // the red-zone panel), it's drawn, because "you can't target 20 yards
+  // downfield from your own 10" is a real constraint worth showing.
+  const FIELD_DEPTH_MIN_YD = -10, FIELD_DEPTH_MAX_YD = 36;
+  const FIELD_DEPTH_SPAN_YD = FIELD_DEPTH_MAX_YD - FIELD_DEPTH_MIN_YD;
+  const FIELD_VB_W = 170, FIELD_VB_H = 300;
+  const FIELD_LABEL_GUTTER = 24;                       // left strip for yard-marker numbers, "up the side"
+  const FIELD_PLAY_W = FIELD_VB_W - FIELD_LABEL_GUTTER; // sideline-to-sideline width of the green
+  const FIELD_TOP_MARGIN = 8, FIELD_BOTTOM_MARGIN = 8;
+  const FIELD_PLAY_H = FIELD_VB_H - FIELD_TOP_MARGIN - FIELD_BOTTOM_MARGIN;
+  const FIELD_PX_PER_YARD = FIELD_PLAY_H / FIELD_DEPTH_SPAN_YD;
 
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // Yards-relative-to-LOS -> SVG y. LOS sits near the bottom; positive
+  // (downfield) runs up, matching how depth actually reads.
+  function depthYdToY(yd) {
+    return (FIELD_VB_H - FIELD_BOTTOM_MARGIN) - (yd - FIELD_DEPTH_MIN_YD) * FIELD_PX_PER_YARD;
+  }
+  const LOS_Y = depthYdToY(0);
 
   // Representative yardline_100 (distance from the OPPONENT's end zone) for
   // each field-position small multiple -- a single fixed, recognizable
@@ -3901,34 +3931,40 @@
     return `${zone.label}: ${zone.count} play${zone.count === 1 ? '' : 's'} (${(zone.share * 100).toFixed(0)}% of this player's ${kind})${zone.sparse ? ' -- thin sample' : ''}`;
   }
 
-  // Draws the field ITSELF -- green playing surface, darker end zones,
-  // 10-yard grid lines (bolder at the 50 for orientation), sideline/goal
-  // line borders, and the line of scrimmage as a bold dashed marker at the
-  // real yardline_100 this diagram represents. Every heat overlay below is
-  // drawn relative to the returned losX, so "the player's position on the
-  // field" is always visually literal, not implied by a label alone.
+  // Draws the field ITSELF -- green playing surface, yard-marker ticks up
+  // the left side every 10 yards off the LOS, and the line of scrimmage as
+  // a bold dashed marker fixed near the bottom. The opponent's end zone is
+  // only drawn when yardline100 puts it inside this cropped window (i.e.
+  // the red-zone small multiple) -- for midfield/backfield panels the real
+  // goal line is 30+ yards outside anything this window shows, so nothing
+  // is lost by leaving it off.
   function fieldBackgroundSvg(yardline100) {
-    const top = FIELD_TOP_MARGIN;
-    let svg = `<rect x="0" y="${top}" width="${FIELD_VB_W}" height="${FIELD_PLAY_H}" fill="#0a3814"/>`;
-    svg += `<rect x="${FIELD_ENDZONE_W}" y="${top}" width="${FIELD_PLAY_W}" height="${FIELD_PLAY_H}" fill="#0d4f1c"/>`;
-    for (let yd = 0; yd <= 100; yd += 10) {
-      const x = FIELD_ENDZONE_W + yd * FIELD_PX_PER_YARD;
-      const isMid = yd === 50;
-      svg += `<line x1="${x}" y1="${top}" x2="${x}" y2="${FIELD_VB_H}" stroke="rgba(255,255,255,${isMid ? 0.5 : 0.2})" stroke-width="${isMid ? 1.5 : 1}"/>`;
-    }
-    svg += `<rect x="0.5" y="${top + 0.5}" width="${FIELD_VB_W - 1}" height="${FIELD_PLAY_H - 1}" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="1.5"/>`;
-    svg += `<line x1="${FIELD_ENDZONE_W}" y1="${top}" x2="${FIELD_ENDZONE_W}" y2="${FIELD_VB_H}" stroke="rgba(255,255,255,0.4)" stroke-width="1.5"/>`;
-    svg += `<line x1="${FIELD_VB_W - FIELD_ENDZONE_W}" y1="${top}" x2="${FIELD_VB_W - FIELD_ENDZONE_W}" y2="${FIELD_VB_H}" stroke="rgba(255,255,255,0.4)" stroke-width="1.5"/>`;
+    const left = FIELD_LABEL_GUTTER, top = FIELD_TOP_MARGIN;
+    let svg = `<rect x="${left}" y="${top}" width="${FIELD_PLAY_W}" height="${FIELD_PLAY_H}" fill="#0d4f1c"/>`;
 
-    const losX = FIELD_ENDZONE_W + (100 - yardline100) * FIELD_PX_PER_YARD;
-    svg += `<line x1="${losX}" y1="${top}" x2="${losX}" y2="${FIELD_VB_H}" stroke="#facc15" stroke-width="3" stroke-dasharray="6,3"/>`;
-    svg += `<circle cx="${losX}" cy="${FIELD_VB_H - 8}" r="3.5" fill="#facc15"/>`;
-    // Label lives in the top margin, ABOVE the playing field entirely, so
-    // it never sits on top of a heat zone regardless of how tall that
-    // zone's box grows (a dominant zone can grow to nearly full height).
-    const losLabelLeft = losX > FIELD_VB_W / 2;
-    svg += `<text x="${losX + (losLabelLeft ? -6 : 6)}" y="11" fill="#facc15" font-size="10" font-weight="800" text-anchor="${losLabelLeft ? 'end' : 'start'}">LOS</text>`;
-    return { svg, losX };
+    if (yardline100 <= FIELD_DEPTH_MAX_YD) {
+      const ezY = depthYdToY(yardline100);
+      svg += `<rect x="${left}" y="${top}" width="${FIELD_PLAY_W}" height="${Math.max(ezY - top, 0)}" fill="#0a3814"/>`;
+      svg += `<line x1="${left}" y1="${ezY}" x2="${left + FIELD_PLAY_W}" y2="${ezY}" stroke="rgba(255,255,255,0.5)" stroke-width="1.5"/>`;
+    }
+
+    for (let yd = Math.ceil(FIELD_DEPTH_MIN_YD / 10) * 10; yd <= FIELD_DEPTH_MAX_YD; yd += 10) {
+      if (yd === 0) continue; // the LOS line itself already marks zero
+      const y = depthYdToY(yd);
+      svg += `<line x1="${left}" y1="${y}" x2="${left + FIELD_PLAY_W}" y2="${y}" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>`;
+      svg += `<text x="${left - 4}" y="${y + 3}" fill="rgba(255,255,255,0.55)" font-size="8" font-weight="700" text-anchor="end">${Math.abs(yd)}</text>`;
+    }
+
+    svg += `<rect x="${left + 0.5}" y="${top + 0.5}" width="${FIELD_PLAY_W - 1}" height="${FIELD_PLAY_H - 1}" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="1.5"/>`;
+
+    svg += `<line x1="${left}" y1="${LOS_Y}" x2="${left + FIELD_PLAY_W}" y2="${LOS_Y}" stroke="#facc15" stroke-width="3" stroke-dasharray="6,3"/>`;
+    // "LOS" lives in the gutter, not on the field -- the passing grid's
+    // cells run edge to edge right up to the LOS line, so a label drawn
+    // over the playing surface itself (as the old landscape design did,
+    // safely, in a top margin no heat ever reached) could land on top of
+    // a zone's own percentage. The gutter is never occupied by heat.
+    svg += `<text x="${left - 4}" y="${LOS_Y + 3}" fill="#facc15" font-size="9" font-weight="800" text-anchor="end">LOS</text>`;
+    return svg;
   }
 
   // Every overlay below double-encodes frequency -- SIZE as well as shade
@@ -3944,35 +3980,48 @@
   // a real deep threat, without reading a single percentage).
   const HEAT_MIN_SIZE_FRAC = 0.14; // a real-but-small zone still shows as a visible sliver, never truly invisible
 
-  // Single-axis heat (depth only) spanning the field's full width, for one
-  // field-position small multiple -- receivers have no direction data, so
-  // each depth band's HEIGHT (centered vertically) is what shows how much
-  // of this player's usage sits there; a faint full-height track behind it
-  // marks where that depth range sits on the field even when unused.
-  // `maxShare` is passed in from the whole group (every field-position
-  // panel combined) so size/color both mean the same thing across all
-  // three panels, not just within one.
-  function depthHeatOverlaySvg(losX, zoneByDepth, maxShare, kind) {
-    const fullH = FIELD_PLAY_H - 6, midY = FIELD_TOP_MARGIN + FIELD_PLAY_H / 2;
+  // Single-axis heat (depth only), for one field-position small multiple --
+  // receivers have no direction data, so each depth band gets its own row
+  // (fixed by the band's real yard boundaries), and how much of this
+  // player's usage sits there is the bar's WIDTH, centered in that row. A
+  // faint full-width track behind it marks where that depth range sits
+  // even when unused. `maxShare` is passed in from the whole group (every
+  // field-position panel combined) so size/color both mean the same thing
+  // across all three panels, not just within one.
+  //
+  // Rows stack vertically now (one per depth band), so there's no more
+  // "adjacent zones fighting for the same horizontal strip" -- that's what
+  // caused labels to run together in the old landscape layout. A bar wide
+  // enough gets its % centered inside it; a thin one (small share) gets its
+  // label placed just outside it, still inside the same row, so it's never
+  // ambiguous which zone it belongs to and it's never dropped.
+  function depthHeatOverlaySvg(zoneByDepth, maxShare, kind) {
+    const trackX = FIELD_LABEL_GUTTER + 3, fullW = FIELD_PLAY_W - 6;
+    const midX = FIELD_LABEL_GUTTER + FIELD_PLAY_W / 2;
+    const bottomEdge = FIELD_VB_H - FIELD_BOTTOM_MARGIN;
     let svg = '';
     HEATMAP_DEPTH_BANDS.forEach(band => {
-      const x1 = clamp(losX + band.fromYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
-      const x2 = clamp(losX + band.toYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
-      const w = Math.max(x2 - x1, 1);
+      const yTop = clamp(depthYdToY(band.toYd), FIELD_TOP_MARGIN, bottomEdge);
+      const yBot = clamp(depthYdToY(band.fromYd), FIELD_TOP_MARGIN, bottomEdge);
+      const rowH = Math.max(yBot - yTop, 1);
+      const rowMidY = (yTop + yBot) / 2;
       const zone = zoneByDepth[band.key];
-      svg += `<rect x="${x1}" y="${FIELD_TOP_MARGIN + 3}" width="${w}" height="${fullH}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
+      svg += `<rect x="${trackX}" y="${yTop}" width="${fullW}" height="${rowH}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
       if (!zone) return;
       const t = zone.share / maxShare;
-      const h = fullH * (HEAT_MIN_SIZE_FRAC + (1 - HEAT_MIN_SIZE_FRAC) * t);
-      const y = midY - h / 2;
+      const w = fullW * (HEAT_MIN_SIZE_FRAC + (1 - HEAT_MIN_SIZE_FRAC) * t);
+      const x = midX - w / 2;
       const fill = heatCellColor(t);
       const dash = zone.sparse ? ' stroke-dasharray="4,3"' : '';
-      svg += `<rect x="${x1}" y="${y}" width="${w}" height="${h}" fill="${fill}" stroke="rgba(255,255,255,0.6)" stroke-width="1.5"${dash}><title>${heatZoneTooltip(zone, kind)}</title></rect>`;
-      if (w >= 18 && h >= 16) {
-        svg += `<text x="${(x1 + x2) / 2}" y="${midY + 6}" fill="white" font-size="18" font-weight="800" text-anchor="middle" pointer-events="none">${Math.round(zone.share * 100)}%</text>`;
+      svg += `<rect x="${x}" y="${yTop + 2}" width="${w}" height="${Math.max(rowH - 4, 1)}" fill="${fill}" stroke="rgba(255,255,255,0.6)" stroke-width="1.5"${dash}><title>${heatZoneTooltip(zone, kind)}</title></rect>`;
+      const label = `${Math.round(zone.share * 100)}%`;
+      if (w >= 30) {
+        svg += `<text x="${midX}" y="${rowMidY + 5}" fill="white" font-size="13" font-weight="800" text-anchor="middle" pointer-events="none">${label}</text>`;
+      } else {
+        svg += `<text x="${x + w + 5}" y="${rowMidY + 4}" fill="rgba(255,255,255,0.95)" font-size="11" font-weight="800" text-anchor="start" pointer-events="none">${label}</text>`;
       }
       if (zone.sparse) {
-        svg += `<text x="${(x1 + x2) / 2}" y="15" fill="rgba(255,255,255,0.9)" font-size="11" font-weight="800" text-anchor="middle" pointer-events="none">~</text>`;
+        svg += `<text x="${trackX + 4}" y="${yTop + 10}" fill="rgba(255,255,255,0.9)" font-size="9" font-weight="800" text-anchor="start" pointer-events="none">~</text>`;
       }
     });
     return svg;
@@ -3980,38 +4029,44 @@
 
   // Direction-only heat (left/middle/right lanes) for one field-position
   // small multiple -- rushing zones carry no depth data, so each lane is
-  // drawn as a bar extending from the LOS, LENGTH proportional to share
-  // (not a fixed chunk shaded by color) -- an unused lane shows almost no
-  // colored bar at all next to a heavily-used lane's long one, which is
-  // the literal "gaps visible" this was built for. Lane POSITION (top =
-  // left, middle, bottom = right) stays fixed regardless of share -- only
-  // the bar length varies, so "which lane is which" never has to be
-  // re-read.
-  const RUSH_BAR_MIN_YARDS = 2, RUSH_BAR_MAX_YARDS = 11;
-  function directionHeatOverlaySvg(losX, zoneByDir, maxShare, kind) {
-    const laneH = (FIELD_PLAY_H - 6) / HEATMAP_DIRECTION_LANES.length;
-    const trackX2 = clamp(losX + RUSH_BAR_MAX_YARDS * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
+  // drawn as a bar extending UPWARD from the LOS, LENGTH proportional to
+  // share (not a fixed chunk shaded by color) -- an unused lane shows
+  // almost no colored bar at all next to a heavily-used lane's long one,
+  // the literal "gaps visible" this was built for. Lane POSITION (left =
+  // left column, right = right column) stays fixed regardless of share --
+  // direction is lateral, so it still maps to left-to-right, just now as
+  // columns instead of stacked rows. Bar length is a display device (not a
+  // real yardage), so its max is tuned to use a good chunk of this
+  // portrait window's vertical room rather than the couple-yard cap that
+  // made sense on the old landscape field.
+  const RUSH_BAR_MIN_YARDS = 3, RUSH_BAR_MAX_YARDS = 24;
+  function directionHeatOverlaySvg(zoneByDir, maxShare, kind) {
+    const gutterInset = 3;
+    const laneW = (FIELD_PLAY_W - gutterInset * 2) / HEATMAP_DIRECTION_LANES.length;
+    const trackTop = clamp(depthYdToY(RUSH_BAR_MAX_YARDS), FIELD_TOP_MARGIN, LOS_Y);
     let svg = '';
     HEATMAP_DIRECTION_LANES.forEach((lane, i) => {
-      const y = FIELD_TOP_MARGIN + 3 + i * laneH, barY = y + 3, barH = laneH - 6;
+      const laneX = FIELD_LABEL_GUTTER + gutterInset + i * laneW;
+      const barX = laneX + 3, barW = laneW - 6;
       const zone = zoneByDir[lane.key];
-      svg += `<rect x="${losX}" y="${barY}" width="${trackX2 - losX}" height="${barH}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
+      svg += `<rect x="${barX}" y="${trackTop}" width="${barW}" height="${LOS_Y - trackTop}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
       if (!zone) return;
       const t = zone.share / maxShare;
       const barYd = RUSH_BAR_MIN_YARDS + (RUSH_BAR_MAX_YARDS - RUSH_BAR_MIN_YARDS) * t;
-      const x2 = clamp(losX + barYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
-      const w = Math.max(x2 - losX, 2);
+      const y1 = clamp(depthYdToY(barYd), FIELD_TOP_MARGIN, LOS_Y);
+      const h = Math.max(LOS_Y - y1, 2);
       const fill = heatCellColor(t);
       const dash = zone.sparse ? ' stroke-dasharray="4,3"' : '';
-      svg += `<rect x="${losX}" y="${barY}" width="${w}" height="${barH}" fill="${fill}" stroke="rgba(255,255,255,0.6)" stroke-width="1.5"${dash}><title>${heatZoneTooltip(zone, kind)}</title></rect>`;
+      svg += `<rect x="${barX}" y="${y1}" width="${barW}" height="${h}" fill="${fill}" stroke="rgba(255,255,255,0.6)" stroke-width="1.5"${dash}><title>${heatZoneTooltip(zone, kind)}</title></rect>`;
       const label = `${Math.round(zone.share * 100)}%`;
-      if (w >= 24) {
-        svg += `<text x="${losX + w / 2}" y="${barY + barH / 2 + 5}" fill="white" font-size="14" font-weight="800" text-anchor="middle" pointer-events="none">${label}</text>`;
+      const cx = barX + barW / 2;
+      if (h >= 20) {
+        svg += `<text x="${cx}" y="${y1 + h / 2 + 4}" fill="white" font-size="12" font-weight="800" text-anchor="middle" pointer-events="none">${label}</text>`;
       } else {
-        svg += `<text x="${x2 + 4}" y="${barY + barH / 2 + 4}" fill="rgba(255,255,255,0.9)" font-size="12" font-weight="800" text-anchor="start" pointer-events="none">${label}</text>`;
+        svg += `<text x="${cx}" y="${y1 - 4}" fill="rgba(255,255,255,0.9)" font-size="11" font-weight="800" text-anchor="middle" pointer-events="none">${label}</text>`;
       }
       if (zone.sparse) {
-        svg += `<text x="${losX + 4}" y="${barY + 10}" fill="rgba(255,255,255,0.9)" font-size="11" font-weight="800" text-anchor="start" pointer-events="none">~</text>`;
+        svg += `<text x="${cx}" y="${LOS_Y - 4}" fill="rgba(255,255,255,0.9)" font-size="10" font-weight="800" text-anchor="middle" pointer-events="none">~</text>`;
       }
     });
     return svg;
@@ -4020,37 +4075,51 @@
   // Full 2-D heat (location x depth) on ONE diagram -- passing is the one
   // kind whose two real axes (direction AND depth) are both spatial, so it
   // never needed the field-position small-multiple treatment at all: one
-  // field, one grid drawn directly on it. Position is fixed by the grid
+  // field, one grid drawn directly on it -- now columns (left/middle/right)
+  // by rows (depth bands, deepest at top). Position is fixed by the grid
   // (12 real cells, each a real location x depth combination), so size
-  // here means each cell SHRINKS toward its center as share drops --
-  // a heavily-thrown zone fills its whole cell, a rarely-thrown one draws
-  // as a small, faint square inside the same footprint.
-  function passingHeatOverlaySvg(losX, zones, maxShare) {
+  // here means each cell SHRINKS toward its center as share drops -- a
+  // heavily-thrown zone fills its whole cell, a rarely-thrown one draws as
+  // a small, faint square inside the same footprint.
+  //
+  // This is the one grid dense enough that a shrunk cell can genuinely run
+  // out of room for inline text in BOTH dimensions at once (unlike the
+  // depth/direction bars, which only ever shrink in one). When that
+  // happens the label doesn't get centered in the shrunk swatch -- it gets
+  // a fixed slot in the cell's own (unshrinking) corner instead, so a
+  // small zone still gets a legible number rather than being dropped.
+  function passingHeatOverlaySvg(zones, maxShare) {
     const zoneByKey = {};
     zones.forEach(z => { zoneByKey[z.id] = z; });
-    const laneH = (FIELD_PLAY_H - 6) / HEATMAP_DIRECTION_LANES.length;
+    const gutterInset = 3;
+    const laneW = (FIELD_PLAY_W - gutterInset * 2) / HEATMAP_DIRECTION_LANES.length;
+    const bottomEdge = FIELD_VB_H - FIELD_BOTTOM_MARGIN;
     let svg = '';
     HEATMAP_DIRECTION_LANES.forEach((lane, i) => {
-      const y = FIELD_TOP_MARGIN + 3 + i * laneH;
+      const cellX = FIELD_LABEL_GUTTER + gutterInset + i * laneW;
       HEATMAP_DEPTH_BANDS.forEach(band => {
-        const x1 = clamp(losX + band.fromYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
-        const x2 = clamp(losX + band.toYd * FIELD_PX_PER_YARD, 1, FIELD_VB_W - 1);
-        const cw = Math.max(x2 - x1, 1), ch = laneH - 2;
+        const yTop = clamp(depthYdToY(band.toYd), FIELD_TOP_MARGIN, bottomEdge);
+        const yBot = clamp(depthYdToY(band.fromYd), FIELD_TOP_MARGIN, bottomEdge);
+        const cw = laneW - 2, ch = Math.max(yBot - yTop - 2, 1);
+        const cx = cellX + 1, cy = yTop + 1;
         const zone = zoneByKey[`${lane.key}|${band.key}`];
-        svg += `<rect x="${x1}" y="${y}" width="${cw}" height="${ch}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
+        svg += `<rect x="${cx}" y="${cy}" width="${cw}" height="${ch}" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>`;
         if (!zone) return;
         const t = zone.share / maxShare;
         const sizeFrac = HEAT_MIN_SIZE_FRAC + (1 - HEAT_MIN_SIZE_FRAC) * t;
         const rw = cw * sizeFrac, rh = ch * sizeFrac;
-        const rx = x1 + (cw - rw) / 2, ry = y + (ch - rh) / 2;
+        const rx = cx + (cw - rw) / 2, ry = cy + (ch - rh) / 2;
         const fill = heatCellColor(t);
         const dash = zone.sparse ? ' stroke-dasharray="3,3"' : '';
         svg += `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${fill}" stroke="rgba(255,255,255,0.6)" stroke-width="1"${dash}><title>${heatZoneTooltip(zone, 'passing')}</title></rect>`;
-        if (rw >= 20 && rh >= 14) {
-          svg += `<text x="${rx + rw / 2}" y="${ry + rh / 2 + 4}" fill="white" font-size="10" font-weight="800" text-anchor="middle" pointer-events="none">${Math.round(zone.share * 100)}%</text>`;
+        const label = `${Math.round(zone.share * 100)}%`;
+        if (rw >= 22 && rh >= 14) {
+          svg += `<text x="${rx + rw / 2}" y="${ry + rh / 2 + 3.5}" fill="white" font-size="9.5" font-weight="800" text-anchor="middle" pointer-events="none">${label}</text>`;
+        } else {
+          svg += `<text x="${cx + cw - 2}" y="${cy + 8}" fill="rgba(255,255,255,0.95)" font-size="7.5" font-weight="800" text-anchor="end" pointer-events="none">${label}</text>`;
         }
         if (zone.sparse) {
-          svg += `<text x="${x1 + cw - 6}" y="${y + 11}" fill="rgba(255,255,255,0.9)" font-size="9" font-weight="800" text-anchor="end" pointer-events="none">~</text>`;
+          svg += `<text x="${cx + 2}" y="${cy + 8}" fill="rgba(255,255,255,0.9)" font-size="7.5" font-weight="800" text-anchor="start" pointer-events="none">~</text>`;
         }
       });
     });
@@ -4062,12 +4131,12 @@
   // the single full-width passing diagram so they're built from the same
   // markup shape.
   function fieldPanelHtml(yardline100, overlaySvg, caption) {
-    const { svg: bg, losX } = fieldBackgroundSvg(yardline100);
+    const bg = fieldBackgroundSvg(yardline100);
     return `
       <div class="field-multiple">
         ${caption ? `<div class="field-multiple-caption">${caption}</div>` : ''}
         <div class="field-container">
-          <svg class="field-svg" viewBox="0 0 ${FIELD_VB_W} ${FIELD_VB_H}" xmlns="http://www.w3.org/2000/svg">${bg}${overlaySvg(losX)}</svg>
+          <svg class="field-svg" viewBox="0 0 ${FIELD_VB_W} ${FIELD_VB_H}" xmlns="http://www.w3.org/2000/svg">${bg}${overlaySvg()}</svg>
         </div>
       </div>
     `;
@@ -4081,9 +4150,10 @@
     if (group.kind === 'passing') {
       // One diagram, not a row of small multiples -- passing's two real
       // axes (location, depth) are both spatial already, so there's no
-      // field-position dimension left to split into panels. Still wrapped
-      // in .field-multiples so the same CSS handles both shapes.
-      return `<div class="field-multiples">${fieldPanelHtml(50, losX => passingHeatOverlaySvg(losX, group.zones, maxShare), null)}</div>`;
+      // field-position dimension left to split into panels. field-multiples-
+      // single caps its width instead of letting one portrait field stretch
+      // to fill a whole row (which would make it absurdly tall).
+      return `<div class="field-multiples field-multiples-single">${fieldPanelHtml(50, () => passingHeatOverlaySvg(group.zones, maxShare), null)}</div>`;
     }
 
     const zonesByFieldPos = {};
@@ -4098,8 +4168,8 @@
           const zoneByAxis = zonesByFieldPos[panel.key] || {};
           const panelPlays = Object.values(zoneByAxis).reduce((sum, z) => sum + z.count, 0);
           const overlay = group.kind === 'rushing'
-            ? (losX => directionHeatOverlaySvg(losX, zoneByAxis, maxShare, group.kind))
-            : (losX => depthHeatOverlaySvg(losX, zoneByAxis, maxShare, group.kind));
+            ? (() => directionHeatOverlaySvg(zoneByAxis, maxShare, group.kind))
+            : (() => depthHeatOverlaySvg(zoneByAxis, maxShare, group.kind));
           const caption = `${panel.label}${panelPlays ? ` · ${panelPlays} play${panelPlays === 1 ? '' : 's'}` : ''}`;
           return fieldPanelHtml(panel.yardline100, overlay, caption);
         }).join('')}
