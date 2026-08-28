@@ -58,9 +58,9 @@ from src.export import (  # noqa: E402
     CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_defense_rankings,
     build_heatmap_snapshot, build_matchup_simulation, build_matchup_snapshot, build_playoff_odds,
     build_player_simulation_metrics, build_radar_snapshot, build_starter_quantile_rows,
-    build_target_week_features, build_team_game_id_lookup, build_trend_snapshot, build_usage_snapshot,
-    build_weekly_matchup, build_weekly_xfp, build_xfp_summary, get_export_candidates, get_export_scope,
-    predict_target_week_from_artifact, validate_export, validate_simulation,
+    build_target_week_features, build_team_game_id_lookup, build_team_tendencies, build_trend_snapshot,
+    build_usage_snapshot, build_weekly_matchup, build_weekly_xfp, build_xfp_summary, get_export_candidates,
+    get_export_scope, predict_target_week_from_artifact, validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
     DATA_OUTPUT, DEFAULT_LEAGUE_ID, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
@@ -380,6 +380,13 @@ def main() -> None:
     n_heatmap_eligible = sum(1 for h in heatmap.values() if h["eligible"])
     print(f"    heatmap: {n_heatmap_eligible}/{len(heatmap)} candidates eligible (>= games played floor)")
 
+    # Team Tendencies -- reuses the same pbp_current fetch above (resets
+    # every season, no cross-season lookback needed, same reasoning
+    # add_opponent_strength_features's own docstring already gives for a
+    # single-season call being sufficient).
+    team_tendencies = build_team_tendencies(combined_features, pbp_current, current_season, target_week)
+    print(f"    team tendencies: {len(team_tendencies)}/32 teams have enough prior games this season")
+
     # Per-player Monte Carlo: boom/bust + threshold probabilities, plus the
     # game_id + quantiles the dashboard needs for an ad-hoc start-over-
     # replacement comparison between any two exported players (see
@@ -400,6 +407,7 @@ def main() -> None:
         matchup=matchup,
         defense_rankings=defense_rankings,
         weekly_matchup=weekly_matchup,
+        team_tendencies=team_tendencies,
     )
     print(f"    crosswalk match rate: {crosswalk_report}")
 

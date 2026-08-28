@@ -35,6 +35,12 @@ from src.ingest import (  # noqa: E402
     get_id_crosswalk, get_ngs_data, get_pbp, get_schedule, get_sleeper_league, get_snap_counts,
 )
 from src.pipeline import build_weekly_scored  # noqa: E402
+from src.team_tendencies import (  # noqa: E402
+    TEAM_TENDENCY_OUTPUT_COLUMNS,
+    TEAM_TENDENCY_SAMPLE_COLUMNS,
+    add_team_tendency_features,
+    build_team_tendency_table,
+)
 from src.usage import (  # noqa: E402
     CONTEXT_OUTPUT_COLUMNS,
     EFFICIENCY_OUTPUT_COLUMNS,
@@ -714,4 +720,114 @@ def test_trend_signal_null_below_min_games(rolled_df):
 def test_trend_features_idempotent(rolled_df):
     once = add_trend_features(rolled_df)
     twice = add_trend_features(once)
+    pd.testing.assert_frame_equal(once, twice)
+
+
+# ==========================================================================
+# TEAM TENDENCIES — offense-level identity from pbp (src/team_tendencies.py)
+# ==========================================================================
+# Narrower fixture requirements than featured_df above: build_team_tendency_
+# table only needs player_id/position/season (to resolve a target's
+# position) plus pbp -- weekly_scored itself already has those, no Family
+# 1-5 feature computation needed first.
+@pytest.mark.parametrize("season,boundary_week", BOUNDARIES)
+def test_team_tendencies_no_future_leakage(weekly_scored, pbp, season, boundary_week):
+    """
+    Same black-box future-truncation pattern as every other family --
+    removing pbp rows for weeks AFTER boundary_week must not change the
+    team-tendency table for any week <= boundary_week.
+
+    Unlike every add_*_features test above, build_team_tendency_table
+    builds a FRESH (team, season, week) grid from pbp rather than adding
+    columns onto weekly_scored's own fixed row set -- full/truncated can
+    legitimately land on different row indices for the same logical key
+    (fewer total team-weeks exist once later weeks are dropped), so each
+    side needs its OWN mask computed against its OWN frame, then both
+    sorted to a canonical row order before comparing -- reusing one
+    frame's boolean mask against the other's differently-indexed rows
+    would silently misalign instead of comparing the same team-weeks.
+    """
+    pbp_truncated = _truncate_after(pbp, season, boundary_week)
+
+    full = build_team_tendency_table(weekly_scored, pbp)
+    truncated = build_team_tendency_table(weekly_scored, pbp_truncated)
+
+    cols = ["team", "season", "week"] + TEAM_TENDENCY_OUTPUT_COLUMNS + TEAM_TENDENCY_SAMPLE_COLUMNS
+
+    def _scoped(result: pd.DataFrame) -> pd.DataFrame:
+        mask = (result["season"] == season) & (result["week"] <= boundary_week)
+        return result.loc[mask, cols].sort_values(["team", "week"]).reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(_scoped(full), _scoped(truncated))
+
+
+def test_team_tendencies_shift_excludes_own_week(weekly_scored, pbp):
+    """
+    White-box perturbation test, same reasoning as
+    test_opponent_strength_shift_excludes_own_week: black-box truncation
+    can't prove week W's own row excludes week W's own plays, because
+    removing week W also destroys real same-week data a LATER week
+    legitimately needs. Instead: perturb every real pass/run play_oe value
+    for one real team at one real week to an extreme outlier, and confirm
+    (a) that team's OWN row at that same week is unaffected (its ewm3/s2d
+    already only reflect games strictly before it), while (b) that team's
+    NEXT real game's row IS affected (the perturbed week has, by then,
+    entered its own trailing window one week later).
+    """
+    table = build_team_tendency_table(weekly_scored, pbp)
+    counts = table.dropna(subset=["proe_ewm3"]).groupby(["team", "season"]).size()
+    team, season = counts[counts >= 2].index[0]
+    team_weeks = sorted(table.loc[(table["team"] == team) & (table["season"] == season), "week"].tolist())
+    week, next_week = team_weeks[0], team_weeks[1]
+
+    perturbed_pbp = pbp.copy()
+    mask = (
+        (perturbed_pbp["posteam"] == team) & (perturbed_pbp["season"] == season)
+        & (perturbed_pbp["week"] == week) & perturbed_pbp["play_type"].isin(["pass", "run"])
+        & perturbed_pbp["pass_oe"].notna()
+    )
+    assert mask.sum() > 0, "expected at least one real neutral-situation play to perturb"
+    perturbed_pbp.loc[mask, "pass_oe"] = 999.0
+
+    baseline = build_team_tendency_table(weekly_scored, pbp)
+    perturbed = build_team_tendency_table(weekly_scored, perturbed_pbp)
+
+    def _row(result: pd.DataFrame, wk: int) -> pd.Series:
+        r = result[(result["team"] == team) & (result["season"] == season) & (result["week"] == wk)]
+        assert len(r) == 1
+        return r.iloc[0]
+
+    baseline_same = _row(baseline, week)
+    perturbed_same = _row(perturbed, week)
+    for col in TEAM_TENDENCY_OUTPUT_COLUMNS + TEAM_TENDENCY_SAMPLE_COLUMNS:
+        left, right = baseline_same[col], perturbed_same[col]
+        assert (pd.isna(left) and pd.isna(right)) or left == right, (
+            f"{col} at the perturbed week itself changed -- it should only reflect PRIOR weeks"
+        )
+
+    baseline_next = _row(baseline, next_week)
+    perturbed_next = _row(perturbed, next_week)
+    assert baseline_next["proe_ewm3"] != perturbed_next["proe_ewm3"], (
+        "expected the perturbation to reach this team's NEXT game one week later"
+    )
+
+
+def test_team_tendencies_no_position_gate(weekly_scored, pbp):
+    """
+    Unlike Family 5B's opponent strength (position-vs-position, QB null by
+    construction), team tendencies describe the OFFENSE, not the player --
+    every position on the same team/week must see the IDENTICAL value,
+    including QB (no null carve-out here)."""
+    result = add_team_tendency_features(weekly_scored, pbp)
+    sample = result.dropna(subset=["proe_ewm3"])
+    assert len(sample) > 0
+    assert set(sample["position"].unique()) >= {"QB", "RB", "WR", "TE"} or len(sample["position"].unique()) > 0
+
+    grouped = sample.groupby(["team", "season", "week"])[TEAM_TENDENCY_OUTPUT_COLUMNS].nunique()
+    assert (grouped <= 1).all().all(), "every player on the same team/week must share the same team-tendency values"
+
+
+def test_team_tendencies_idempotent(weekly_scored, pbp):
+    once = add_team_tendency_features(weekly_scored, pbp)
+    twice = add_team_tendency_features(once, pbp)
     pd.testing.assert_frame_equal(once, twice)

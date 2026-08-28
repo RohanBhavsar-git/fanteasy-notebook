@@ -121,6 +121,8 @@ CAVEATS = [
     "The red_zone_share trend signal is real but noisier than snap/target/carry "
     "share -- red-zone opportunities are low-volume, and a 'rising' read reverts "
     "more often than it holds even at the validated window and threshold.",
+    "Team Tendencies describes a team's offense (pass rate over expected, pace, "
+    "red-zone play-calling, target distribution), not any one player's usage.",
 ]
 
 # Surfaced both in meta.caveats (above, terse) and as its own meta field
@@ -797,6 +799,195 @@ def build_season_defense_rankings(historical_features: pd.DataFrame, schedule: p
     return out
 
 
+# ==========================================================================
+# TEAM TENDENCIES -- real offense-level identity from pbp (src/team_tendencies.py)
+# ==========================================================================
+# The honest version of an earlier "coaching scheme" idea -- see
+# src/team_tendencies.py's own module docstring for why this measures the
+# TEAM, not a coordinator. Surfaced both in meta.caveats (terse) and as its
+# own meta field (full), matching MONTE_CARLO_CALIBRATION_CAVEAT's existing
+# "surface it where the numbers appear" pattern.
+TEAM_TENDENCY_CAVEAT = (
+    "These describe the offense a team runs -- pass rate over expected, pace, "
+    "red-zone play-calling, target distribution by position -- not any one "
+    "player's usage within it. A player who joins this team inherits the "
+    "environment, not the incumbent's role."
+)
+
+
+def _team_tendency_metric_block(
+    row, ewm3_col: str, s2d_col: str, sample_col: str | None, decimals: int = 4, sample_unit: str = "plays"
+) -> dict:
+    """
+    One metric's {ewm3, s2d, sample_<unit>, sparse} block, from a
+    build_team_tendency_table (or season-long equivalent) row. `sample_col`
+    is None for target-distribution shares, which share ONE sample count
+    across all three positions -- that shared count is attached once at
+    the target_distribution level instead (see build_team_tendencies),
+    not duplicated into every position's own block.
+
+    `sample_unit` controls both the JSON key (sample_plays vs. sample_games)
+    and which sparsity floor applies -- plays_per_game's own sample is a
+    GAMES count (how many weekly totals went into the average), a much
+    lower-variance quantity than a real PLAY count, so it's held to
+    TEAM_TENDENCY_SPARSE_GAMES instead of TEAM_TENDENCY_SPARSE_PLAYS.
+    """
+    from src.team_tendencies import TEAM_TENDENCY_SPARSE_GAMES, TEAM_TENDENCY_SPARSE_PLAYS
+
+    threshold = TEAM_TENDENCY_SPARSE_GAMES if sample_unit == "games" else TEAM_TENDENCY_SPARSE_PLAYS
+
+    block = {
+        "ewm3": None if pd.isna(row[ewm3_col]) else round(float(row[ewm3_col]), decimals),
+        "s2d": None if pd.isna(row[s2d_col]) else round(float(row[s2d_col]), decimals),
+    }
+    if sample_col is not None:
+        sample = None if pd.isna(row[sample_col]) else int(row[sample_col])
+        block[f"sample_{sample_unit}"] = sample
+        block["sparse"] = sample is not None and sample < threshold
+    return block
+
+
+def _team_tendency_row_to_dict(row) -> dict:
+    """Shared shape builder for both the live (point-in-time) and season-
+    archive team tendency dicts -- both build_team_tendency_table's real
+    output and build_season_team_tendencies' own season-long frame use
+    these exact column names (see that function's docstring for why)."""
+    from src.team_tendencies import TEAM_TENDENCY_METRIC_SAMPLE, TEAM_TENDENCY_SPARSE_PLAYS
+
+    target_sample = row.get("team_targets_s2d_n")
+    target_sample = None if pd.isna(target_sample) else int(target_sample)
+
+    return {
+        "proe": _team_tendency_metric_block(row, "proe_ewm3", "proe_s2d", TEAM_TENDENCY_METRIC_SAMPLE["proe"]),
+        "pace_seconds_per_play": _team_tendency_metric_block(
+            row, "seconds_per_play_ewm3", "seconds_per_play_s2d", TEAM_TENDENCY_METRIC_SAMPLE["seconds_per_play"], decimals=2
+        ),
+        "plays_per_game": _team_tendency_metric_block(
+            row, "plays_per_game_ewm3", "plays_per_game_s2d", TEAM_TENDENCY_METRIC_SAMPLE["plays_per_game"],
+            decimals=1, sample_unit="games",
+        ),
+        "red_zone": {
+            "inside_20_pass_rate": _team_tendency_metric_block(
+                row, "rz20_pass_rate_ewm3", "rz20_pass_rate_s2d", TEAM_TENDENCY_METRIC_SAMPLE["rz20_pass_rate"]
+            ),
+            "inside_10_pass_rate": _team_tendency_metric_block(
+                row, "rz10_pass_rate_ewm3", "rz10_pass_rate_s2d", TEAM_TENDENCY_METRIC_SAMPLE["rz10_pass_rate"]
+            ),
+        },
+        "target_distribution": {
+            "rb": _team_tendency_metric_block(row, "target_share_rb_ewm3", "target_share_rb_s2d", None),
+            "wr": _team_tendency_metric_block(row, "target_share_wr_ewm3", "target_share_wr_s2d", None),
+            "te": _team_tendency_metric_block(row, "target_share_te_ewm3", "target_share_te_s2d", None),
+            "sample_targets": target_sample,
+            "sparse": target_sample is not None and target_sample < TEAM_TENDENCY_SPARSE_PLAYS,
+        },
+    }
+
+
+def build_team_tendencies(
+    combined_features: pd.DataFrame, pbp: pd.DataFrame, target_season: int, target_week: int
+) -> dict:
+    """
+    Every team's CURRENT (as of target_week -- real games strictly before
+    target_week only) offense-level identity: PROE, pace, red-zone
+    play-calling split, target distribution by position. Powers the
+    dashboard's Team Tendencies tab. Not a ranked list (unlike
+    build_defense_rankings) -- there's no single good/bad direction for
+    pace or PROE the way there is for "xFP allowed," so this returns a
+    plain {team: {...}} dict, the same per-entity-dict shape radar/heatmap
+    already use.
+
+    A team missing from the returned dict simply has no prior in-season
+    game yet (week 1 of a season, or an early-season target week) -- not
+    enough real plays to show anything honest, the same absence-means-no-
+    data convention as build_defense_rankings.
+
+    `pbp` can legitimately arrive completely empty (zero columns, not just
+    zero rows) -- weekly_update.py passes that when the current season
+    hasn't started yet (see build_heatmap_snapshot's own comment for why).
+    Guarded here, before touching any pbp column, same reasoning: a season
+    with zero real pbp can only mean every team has zero prior games this
+    season, so every team would be absent below regardless.
+    """
+    if pbp.empty:
+        return {}
+
+    from src.team_tendencies import build_team_tendency_table
+
+    table = build_team_tendency_table(combined_features, pbp)
+    week_rows = table[(table["season"] == target_season) & (table["week"] == target_week)]
+    week_rows = week_rows[week_rows["proe_ewm3"].notna()]
+
+    return {row["team"]: _team_tendency_row_to_dict(row) for _, row in week_rows.iterrows()}
+
+
+def build_season_team_tendencies(historical_features: pd.DataFrame, pbp: pd.DataFrame, season: int) -> dict:
+    """
+    Season-ARCHIVE counterpart to build_team_tendencies -- a full completed
+    season's real team identity, unshifted (same "nothing left to leak,
+    this is a retrospective for a human reader" reasoning
+    build_season_defense_rankings already documents). ewm3 and s2d are
+    identical here (both just the real season-long weighted average) --
+    kept as two separate keys anyway so index.html's rendering needs no
+    archive-specific branch, the exact convention build_season_defense_
+    rankings already established.
+
+    Weighted by each week's own real sample size (a 70-play week counts
+    more than a 40-play week), not a plain mean of weekly rates.
+    """
+    from src.team_tendencies import _team_week_pace, _team_week_play_rates, _team_week_target_distribution
+
+    weekly_scored = historical_features[historical_features["season"] == season]
+    pbp_season = pbp[pbp["season"] == season]
+
+    rates = _team_week_play_rates(pbp_season)
+    pace = _team_week_pace(pbp_season)
+    position_lookup = weekly_scored[["player_id", "position", "season"]].drop_duplicates(subset=["player_id", "season"])
+    targets = _team_week_target_distribution(pbp_season, position_lookup)
+
+    def _weighted(df: pd.DataFrame, value_col: str, weight_col: str) -> pd.Series:
+        w = df[weight_col].fillna(0)
+        return (df[value_col] * w).groupby(df["team"]).sum() / w.groupby(df["team"]).sum().replace(0, float("nan"))
+
+    out: dict = {}
+    teams = sorted(set(rates["team"]) | set(pace["team"]) | set(targets["team"]))
+    proe = _weighted(rates, "proe_raw", "neutral_plays")
+    plays_per_game = rates.groupby("team")["total_plays"].mean()
+    seconds_per_play = _weighted(pace, "seconds_per_play_raw", "pace_gaps")
+    rz20 = _weighted(rates, "rz20_pass_rate_raw", "rz20_plays")
+    rz10 = _weighted(rates, "rz10_pass_rate_raw", "rz10_plays")
+    target_rb = _weighted(targets, "target_share_rb_raw", "team_targets")
+    target_wr = _weighted(targets, "target_share_wr_raw", "team_targets")
+    target_te = _weighted(targets, "target_share_te_raw", "team_targets")
+    games_n = rates.groupby("team").size()
+    neutral_n = rates.groupby("team")["neutral_plays"].sum()
+    pace_n = pace.groupby("team")["pace_gaps"].sum()
+    rz20_n = rates.groupby("team")["rz20_plays"].sum()
+    rz10_n = rates.groupby("team")["rz10_plays"].sum()
+    target_n = targets.groupby("team")["team_targets"].sum()
+
+    for team in teams:
+        row = pd.Series({
+            "proe_ewm3": proe.get(team), "proe_s2d": proe.get(team),
+            "plays_per_game_ewm3": plays_per_game.get(team), "plays_per_game_s2d": plays_per_game.get(team),
+            "seconds_per_play_ewm3": seconds_per_play.get(team), "seconds_per_play_s2d": seconds_per_play.get(team),
+            "rz20_pass_rate_ewm3": rz20.get(team), "rz20_pass_rate_s2d": rz20.get(team),
+            "rz10_pass_rate_ewm3": rz10.get(team), "rz10_pass_rate_s2d": rz10.get(team),
+            "target_share_rb_ewm3": target_rb.get(team), "target_share_rb_s2d": target_rb.get(team),
+            "target_share_wr_ewm3": target_wr.get(team), "target_share_wr_s2d": target_wr.get(team),
+            "target_share_te_ewm3": target_te.get(team), "target_share_te_s2d": target_te.get(team),
+            "games_s2d_n": games_n.get(team),
+            "neutral_plays_s2d_n": neutral_n.get(team), "pace_gaps_s2d_n": pace_n.get(team),
+            "rz20_plays_s2d_n": rz20_n.get(team), "rz10_plays_s2d_n": rz10_n.get(team),
+            "team_targets_s2d_n": target_n.get(team),
+        })
+        if pd.isna(row["proe_ewm3"]):
+            continue
+        out[team] = _team_tendency_row_to_dict(row)
+
+    return out
+
+
 def build_radar_snapshot(
     combined_features: pd.DataFrame,
     target_season: int,
@@ -1206,6 +1397,7 @@ def assemble_player_advanced_stats(
     matchup: pd.DataFrame | None = None,
     defense_rankings: dict | None = None,
     weekly_matchup: pd.DataFrame | None = None,
+    team_tendencies: dict | None = None,
 ) -> tuple[dict, dict]:
     """
     Joins everything onto scoped_predictions and crosswalks gsis_id ->
@@ -1267,6 +1459,13 @@ def assemble_player_advanced_stats(
     already keeps the top-level `simulation` block null for archives (see
     that module's own comment). When provided, each covered player gets a
     `monte_carlo` block; everyone else gets null, not a guessed number.
+
+    `team_tendencies` (build_team_tendencies's or build_season_team_
+    tendencies's output) is Team Tendencies' league-wide wiring -- optional
+    for the same "hypothetical week" reason as player_sim_metrics, written
+    ONLY as its own top-level key (sibling to `players`), NOT joined onto
+    any individual player -- see src/team_tendencies.py's own docstring for
+    why these deliberately describe the offense, not any one player's row.
 
     `matchup` (build_matchup_snapshot's output) and `defense_rankings`
     (build_defense_rankings's or build_season_defense_rankings's output)
@@ -1446,9 +1645,11 @@ def assemble_player_advanced_stats(
             "caveats": caveats,
             "monte_carlo_caveat": MONTE_CARLO_CALIBRATION_CAVEAT,
             "monte_carlo_n_sims": SIMULATION_N_SIMS_MATCHUP,
+            "team_tendency_caveat": TEAM_TENDENCY_CAVEAT,
         },
         "players": players,
         "defense_rankings": defense_rankings,
+        "team_tendencies": team_tendencies,
     }
     crosswalk_report = {
         "n_scoped": n_scoped, "n_matched": n_matched,
@@ -1561,6 +1762,22 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
 
     n_with_matchup = sum(1 for p in players.values() if p.get("matchup") is not None)
     n_with_weekly_matchup = sum(1 for p in players.values() if p.get("weekly_matchup"))
+
+    team_tendencies = payload.get("team_tendencies") or {}
+    bad_team_tendency_shares = [
+        team for team, block in team_tendencies.items()
+        if any(
+            v["ewm3"] is not None and not (0 <= v["ewm3"] <= 1)
+            for v in [
+                block["red_zone"]["inside_20_pass_rate"], block["red_zone"]["inside_10_pass_rate"],
+                block["target_distribution"]["rb"], block["target_distribution"]["wr"], block["target_distribution"]["te"],
+            ]
+        )
+    ]
+    assert not bad_team_tendency_shares, (
+        f"team_tendencies has a share outside [0, 1] for: {bad_team_tendency_shares[:5]}"
+    )
+
     return {
         "n_players": len(players),
         "all_keys_real_sleeper_ids": True,
@@ -1575,6 +1792,8 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         "n_with_weekly_matchup": n_with_weekly_matchup,
         "weekly_matchup_ranks_valid": True,
         "defense_rankings_positions": list(defense_rankings.keys()),
+        "n_team_tendencies": len(team_tendencies),
+        "team_tendency_shares_in_range": True,
     }
 
 

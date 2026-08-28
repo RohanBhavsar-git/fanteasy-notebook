@@ -50,9 +50,10 @@ import pandas as pd  # noqa: E402
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
     CAVEATS, assemble_player_advanced_stats, build_heatmap_snapshot, build_radar_snapshot,
-    build_season_defense_rankings, build_target_week_features, build_trend_snapshot, build_usage_snapshot,
-    build_weekly_matchup, build_weekly_xfp, build_xfp_summary, get_archive_candidates, get_export_scope,
-    get_season_team_map, predict_target_week_from_artifact, validate_export,
+    build_season_defense_rankings, build_season_team_tendencies, build_target_week_features,
+    build_trend_snapshot, build_usage_snapshot, build_weekly_matchup, build_weekly_xfp, build_xfp_summary,
+    get_archive_candidates, get_export_scope, get_season_team_map, predict_target_week_from_artifact,
+    validate_export,
 )
 from src.ingest import (  # noqa: E402
     DATA_OUTPUT, SEASON_LEAGUE_IDS, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
@@ -176,6 +177,12 @@ def main() -> None:
     defense_rankings = build_season_defense_rankings(weekly_features, schedule_season, season)
     print(f"    defense rankings: { {pos: len(teams) for pos, teams in defense_rankings.items()} } teams ranked (of 32) per position")
 
+    # Same "full real season, unshifted, nothing left to leak" reasoning as
+    # build_season_defense_rankings just above -- reuses pbp_season fetched
+    # for the heatmap above.
+    team_tendencies = build_season_team_tendencies(weekly_features, pbp_season, season)
+    print(f"    team tendencies: {len(team_tendencies)}/32 teams")
+
     print("[6/6] Scoping, assembling, validating, writing...")
     rostered_sleeper_ids = {pid for r in rosters_raw for pid in (r.get("players") or [])}
     cw_lookup = crosswalk.dropna(subset=["sleeper_id", "gsis_id"]).drop_duplicates(subset=["sleeper_id"])
@@ -193,6 +200,7 @@ def main() -> None:
         season_team=season_team,
         defense_rankings=defense_rankings,
         weekly_matchup=weekly_matchup,
+        team_tendencies=team_tendencies,
     )
     payload["simulation"] = None  # a hypothetical post-season week has no real matchups to simulate
     print(f"    crosswalk match rate: {crosswalk_report}")

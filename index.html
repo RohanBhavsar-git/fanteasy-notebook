@@ -883,6 +883,72 @@
     }
     .heat-stat:hover .stat-tooltip { opacity: 1; }
 
+    /* === TEAM TENDENCIES === */
+    .tendencies-scatter-wrap { position: relative; height: 420px; }
+    .tendencies-quadrant-legend {
+      display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px;
+      font-size: 11px; color: var(--text-secondary); justify-content: center;
+    }
+    .tendencies-quadrant-legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .tendencies-quadrant-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+
+    .tendencies-table tr { cursor: pointer; }
+    .tendencies-table td.right { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .tendencies-team-cell { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+    .tendencies-team-cell img { width: 22px; height: 22px; object-fit: contain; }
+
+    /* Target-distribution stacked bar -- RB/WR/TE share as one horizontal
+       track, same "small, legible, comparable across rows" instinct as the
+       Field Heatmap's small multiples. */
+    .target-dist-bar {
+      display: flex; width: 100px; height: 14px; border-radius: 4px; overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .target-dist-seg { height: 100%; }
+    .target-dist-seg.rb { background: #f59e0b; }
+    .target-dist-seg.wr { background: #0891b2; }
+    .target-dist-seg.te { background: #8b5cf6; }
+    .target-dist-legend { display: flex; gap: 10px; font-size: 10px; color: var(--text-secondary); margin-top: 4px; }
+    .target-dist-legend span { display: inline-flex; align-items: center; gap: 4px; }
+    .target-dist-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+
+    .tendency-sparse-mark { color: var(--text-muted); font-weight: 700; margin-left: 3px; cursor: help; }
+
+    /* Team detail view */
+    .tendency-detail-header {
+      display: flex; align-items: center; gap: 14px; margin-bottom: 16px;
+    }
+    .tendency-detail-header img { width: 48px; height: 48px; object-fit: contain; }
+    .tendency-metric-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px; margin-bottom: 16px;
+    }
+    .tendency-metric-card {
+      background: var(--bg-tertiary); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px 16px;
+    }
+    .tendency-metric-label {
+      font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+      color: var(--text-secondary); margin-bottom: 8px; display: flex; align-items: center; gap: 5px;
+    }
+    .tendency-metric-values { display: flex; align-items: baseline; gap: 14px; }
+    .tendency-metric-values .tmv-main { font-size: 22px; font-weight: 800; color: var(--text-primary); }
+    .tendency-metric-values .tmv-sub { font-size: 12px; color: var(--text-muted); }
+    .tendency-range-track {
+      position: relative; height: 6px; border-radius: 3px; background: var(--border);
+      margin-top: 10px;
+    }
+    .tendency-range-fill { position: absolute; top: 0; bottom: 0; border-radius: 3px; background: var(--accent); }
+    .tendency-range-marker {
+      position: absolute; top: -3px; width: 2px; height: 12px; background: var(--text-primary);
+    }
+    .tendency-range-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-muted); margin-top: 4px; }
+
+    .tendency-donuts-row { display: flex; gap: 20px; flex-wrap: wrap; }
+    .tendency-donut-wrap { flex: 1 1 160px; min-width: 140px; text-align: center; }
+    .tendency-donut-canvas-wrap { position: relative; height: 140px; }
+    .tendency-donut-caption { font-size: 11px; font-weight: 700; color: var(--text-secondary); margin-top: 6px; text-transform: uppercase; letter-spacing: 0.4px; }
+
     /* === COMPARE BUTTON === */
     .compare-btn {
       display: inline-flex; align-items: center; gap: 6px;
@@ -1819,6 +1885,7 @@
         <div class="nav-link" data-view="players">Players</div>
         <div class="nav-link" data-view="comparison">Player Comparison</div>
         <div class="nav-link" data-view="draft">Draft</div>
+        <div class="nav-link" data-view="tendencies">Team Tendencies</div>
         <div class="nav-link" data-view="injuries">Injuries</div>
       </div>
       <div class="league-info" id="league-info">
@@ -2569,6 +2636,8 @@
     playerFilters: { search: '', position: 'ALL', team: 'ALL', owner: 'ALL', injury: 'ALL', sortBy: 'sleeperProj', sortDir: 'desc' },
     playerWeek: null,        // null = current week; otherwise the projection week the Players list shows
     matchupPanelPosition: 'WR', // which position tab the Dashboard's Matchup Ratings panel shows
+    tendenciesSelectedTeam: null, // null = league-wide Team Tendencies view; a team code = that team's detail view
+    tendenciesSortMetric: 'proe', // which column the Team Tendencies league table is sorted by
   };
 
   let chartInstances = {};
@@ -5235,6 +5304,7 @@
     if (state.currentView === 'players') return renderPlayersView(main);
     if (state.currentView === 'comparison') return renderComparisonView(main);
     if (state.currentView === 'draft') return renderDraftView(main);
+    if (state.currentView === 'tendencies') return renderTendenciesView(main);
     if (state.currentView === 'injuries') return renderInjuryView(main);
   }
 
@@ -8170,6 +8240,412 @@
     }
   }
 
+  // ----- TEAM TENDENCIES VIEW -----
+  // The honest version of an earlier "coaching scheme" idea -- nflverse has
+  // no coordinator table (it would need permanent hand-maintenance, and a
+  // per-coordinator sample is tiny), so this measures what a TEAM actually
+  // does, from real play-by-play (src/team_tendencies.py), not who calls
+  // the plays. Every number here describes the OFFENSE, not a player --
+  // teamTendencyCaveatText() says so plainly, inline, not just in a tooltip.
+  function getAllTeamTendencies() {
+    return state.advancedStats?.team_tendencies || {};
+  }
+  function getTeamTendency(team) {
+    return getAllTeamTendencies()[team] || null;
+  }
+  function teamTendencyCaveatText() {
+    return state.advancedStats?.meta?.team_tendency_caveat
+      || "These describe the offense a team runs, not any one player's usage within it -- a player who joins this team inherits the environment, not the incumbent's role.";
+  }
+  function tendencyLeagueValues(pick) {
+    return Object.values(getAllTeamTendencies()).map(pick).filter(v => v != null);
+  }
+  function tendencySparseBadge(block) {
+    return block && block.sparse
+      ? `<span class="tendency-sparse-mark" title="Thin real sample this season -- shown, not hidden, but too few plays to read with confidence yet.">~</span>`
+      : '';
+  }
+  function teamLogoUrl(team) {
+    return `https://a.espncdn.com/i/teamlogos/nfl/500/${(team || '').toLowerCase()}.png`;
+  }
+
+  const TENDENCY_SORT_ACCESSORS = {
+    proe: t => t.proe.s2d,
+    pace: t => t.pace_seconds_per_play.s2d,
+    plays: t => t.plays_per_game.s2d,
+    rz20: t => t.red_zone.inside_20_pass_rate.s2d,
+    rz10: t => t.red_zone.inside_10_pass_rate.s2d,
+  };
+
+  function sortedTendencyEntries(all) {
+    const accessor = TENDENCY_SORT_ACCESSORS[state.tendenciesSortMetric] || TENDENCY_SORT_ACCESSORS.proe;
+    return Object.entries(all)
+      .filter(([, t]) => accessor(t) != null)
+      .sort((a, b) => accessor(b[1]) - accessor(a[1]));
+  }
+
+  // Quadrant split: PROE against 0 (the league's own natural center by
+  // construction -- nflfastR's xpass model is fit so the league-wide mean
+  // of pass_oe sits near zero), pace against the league's OWN median this
+  // season (there's no natural "zero" for seconds/play the way there is
+  // for a rate-over-expected).
+  function tendencyQuadrant(proe, secPerPlay, paceMedian) {
+    const fast = secPerPlay < paceMedian;
+    const passHeavy = proe > 0;
+    if (fast && passHeavy) return { color: '#0891b2', label: 'Fast & pass-heavy' };
+    if (fast && !passHeavy) return { color: '#f59e0b', label: 'Fast & run-heavy' };
+    if (!fast && passHeavy) return { color: '#8b5cf6', label: 'Slow & pass-heavy' };
+    return { color: '#ef4444', label: 'Slow & run-heavy' };
+  }
+
+  function renderTendenciesScatterChart(all) {
+    const canvas = document.getElementById('tendencies-scatter');
+    if (!canvas) return;
+    const entries = Object.entries(all).filter(
+      ([, t]) => t.proe.s2d != null && t.pace_seconds_per_play.s2d != null
+    );
+    if (entries.length === 0) return;
+
+    const paceValues = entries.map(([, t]) => t.pace_seconds_per_play.s2d).sort((a, b) => a - b);
+    const paceMedian = paceValues[Math.floor(paceValues.length / 2)];
+
+    const points = entries.map(([team, t]) => {
+      const q = tendencyQuadrant(t.proe.s2d, t.pace_seconds_per_play.s2d, paceMedian);
+      return { x: t.proe.s2d, y: t.pace_seconds_per_play.s2d, team, color: q.color };
+    });
+
+    chartInstances.tendenciesScatter = new Chart(canvas.getContext('2d'), {
+      type: 'scatter',
+      data: {
+        datasets: [{
+          data: points,
+          backgroundColor: points.map(p => p.color),
+          borderColor: 'rgba(255,255,255,0.7)',
+          borderWidth: 1.5,
+          pointRadius: 7,
+          pointHoverRadius: 9,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            title: { display: true, text: 'Pass rate over expected (PROE, pts) -- run-heavy ← → pass-heavy' },
+            grid: { color: 'rgba(128,128,128,0.15)' },
+          },
+          y: {
+            reverse: true, // up = faster tempo, reads intuitively
+            title: { display: true, text: 'Seconds / play -- slower ↓   ↑ faster' },
+            grid: { color: 'rgba(128,128,128,0.15)' },
+          },
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                const p = ctx.raw;
+                return `${p.team}: PROE ${p.x >= 0 ? '+' : ''}${p.x.toFixed(1)}, ${p.y.toFixed(1)} sec/play`;
+              },
+            },
+          },
+        },
+        onClick: (evt, elements) => {
+          if (!elements.length) return;
+          state.tendenciesSelectedTeam = points[elements[0].index].team;
+          renderView();
+        },
+        onHover: (evt, elements) => {
+          evt.native.target.style.cursor = elements.length ? 'pointer' : 'default';
+        },
+      },
+    });
+  }
+
+  function tendencyMetricCellHtml(block, decimals, suffix, scale) {
+    scale = scale || 1;
+    if (!block || block.s2d == null) return '<td class="right" style="color: var(--text-muted);">—</td>';
+    return `<td class="right">${(block.s2d * scale).toFixed(decimals)}${suffix || ''}${tendencySparseBadge(block)}</td>`;
+  }
+
+  function targetDistBarHtml(td) {
+    const rb = Math.round((td.rb.s2d || 0) * 100);
+    const wr = Math.round((td.wr.s2d || 0) * 100);
+    const te = Math.round((td.te.s2d || 0) * 100);
+    return `
+      <div class="target-dist-bar" title="RB ${rb}% · WR ${wr}% · TE ${te}%${td.sparse ? ' (thin sample)' : ''}">
+        <div class="target-dist-seg rb" style="width:${rb}%"></div>
+        <div class="target-dist-seg wr" style="width:${wr}%"></div>
+        <div class="target-dist-seg te" style="width:${te}%"></div>
+      </div>
+    `;
+  }
+
+  function tendencyTableRowHtml(team, t) {
+    return `
+      <tr data-team="${team}">
+        <td><div class="tendencies-team-cell"><img src="${teamLogoUrl(team)}" alt="" onerror="this.style.display='none'"/>${team}</div></td>
+        ${tendencyMetricCellHtml(t.proe, 1)}
+        ${tendencyMetricCellHtml(t.pace_seconds_per_play, 1)}
+        ${tendencyMetricCellHtml(t.plays_per_game, 1)}
+        ${tendencyMetricCellHtml(t.red_zone.inside_20_pass_rate, 0, '%', 100)}
+        ${tendencyMetricCellHtml(t.red_zone.inside_10_pass_rate, 0, '%', 100)}
+        <td>${targetDistBarHtml(t.target_distribution)}</td>
+      </tr>
+    `;
+  }
+
+  function tendenciesEmptyStateHtml() {
+    // Distinguishes "this export predates the team_tendencies key
+    // entirely" (an old export, or advancedStats hasn't loaded yet) from
+    // "the key exists but no team has enough real plays yet" (genuinely
+    // early season) -- same distinction renderFieldHeatmapPanel's
+    // !heatmap vs. !heatmap.eligible check already makes, just at the
+    // top-level-key granularity instead of per-player.
+    const keyExists = state.advancedStats?.team_tendencies != null;
+    const title = keyExists ? 'Not enough plays yet' : 'Awaiting model output';
+    const text = keyExists
+      ? 'No team has enough real offensive plays this season yet for an honest read -- this populates as the season’s early weeks are played.'
+      : 'Once <code>player_advanced_stats.json</code> covers Team Tendencies, this tab will show real offensive tendencies -- pass rate over expected, pace, red-zone play-calling, target distribution -- for every team, from play-by-play.';
+    return `
+      <div class="panel">
+        <div class="pd-placeholder">
+          <div class="pd-placeholder-icon">🏈</div>
+          <div class="pd-placeholder-title">${title}</div>
+          <div class="pd-placeholder-text">${text}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function wireTendenciesTable(main) {
+    main.querySelectorAll('.tendencies-table th[data-tendency-sort]').forEach((th) => {
+      th.addEventListener('click', () => {
+        state.tendenciesSortMetric = th.dataset.tendencySort;
+        renderView();
+      });
+    });
+    main.querySelectorAll('.tendencies-table tbody tr[data-team]').forEach((tr) => {
+      tr.addEventListener('click', () => {
+        state.tendenciesSelectedTeam = tr.dataset.team;
+        renderView();
+      });
+    });
+  }
+
+  function renderTendenciesView(main) {
+    if (state.tendenciesSelectedTeam) return renderTendencyTeamDetail(main, state.tendenciesSelectedTeam);
+
+    const all = getAllTeamTendencies();
+    const teams = Object.keys(all);
+    const sortLabel = { proe: 'PROE', pace: 'Pace', plays: 'Plays/Gm', rz20: 'RZ Pass% (≤20)', rz10: 'RZ Pass% (≤10)' };
+
+    main.innerHTML = `
+      <div class="page-header-row">
+        <div>
+          <div class="page-title">Team Tendencies</div>
+          <div class="page-subtitle">Real offense identity from play-by-play -- not a player's usage, the environment they play in</div>
+        </div>
+      </div>
+      ${teams.length === 0 ? tendenciesEmptyStateHtml() : `
+        <div class="panel" style="margin-bottom: 16px;">
+          <div class="panel-header">
+            <div class="panel-title">League Landscape</div>
+            <div class="panel-note">Pass rate over expected vs. pace -- click a point, or use the table below</div>
+          </div>
+          <div class="tendencies-scatter-wrap">
+            <canvas id="tendencies-scatter"></canvas>
+          </div>
+          <div class="tendencies-quadrant-legend">
+            <span><i class="tendencies-quadrant-dot" style="background:#0891b2"></i>Fast &amp; pass-heavy</span>
+            <span><i class="tendencies-quadrant-dot" style="background:#f59e0b"></i>Fast &amp; run-heavy</span>
+            <span><i class="tendencies-quadrant-dot" style="background:#8b5cf6"></i>Slow &amp; pass-heavy</span>
+            <span><i class="tendencies-quadrant-dot" style="background:#ef4444"></i>Slow &amp; run-heavy</span>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">All Teams</div>
+            <div class="panel-note">Sorted by ${sortLabel[state.tendenciesSortMetric] || 'PROE'} · click a row for detail · ~ marks a thin sample</div>
+          </div>
+          <div style="overflow-x:auto;">
+            <table class="players-table tendencies-table">
+              <thead><tr>
+                <th>Team</th>
+                <th class="right" data-tendency-sort="proe">PROE</th>
+                <th class="right" data-tendency-sort="pace">Pace (sec/play)</th>
+                <th class="right" data-tendency-sort="plays">Plays/Gm</th>
+                <th class="right" data-tendency-sort="rz20">RZ Pass% (≤20)</th>
+                <th class="right" data-tendency-sort="rz10">RZ Pass% (≤10)</th>
+                <th>Target Distribution</th>
+              </tr></thead>
+              <tbody>
+                ${sortedTendencyEntries(all).map(([team, t]) => tendencyTableRowHtml(team, t)).join('')}
+              </tbody>
+            </table>
+          </div>
+          <div class="target-dist-legend">
+            <span><i style="background:#f59e0b"></i>RB</span>
+            <span><i style="background:#0891b2"></i>WR</span>
+            <span><i style="background:#8b5cf6"></i>TE</span>
+          </div>
+        </div>
+      `}
+      <div class="pd-placeholder-text" style="text-align: left; max-width: none; margin-top: 14px;">
+        ${teamTendencyCaveatText()}
+      </div>
+    `;
+
+    if (teams.length > 0) {
+      wireTendenciesTable(main);
+      renderTendenciesScatterChart(all);
+    }
+  }
+
+  function tendencyRangeCardHtml(label, block, decimals, suffix, allValues) {
+    if (!block || block.s2d == null || allValues.length === 0) {
+      return `
+        <div class="tendency-metric-card">
+          <div class="tendency-metric-label">${label}</div>
+          <div class="tendency-metric-values"><span class="tmv-main" style="color: var(--text-muted);">—</span></div>
+        </div>
+      `;
+    }
+    const val = block.s2d;
+    const min = Math.min(...allValues), max = Math.max(...allValues);
+    const pct = max > min ? ((val - min) / (max - min)) * 100 : 50;
+    const recent = block.ewm3;
+    return `
+      <div class="tendency-metric-card">
+        <div class="tendency-metric-label">${label}${tendencySparseBadge(block)}</div>
+        <div class="tendency-metric-values">
+          <span class="tmv-main">${val.toFixed(decimals)}${suffix || ''}</span>
+          ${recent != null ? `<span class="tmv-sub">recent (3wk): ${recent.toFixed(decimals)}${suffix || ''}</span>` : ''}
+        </div>
+        <div class="tendency-range-track">
+          <div class="tendency-range-marker" style="left: calc(${pct}% - 1px);"></div>
+        </div>
+        <div class="tendency-range-labels"><span>${min.toFixed(decimals)}${suffix || ''} low</span><span>${max.toFixed(decimals)}${suffix || ''} high</span></div>
+      </div>
+    `;
+  }
+
+  function renderTendencyDonuts(t) {
+    const pairDonut = (canvasId, passRate) => {
+      const el = document.getElementById(canvasId);
+      if (!el || passRate == null) return;
+      chartInstances[canvasId] = new Chart(el.getContext('2d'), {
+        type: 'doughnut',
+        data: { labels: ['Pass', 'Run'], datasets: [{ data: [passRate, 1 - passRate], backgroundColor: ['#0891b2', '#f59e0b'], borderWidth: 0 }] },
+        options: {
+          responsive: true, maintainAspectRatio: false, cutout: '65%',
+          plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `${c.label}: ${(c.raw * 100).toFixed(0)}%` } } },
+        },
+      });
+    };
+    pairDonut('tendency-rz20-donut', t.red_zone.inside_20_pass_rate.s2d);
+    pairDonut('tendency-rz10-donut', t.red_zone.inside_10_pass_rate.s2d);
+
+    const td = t.target_distribution;
+    const targetEl = document.getElementById('tendency-target-donut');
+    if (targetEl && td.rb.s2d != null) {
+      chartInstances.tendencyTargetDist = new Chart(targetEl.getContext('2d'), {
+        type: 'doughnut',
+        data: {
+          labels: ['RB', 'WR', 'TE'],
+          datasets: [{ data: [td.rb.s2d, td.wr.s2d, td.te.s2d], backgroundColor: ['#f59e0b', '#0891b2', '#8b5cf6'], borderWidth: 0 }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, cutout: '65%',
+          plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `${c.label}: ${(c.raw * 100).toFixed(0)}%` } } },
+        },
+      });
+    }
+  }
+
+  function renderTendencyTeamDetail(main, team) {
+    const t = getTeamTendency(team);
+
+    if (!t) {
+      main.innerHTML = `
+        <div class="back-btn" id="tendency-back">← Back to Team Tendencies</div>
+        <div class="tendency-detail-header">
+          <img src="${teamLogoUrl(team)}" alt="" onerror="this.style.display='none'"/>
+          <div class="page-title" style="margin-bottom:0;">${team}</div>
+        </div>
+        <div class="panel">
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">🏈</div>
+            <div class="pd-placeholder-title">Not enough plays yet for ${team}</div>
+            <div class="pd-placeholder-text">This team doesn't have enough real offensive plays this season yet for an honest read.</div>
+          </div>
+        </div>
+      `;
+      document.getElementById('tendency-back').addEventListener('click', () => {
+        state.tendenciesSelectedTeam = null;
+        renderView();
+      });
+      return;
+    }
+
+    const proeValues = tendencyLeagueValues((x) => x.proe.s2d);
+    const paceValues = tendencyLeagueValues((x) => x.pace_seconds_per_play.s2d);
+    const playsValues = tendencyLeagueValues((x) => x.plays_per_game.s2d);
+
+    main.innerHTML = `
+      <div class="back-btn" id="tendency-back">← Back to Team Tendencies</div>
+      <div class="tendency-detail-header">
+        <img src="${teamLogoUrl(team)}" alt="" onerror="this.style.display='none'"/>
+        <div>
+          <div class="page-title" style="margin-bottom: 2px;">${team}</div>
+          <div class="page-subtitle">Real offense identity from play-by-play</div>
+        </div>
+      </div>
+
+      <div class="tendency-metric-grid">
+        ${tendencyRangeCardHtml('Pass Rate Over Expected', t.proe, 1, ' pts', proeValues)}
+        ${tendencyRangeCardHtml('Pace', t.pace_seconds_per_play, 1, ' sec/play', paceValues)}
+        ${tendencyRangeCardHtml('Plays Per Game', t.plays_per_game, 1, '', playsValues)}
+      </div>
+
+      <div class="panel" style="margin-bottom: 16px;">
+        <div class="panel-header">
+          <div class="panel-title">Red-Zone Play-Calling &amp; Target Distribution</div>
+          <div class="panel-note">Pass vs. run split inside the 20 and inside the 10; real target share by position</div>
+        </div>
+        <div class="tendency-donuts-row">
+          <div class="tendency-donut-wrap">
+            <div class="tendency-donut-canvas-wrap"><canvas id="tendency-rz20-donut"></canvas></div>
+            <div class="tendency-donut-caption">Inside the 20${tendencySparseBadge(t.red_zone.inside_20_pass_rate)}</div>
+          </div>
+          <div class="tendency-donut-wrap">
+            <div class="tendency-donut-canvas-wrap"><canvas id="tendency-rz10-donut"></canvas></div>
+            <div class="tendency-donut-caption">Inside the 10${tendencySparseBadge(t.red_zone.inside_10_pass_rate)}</div>
+          </div>
+          <div class="tendency-donut-wrap">
+            <div class="tendency-donut-canvas-wrap"><canvas id="tendency-target-donut"></canvas></div>
+            <div class="tendency-donut-caption">Target Distribution${tendencySparseBadge(t.target_distribution)}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="pd-placeholder-text" style="text-align: left; max-width: none;">
+        ${teamTendencyCaveatText()}
+        <br/><br/>
+        Real sample this season: ${t.proe.sample_plays ?? '—'} neutral-situation plays ·
+        ${t.plays_per_game.sample_games ?? '—'} games ·
+        ${t.target_distribution.sample_targets ?? '—'} targets.
+      </div>
+    `;
+
+    document.getElementById('tendency-back').addEventListener('click', () => {
+      state.tendenciesSelectedTeam = null;
+      renderView();
+    });
+    renderTendencyDonuts(t);
+  }
+
   // ----- INJURY REPORT VIEW -----
   function renderInjuryView(main) {
     const f = state.injuryFilter;
@@ -8978,6 +9454,7 @@
     state.activeTeamId = null;
     state.activePlayerId = null;
     state.showBench = false;
+    state.tendenciesSelectedTeam = null;
     // Note: state.compareIds is intentionally preserved across nav changes
     renderView();
   });

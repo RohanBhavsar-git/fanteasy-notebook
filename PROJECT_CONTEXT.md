@@ -113,6 +113,19 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > use it as a model input yet — only the next `retrain.yml` run picks that
 > up); the export keys themselves are real now, tracked in **What's
 > outstanding**.
+> Team Tendencies (Aug 2026) is also done — `src/team_tendencies.py`, the
+> honest replacement for an earlier "coaching scheme" idea: nflverse has no
+> coordinator table, so this measures what a TEAM actually does from real
+> pbp instead (PROE via nflverse's own native `pass_oe`, pace, red-zone
+> pass/run split at the 20 and the 10, target distribution by RB/WR/TE),
+> new `team_tendencies` export key, and a new Team Tendencies dashboard tab
+> (league-wide scatter + sortable table, per-team detail). Walk-forward
+> tested as a candidate model feature the same way Family 5B was: a real,
+> substantial MAE improvement for QB, noise for RB/WR, a real degradation
+> for TE — position-differentiated enough that shipping it needs a small
+> `src/model.py` architecture change (per-position feature sets) not made
+> in this pass; `FEATURE_COLUMNS` is unchanged for now — see **Team
+> Tendencies findings** below for the full table and reasoning.
 > See **Verification status** near the end before treating any pipeline
 > claim as settled.
 
@@ -359,6 +372,142 @@ The dashboard already has integration hooks waiting. Search `state.advancedStats
 - `prev_season_*` holds last season's full-season average for a core subset of role/opportunity features and does **not** reset at the season boundary the way in-season rolling features do — an entire prior season can't leak forward.
 
 Step 5 (`03_usage_features.ipynb`, exercising the full table) is also done. Phase 6 (projection model) was picked up next, investigated, and concluded rather than shipped — see **Phase 6 findings** below. Steps 8-10 (quantile floor/ceiling, `src/simulate.py`, calibration/playoff-odds) remain open, contingent on what happens with Phase 6 next.
+
+---
+
+## Team Tendencies findings (Aug 2026)
+
+The honest version of an earlier "coaching scheme" idea, raised and dropped
+in the same conversation it was decided: attributing tendencies to an
+offensive coordinator sounds appealing, but nflverse has no coordinator
+table, one would need permanent hand-maintenance to keep current, and the
+sample size per coordinator (one team, one season at a time, sometimes
+mid-season firings splitting it further) would be too thin to trust. Built
+instead as `src/team_tendencies.py`, measuring what a TEAM actually does
+from real play-by-play: pass rate over expected (PROE), pace, red-zone
+play-calling split, and target distribution by position.
+
+**PROE reuses nflverse's own model rather than building a second one.**
+The spec called for "how much more or less a team passes than the
+situation implies, given down, distance, score, and time" — exactly what
+nflfastR's own `xpass`/`pass_oe` columns already are, verified directly
+against real cached 2025 pbp before writing any code: `pass_oe` is
+populated on 99.6% of real pass/run plays (the null remainder is
+nflfastR's own garbage-time/extreme-win-probability exclusion, not a gap
+in this pipeline). Team PROE is just the mean of `pass_oe` over a team's
+real neutral-situation plays each week — no second, competing
+down/distance/score/time model was built, the same "reuse, don't
+re-derive" principle Family 5B's xFP-based defense metric already
+established.
+
+**Pace is two numbers, not one, because they answer different
+questions.** `seconds_per_play` (the real tempo measure) is the mean time
+between the start of consecutive offensive snaps by the same team WITHIN
+THE SAME DRIVE, excluding the last play of each drive (no next play to
+time), two-minute-drill situations (deliberately fast, not normal tempo),
+and any gap outside (0, 90] seconds (a real stoppage — injury, replay
+review, TV timeout — not tempo). `plays_per_game` rides along as a
+simpler, more robust, more widely-cited corroborating number. Both are
+shown, not just one, since a team can be fast by one definition and merely
+high-volume by the other.
+
+**No position gate, unlike Family 5B.** Opponent defensive strength is
+inherently position-vs-position (a defense's rating against WRs differs
+from its rating against RBs), so it needed an `OPP_STRENGTH_POSITIONS`
+gate and a `(team, position, season)` join, with every QB row null by
+construction. Team tendencies describe the offense as a whole — every
+player on a team sees the identical PROE/pace/red-zone-split value
+regardless of their own position, verified directly
+(`test_team_tendencies_no_position_gate`) — so the join here is a plain
+`(team, season, week)` lookup. Target distribution by position is the one
+metric that's inherently position-shaped, but it's still delivered as
+three sibling values (RB/WR/TE share) attached to the team, not gated per
+player — the point of this whole feature is that it describes an offense,
+not a player, and a player who joins a team inherits the environment, not
+the incumbent's role (`TEAM_TENDENCY_CAVEAT`, surfaced inline on the new
+tab, not just in a tooltip).
+
+**Sample size is reported, not implied.** Every rate has a matching
+rolled, `shift(1)`-safe SAMPLE-SIZE column (a cumulative SUM of real plays
+through the prior week, not a mean). `plays_per_game`'s own sample is a
+GAMES count, not a play count — a much lower-variance quantity, caught
+during implementation (an early version compared 13 real games played
+against the same 15-PLAY sparsity floor built for noisier per-play rates,
+which would have mislabeled a perfectly solid games-played sample as
+"thin") and fixed with its own `TEAM_TENDENCY_SPARSE_GAMES` floor and its
+own `sample_games` JSON key instead of overloading `sample_plays`.
+
+**Real 2025 spot check, not just a leakage-clean value** (same discipline
+Family 5B's own defense spot check used — compute first, then check
+against teams whose identity is independently well-known, not the
+reverse). Baltimore lands at the run-heavy, slow, run-heavy-in-the-red-zone
+extreme on THREE independent metrics at once (lowest PROE at −8.8,
+slowest pace at 35.1 sec/play, lowest red-zone-≤20 pass rate at 39%) —
+matching its real, widely-reported run-first identity under Harbaugh/
+Monken. Arizona sits at the opposite extreme on the same three metrics
+(PROE +4.0, pace 32.0 sec/play, red-zone-≤20 pass rate 69%), and separately
+shows the league's highest TE target share (35.3%) — matching Trey
+McBride's real, heavily-targeted 2025 usage. A plausibility check on a
+handful of teams, not a certification of every team's number.
+
+**Walk-forward tested as a candidate model feature, exact Family 5B
+methodology** (same `eval_min_season` window `scripts/retrain.py` uses,
+`walk_forward_predict`/`evaluate_position` unchanged, `FEATURE_COLUMNS`
+vs. `FEATURE_COLUMNS + TEAM_TENDENCY_OUTPUT_COLUMNS`, full 2018-2025
+history):
+
+| Position | MAE without | MAE with | Delta |
+|---|---|---|---|
+| QB | 6.3553 | 6.1738 | **−0.1815 (real, substantial)** |
+| RB | 4.1712 | 4.1750 | +0.0038 (noise) |
+| WR | 3.9386 | 3.9447 | +0.0060 (noise) |
+| TE | 3.0135 | 3.0371 | **+0.0236 (real degradation)** |
+
+A clean, decisive, position-differentiated result — and it makes sense
+under the same "role and volume already do most of the work" reasoning
+Family 5B's own finding leaned on, pointed the other way. PROE/pace are
+OFFENSE-WIDE aggregates that most directly gate a QB's own volume (a QB
+throws every pass his team throws); for RB/WR/TE, the player-level rolling
+features already in `FEATURE_COLUMNS` (`target_share_ewm3` and friends)
+already capture THAT PLAYER'S OWN share of the team's volume, so a
+team-wide aggregate adds little at best (RB/WR) and appears to actively
+mislead the model at TE specifically (worst-in-class MAE already, most
+sensitive to added noise).
+
+**Not wired into `FEATURE_COLUMNS` in this pass — a scoped, disclosed
+decision, not an oversight.** `src/model.py`'s current architecture trains
+every position with the exact same shared `feature_cols` list (`train_final_
+models`/`predict_with_models` take one `feature_cols` argument applied
+uniformly across `POSITIONS`; the saved artifact stores one flat
+`feature_columns` list). Family 5B's own features could ride along safely
+for every position because they're genuinely null-for-QB (LightGBM just
+ignores an always-null column for that subset) — a "no-op, not a
+regression" case. Team Tendencies' QB-real/TE-worse split is a different
+shape: these columns are FULLY POPULATED for every position, so adding
+them to the one shared list would help QB and hurt TE at the same time,
+with no clean way to have it both ways under the current single-list
+architecture. Shipping the QB-specific win cleanly needs a small,
+real change (per-position `feature_cols`, touching `train_final_models`,
+`predict_with_models`, and `src/artifacts.py`'s artifact schema) that
+this change deliberately did not make, rather than force it in
+alongside a display-tab feature or silently drop a real, decisive
+finding. `TEAM_TENDENCY_OUTPUT_COLUMNS` is defined and ready
+(`src/team_tendencies.py`) for whenever that architecture change is
+scoped as its own piece of work.
+
+**Frontend and data verified against the REAL, regenerated 2023/2024/2025
+archives — not a faked payload.** `scripts/archive_season.py 2023/2024/2025`
+were re-run after this feature landed; each real archive now carries a
+real `team_tendencies` block (`n_team_tendencies: 32` in every
+`validate_export` report). Playwright against the real regenerated 2025
+archive: the League Landscape scatter (PROE × pace, quadrant-colored) and
+the 32-team sortable table both render with zero console errors; team
+detail (checked for both BAL and ARI) shows the real numbers above,
+correctly positioned range markers, red-zone/target-distribution donuts,
+and the real sample-size line. The live, pre-season 2026 export (zero
+games played league-wide, same honest state every other trailing signal
+in this pipeline shows right now) renders the "not enough plays yet" empty
+state, not an error or a blank panel.
 
 ---
 
