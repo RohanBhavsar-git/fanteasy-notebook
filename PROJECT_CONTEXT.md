@@ -122,10 +122,18 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > (league-wide scatter + sortable table, per-team detail). Walk-forward
 > tested as a candidate model feature the same way Family 5B was: a real,
 > substantial MAE improvement for QB, noise for RB/WR, a real degradation
-> for TE — position-differentiated enough that shipping it needs a small
-> `src/model.py` architecture change (per-position feature sets) not made
-> in this pass; `FEATURE_COLUMNS` is unchanged for now — see **Team
-> Tendencies findings** below for the full table and reasoning.
+> for TE. **Follow-up (Aug 2026): `FEATURE_COLUMNS` is now `FEATURE_COLUMNS_
+> BY_POSITION` (`src/model.py`)** — QB alone gets Team Tendencies added, TE
+> explicitly excludes it, RB/WR unchanged; re-verified with the real wired
+> pipeline (QB 6.1738, the full improvement; RB/WR/TE all exactly at their
+> original baselines, TE provably NOT degraded). This changed the model
+> artifact's own schema (`feature_columns` list → per-position dict), so
+> unlike Family 5B's own deferred-retrain precedent, `scripts/retrain.py`
+> was run for real this time — the old artifact would otherwise crash the
+> next `weekly_update.py` run. See **Team Tendencies findings** below for
+> the full tables and reasoning, including a flagged-not-chased note on
+> `CONTEXT_OUTPUT_COLUMNS` (Family 5) as a plausible next candidate for the
+> same helps-QB/redundant-elsewhere pattern.
 > See **Verification status** near the end before treating any pipeline
 > claim as settled.
 
@@ -474,26 +482,105 @@ team-wide aggregate adds little at best (RB/WR) and appears to actively
 mislead the model at TE specifically (worst-in-class MAE already, most
 sensitive to added noise).
 
-**Not wired into `FEATURE_COLUMNS` in this pass — a scoped, disclosed
-decision, not an oversight.** `src/model.py`'s current architecture trains
-every position with the exact same shared `feature_cols` list (`train_final_
-models`/`predict_with_models` take one `feature_cols` argument applied
-uniformly across `POSITIONS`; the saved artifact stores one flat
-`feature_columns` list). Family 5B's own features could ride along safely
-for every position because they're genuinely null-for-QB (LightGBM just
-ignores an always-null column for that subset) — a "no-op, not a
-regression" case. Team Tendencies' QB-real/TE-worse split is a different
-shape: these columns are FULLY POPULATED for every position, so adding
-them to the one shared list would help QB and hurt TE at the same time,
-with no clean way to have it both ways under the current single-list
-architecture. Shipping the QB-specific win cleanly needs a small,
-real change (per-position `feature_cols`, touching `train_final_models`,
-`predict_with_models`, and `src/artifacts.py`'s artifact schema) that
-this change deliberately did not make, rather than force it in
-alongside a display-tab feature or silently drop a real, decisive
-finding. `TEAM_TENDENCY_OUTPUT_COLUMNS` is defined and ready
-(`src/team_tendencies.py`) for whenever that architecture change is
-scoped as its own piece of work.
+**Follow-up (Aug 2026): `FEATURE_COLUMNS` is now PER-POSITION, specifically
+to let this finding be acted on without contradiction.** `src/model.py`'s
+old architecture trained every position with the exact same shared
+`feature_cols` list (`train_final_models`/`predict_with_models` took one
+`feature_cols` argument applied uniformly across `POSITIONS`; the saved
+artifact stored one flat `feature_columns` list). Family 5B's own features
+could ride along safely for every position because they're genuinely
+null-for-QB (LightGBM just ignores an always-null column for that subset)
+— a "no-op, not a regression" case. Team Tendencies' QB-real/TE-worse
+split is a different shape: these columns are FULLY POPULATED for every
+position, so adding them to one shared list would help QB and hurt TE at
+the same time, with no clean way to have it both ways under a single-list
+architecture.
+
+`FEATURE_COLUMNS_BY_POSITION` (`src/model.py`) replaces the single-list
+default everywhere a model actually trains or predicts (`train_final_models`,
+`predict_with_models`, `predict_quantiles_with_models`,
+`scripts/retrain.py`'s walk-forward loop, `src/artifacts.py`'s saved
+`feature_columns`, now `{position: [...]}` not a flat list): QB gets
+`FEATURE_COLUMNS + TEAM_TENDENCY_OUTPUT_COLUMNS`; RB and WR are unchanged
+(the effect was noise, not a case for fighting to add or exclude it); TE
+EXPLICITLY excludes `TEAM_TENDENCY_OUTPUT_COLUMNS` in the dict literal
+itself, not just by omission — it tested worse, so a future edit shouldn't
+casually fold it back in without re-checking that finding.
+
+Getting the model to actually SEE these columns required more than the
+`FEATURE_COLUMNS_BY_POSITION` dict itself: `add_team_tendency_features` had
+only ever been called at the export layer (`build_team_tendencies`, a
+side artifact for the dashboard tab), never wired into the real feature
+table `train_final_models` trains on. Fixed by calling it inside
+`src/pipeline.py::build_raw_features` (same single-season-is-sufficient
+reasoning as opponent strength — team tendencies resets every season) and
+inside `src/export.py::build_target_week_features` (which gained a
+required `pbp` parameter for this, threaded through both
+`scripts/weekly_update.py` and `scripts/archive_season.py`).
+
+A second, real bug surfaced during this wiring: `build_team_tendency_table`
+derived its `(team, season, week)` row set ENTIRELY from pbp's own rows —
+correct for historical weeks, but a not-yet-played target week (the export
+layer's stub row) has no pbp of its own, so that row never got a match at
+all, regardless of how much real history preceded it. Caught before it
+reached production by testing the STUB scenario directly (the original
+verification pass only ever exercised week-1-of-an-empty-season and
+`build_season_team_tendencies`, which doesn't share this code path — the
+symptom was invisible until a mid-season stub row was actually tried).
+Fixed by scaffolding the row set from `df`'s own `(team, season, week)`
+rows too (union, not replacement) — same "derive the key set from df, not
+from an upstream source's own presence" reasoning
+`build_defense_strength_table` already relies on for its own stub-row
+support.
+
+**Re-verified with the real, wired pipeline, not a re-check of the old
+scratch numbers.** Walk-forward re-run via `build_feature_table` (which
+now includes Team Tendencies as real columns) and
+`FEATURE_COLUMNS_BY_POSITION`, same eval window as above:
+
+| Position | MAE | vs. original baseline |
+|---|---|---|
+| QB | 6.1738 | full −0.1815 improvement captured |
+| RB | 4.1712 | exactly unchanged |
+| WR | 3.9386 | exactly unchanged |
+| TE | 3.0135 | exactly unchanged (NOT the +0.0236-degraded 3.0371) |
+
+Both halves of the point hold exactly: QB gets the win, TE is provably
+protected from the degradation, not just "probably fine."
+
+**The committed model artifact was retrained for real this time, not
+deferred.** Unlike the initial Team Tendencies land (an additive change to
+a stable flat-list schema, safe to defer), this change altered the
+artifact's OWN shape (`feature_columns` list → per-position dict) —
+`predict_with_models`/`predict_quantiles_with_models` now expect a dict,
+so the previously-committed artifact (saved under the old flat-list
+format) would have raised `AttributeError` the next time
+`weekly_update.py` ran. Deferring here would have shipped a broken
+pipeline, not a stale-but-safe one, so `scripts/retrain.py` was run for
+real and the refreshed artifact/live export were committed alongside the
+code.
+
+**A flagged-not-chased candidate for the same pattern: `CONTEXT_OUTPUT_
+COLUMNS` (Family 5 — is_home, days_rest, spread, game_total,
+team_implied_total, roof, surface, temp, wind).** Not tested in this pass
+— noted because the architecture is now open and the mechanism is
+identical to what just explained Team Tendencies: these are GAME-level
+signals (shared by every player on both teams that week, an even wider
+share than a team-level one), and Vegas's own game_total/spread/team_
+implied_total price in expected PASSING volume about as directly as
+anything in this feature set — plausibly redundant-at-best for RB/WR/TE
+(whose own rolling target/carry shares already capture their individual
+slice of that environment) and more directly informative for QB, the same
+asymmetry that made Team Tendencies worth splitting out. This already has
+a documented hint pointing the same direction: `usage.py`'s own comment
+on excluding CONTEXT_OUTPUT_COLUMNS from rolling treatment records that
+"SHAP diagnostics on the Phase 6 model showed context columns and their
+rolled variants occupying up to 8 of the top 20 features by importance at
+SOME positions" — evidence the raw (still-active) context columns can
+dominate a position's feature importance disproportionately, never broken
+down by which positions or whether it helps or hurts. Worth the same
+add/measure/compare test Team Tendencies just got, not assumed from this
+reasoning alone.
 
 **Frontend and data verified against the REAL, regenerated 2023/2024/2025
 archives — not a faked payload.** `scripts/archive_season.py 2023/2024/2025`

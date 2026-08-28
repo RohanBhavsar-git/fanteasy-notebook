@@ -17,7 +17,7 @@ from src.artifacts import load_model_artifact, save_model_artifact  # noqa: E402
 def _sample_artifact_kwargs():
     return dict(
         models={"WR": {"point": "fake-model", "quantiles": {0.10: "fake-q10", 0.90: "fake-q90"}}},
-        feature_columns=["feat_a", "feat_b"],
+        feature_columns={"WR": ["feat_a", "feat_b"], "QB": ["feat_a", "feat_b", "feat_c"]},
         cqr_widen_by_10_90={"WR": 1.2},
         cqr_widen_by_25_75={"WR": 0.6},
         performance={"WR": {"model_mae": 4.0, "sleeper_mae": 3.8, "s2d_mae": 4.2}},
@@ -37,7 +37,7 @@ def test_save_and_load_model_artifact_round_trips(tmp_path):
     loaded = load_model_artifact(path=path)
     assert loaded["model_version"] == "abc1234"
     assert loaded["seasons_trained"] == [2024, 2025]
-    assert loaded["feature_columns"] == ["feat_a", "feat_b"]
+    assert loaded["feature_columns"] == {"WR": ["feat_a", "feat_b"], "QB": ["feat_a", "feat_b", "feat_c"]}
     assert loaded["cqr_widen_by_10_90"] == {"WR": 1.2}
     assert loaded["models"]["WR"]["point"] == "fake-model"
     pd.testing.assert_frame_equal(loaded["history_seed"], _sample_artifact_kwargs()["history_seed"])

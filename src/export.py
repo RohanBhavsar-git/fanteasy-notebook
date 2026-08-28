@@ -68,7 +68,10 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from src.model import FEATURE_COLUMNS, _cast_categoricals, predict_quantiles_with_models, predict_with_models, train_final_models
+from src.model import (
+    ALL_FEATURE_COLUMNS, FEATURE_COLUMNS_BY_POSITION, _cast_categoricals, predict_quantiles_with_models,
+    predict_with_models, train_final_models,
+)
 from src.simulate import player_point_in_time_metrics, sample_player_week, simulate_matchup, simulate_season
 
 logger = logging.getLogger(__name__)
@@ -467,6 +470,7 @@ def build_target_week_features(
     schedule: pd.DataFrame,
     target_season: int,
     target_week: int,
+    pbp: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     Returns the COMBINED frame (real history + one stub row per candidate
@@ -475,11 +479,25 @@ def build_target_week_features(
     docstring for why this reuses add_context_features/add_rolling_features
     unmodified rather than writing new future-facing feature logic.
 
+    `pbp` feeds Team Tendencies (src/team_tendencies.py, a QB model
+    feature -- see src/model.py::FEATURE_COLUMNS_BY_POSITION), the one
+    family here that can't be derived from historical_features' own
+    already-computed columns the way opponent strength reuses `xfp` --
+    it needs real play-by-play directly. Scoping this to just the target
+    season's own pbp is sufficient (team tendencies resets every season,
+    same as opponent strength -- see add_team_tendency_features's own
+    docstring) even though historical_features itself may span multiple
+    seasons. Callers pass an EMPTY DataFrame (not None) when pbp can't be
+    fetched yet (season hasn't started -- see build_heatmap_snapshot's own
+    comment for the identical condition); add_team_tendency_features
+    guards that itself.
+
     Categorical columns (roof, surface) are cast ONCE here, on the combined
     frame, so the later train/predict split always shares the same category
     set -- the same reason src/model.py's walk_forward_predict casts before
     splitting into folds, not after.
     """
+    from src.team_tendencies import add_team_tendency_features
     from src.usage import (
         ROLLING_SOURCE_COLUMNS, add_context_features, add_opponent_strength_features,
         add_rolling_features, add_trend_features,
@@ -506,7 +524,8 @@ def build_target_week_features(
     # (add_trend_features's outputs are never added to FEATURE_COLUMNS), so
     # running it here doesn't change what predict_target_week trains on.
     combined = add_trend_features(combined)
-    combined = _cast_categoricals(combined, FEATURE_COLUMNS)
+    combined = add_team_tendency_features(combined, pbp)
+    combined = _cast_categoricals(combined, ALL_FEATURE_COLUMNS)
     return combined
 
 
@@ -517,7 +536,7 @@ def predict_target_week(
     combined_features: pd.DataFrame,
     target_season: int,
     target_week: int,
-    feature_cols: list[str] = FEATURE_COLUMNS,
+    feature_cols: dict[str, list[str]] = FEATURE_COLUMNS_BY_POSITION,
 ) -> pd.DataFrame:
     """
     Per position: one regression model (for `point`) and one q10/q90
@@ -566,9 +585,10 @@ def predict_target_week_from_artifact(
     retrained model.
 
     Uses the artifact's OWN feature_columns/cqr_widen_by_10_90 (not this
-    module's FEATURE_COLUMNS/CQR_WIDEN_BY_10_90 constants) -- the artifact
-    is self-describing so a weekly run always matches whatever retrain.yml
-    actually trained, even if this module's constants are edited later.
+    module's FEATURE_COLUMNS_BY_POSITION/CQR_WIDEN_BY_10_90 constants) --
+    the artifact is self-describing so a weekly run always matches
+    whatever retrain.yml actually trained, even if this module's
+    constants are edited later.
 
     Returns: same shape as predict_target_week.
     """

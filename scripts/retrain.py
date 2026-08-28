@@ -46,7 +46,7 @@ from src.artifacts import save_model_artifact  # noqa: E402
 from src.export import CQR_WIDEN_BY_10_90, CQR_WIDEN_BY_25_75  # noqa: E402
 from src.ingest import DEFAULT_LEAGUE_ID, get_id_crosswalk, get_sleeper_league, get_sleeper_projections  # noqa: E402
 from src.model import (  # noqa: E402
-    FEATURE_COLUMNS, POSITIONS, SIMULATION_QUANTILE_ALPHAS, add_sleeper_baseline, add_target_baselines,
+    FEATURE_COLUMNS_BY_POSITION, POSITIONS, SIMULATION_QUANTILE_ALPHAS, add_sleeper_baseline, add_target_baselines,
     evaluate_position, train_final_models, walk_forward_predict,
 )
 from src.pipeline import HISTORY_SEED_COLUMNS, build_feature_table  # noqa: E402
@@ -109,7 +109,16 @@ def main() -> None:
 
     performance = {}
     for position in POSITIONS:
-        wf = walk_forward_predict(features, position, eval_min_season=eval_min_season)
+        # feature_cols is THIS position's own list (FEATURE_COLUMNS_BY_
+        # POSITION), not walk_forward_predict's shared-list default -- the
+        # reported performance here must match what train_final_models
+        # actually trains below (step 3), or this table would silently
+        # describe a model this run doesn't produce. See PROJECT_CONTEXT.md's
+        # Team Tendencies findings for why QB's own list differs from the
+        # other three.
+        wf = walk_forward_predict(
+            features, position, feature_cols=FEATURE_COLUMNS_BY_POSITION[position], eval_min_season=eval_min_season
+        )
         if wf.empty:
             raise RuntimeError(f"Walk-forward validation produced zero rows for {position} -- aborting.")
 
@@ -130,7 +139,8 @@ def main() -> None:
 
     print("[3/5] Training final (no-holdout) models on the complete history...")
     models = train_final_models(
-        features, feature_cols=FEATURE_COLUMNS, positions=POSITIONS, quantile_alphas=SIMULATION_QUANTILE_ALPHAS,
+        features, feature_cols=FEATURE_COLUMNS_BY_POSITION, positions=POSITIONS,
+        quantile_alphas=SIMULATION_QUANTILE_ALPHAS,
     )
     missing_positions = [p for p in POSITIONS if p not in models]
     if missing_positions:
@@ -148,7 +158,7 @@ def main() -> None:
     model_version = _git_short_sha()
     path = save_model_artifact(
         models=models,
-        feature_columns=FEATURE_COLUMNS,
+        feature_columns=FEATURE_COLUMNS_BY_POSITION,
         cqr_widen_by_10_90=CQR_WIDEN_BY_10_90,
         cqr_widen_by_25_75=CQR_WIDEN_BY_25_75,
         performance=performance,

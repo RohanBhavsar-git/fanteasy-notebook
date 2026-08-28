@@ -213,7 +213,9 @@ def test_build_target_week_features_new_season_row_is_null_in_season_and_carries
         "temp": np.nan, "wind": np.nan,
     }])
 
-    combined = build_target_week_features(historical, candidates, schedule, target_season=2026, target_week=1)
+    combined = build_target_week_features(
+        historical, candidates, schedule, target_season=2026, target_week=1, pbp=pd.DataFrame()
+    )
     stub_row = combined[(combined["season"] == 2026) & (combined["week"] == 1)].iloc[0]
 
     assert pd.isna(stub_row["target_share_ewm3"])  # nothing played yet this season

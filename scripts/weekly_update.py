@@ -118,6 +118,7 @@ def build_simulation_block(
     cw_lookup: pd.DataFrame,
     rosters_raw: list,
     artifact: dict,
+    pbp_current: pd.DataFrame,
 ) -> dict | None:
     """
     Orchestrates src/export.py's simulation helpers into the payload's
@@ -173,7 +174,7 @@ def build_simulation_block(
     def week_quantiles(week: int) -> pd.DataFrame:
         if week not in quantiles_cache:
             week_features = build_target_week_features(
-                historical_features, candidates, schedule_current, current_season, week
+                historical_features, candidates, schedule_current, current_season, week, pbp_current
             )
             # MUST filter to just this week's stub rows before predicting --
             # week_features is the FULL combined frame (all of
@@ -290,8 +291,38 @@ def main() -> None:
     if candidates.empty:
         raise RuntimeError("Zero export candidates -- aborting rather than writing an empty JSON.")
 
+    # Fetched here (not left to build_raw_features' own internal call at
+    # Step 3) because that call short-circuits BEFORE ever reaching
+    # get_pbp when raw_current comes back empty (a not-yet-started
+    # season, this run's real case) -- see build_raw_features' own
+    # docstring. Reused below for build_target_week_features (Team
+    # Tendencies, a QB model feature), the heatmap panel, Team Tendencies'
+    # own league-wide export block, and build_simulation_block's
+    # per-remaining-week predictions -- one fetch, not four.
+    #
+    # nflreadpy.load_pbp() raises ValueError("Season must be between 1999
+    # and <its own current-season guess>") for a season that hasn't
+    # started yet -- a client-side check, before any network call, so it's
+    # not the ConnectionError/404 shape _is_unpublished_season_error
+    # already handles for get_weekly_stats. Same real condition
+    # (build_weekly_scored's own current_season fetch above already logged
+    # "0 real rows played so far this season"), so it gets the same
+    # tolerance, scoped to just this call -- not pushed into get_pbp
+    # itself, matching why build_weekly_scored's own tolerance lives at
+    # its caller and not inside get_weekly_stats (see that function's
+    # docstring): every OTHER get_pbp caller in this pipeline requests
+    # seasons known to be published, where this error would be a real bug
+    # that should still fail loudly.
+    try:
+        pbp_current = get_pbp([current_season])
+    except ValueError as e:
+        if "must be between" not in str(e):
+            raise
+        print(f"    pbp: season {current_season} has no published play-by-play yet -- heatmap/team tendencies will be empty.")
+        pbp_current = pd.DataFrame()  # every pbp-consuming call below treats an empty pbp as "nothing computed yet"
+
     combined_features = build_target_week_features(
-        historical_features, candidates, schedule_current, current_season, target_week
+        historical_features, candidates, schedule_current, current_season, target_week, pbp_current
     )
     predictions = predict_target_week_from_artifact(combined_features, current_season, target_week, artifact)
     if predictions.empty:
@@ -349,33 +380,9 @@ def main() -> None:
     n_eligible = sum(1 for r in radar.values() if r["eligible"])
     print(f"    radar: {n_eligible}/{len(radar)} candidates eligible (>= games played floor)")
 
-    # Phase 5: field heatmap zones -- needs raw pbp for current_season.
-    # build_raw_features (Step 3 above) does NOT already have this cached:
-    # its `if weekly_scored.empty: return weekly_scored` early-out means it
-    # never calls get_pbp at all when raw_current is empty (a not-yet-
-    # started season, this run's real case) -- so this is a genuine first
-    # fetch, not a cache read.
-    #
-    # nflreadpy.load_pbp() raises ValueError("Season must be between 1999
-    # and <its own current-season guess>") for a season that hasn't
-    # started yet -- a client-side check, before any network call, so it's
-    # not the ConnectionError/404 shape _is_unpublished_season_error
-    # already handles for get_weekly_stats. Same real condition
-    # (build_weekly_scored's own current_season fetch above already logged
-    # "0 real rows played so far this season"), so it gets the same
-    # tolerance, scoped to just this call -- not pushed into get_pbp
-    # itself, matching why build_weekly_scored's own tolerance lives at
-    # its caller and not inside get_weekly_stats (see that function's
-    # docstring): every OTHER get_pbp caller in this pipeline requests
-    # seasons known to be published, where this error would be a real bug
-    # that should still fail loudly.
-    try:
-        pbp_current = get_pbp([current_season])
-    except ValueError as e:
-        if "must be between" not in str(e):
-            raise
-        print(f"    pbp: season {current_season} has no published play-by-play yet -- heatmap zones will be empty.")
-        pbp_current = pd.DataFrame()  # build_heatmap_snapshot treats an empty pbp as "nothing to zone" -- see its own comment
+    # Phase 5: field heatmap zones -- pbp_current was already fetched
+    # above (Step 4), before build_target_week_features, so Team
+    # Tendencies (a QB model feature) could use it too; reused here as-is.
     heatmap = build_heatmap_snapshot(combined_features, pbp_current, current_season, target_week)
     n_heatmap_eligible = sum(1 for h in heatmap.values() if h["eligible"])
     print(f"    heatmap: {n_heatmap_eligible}/{len(heatmap)} candidates eligible (>= games played floor)")
@@ -417,7 +424,7 @@ def main() -> None:
     print("[6/7] Simulating matchup win probability + playoff odds...")
     simulation = build_simulation_block(
         league, DEFAULT_LEAGUE_ID, current_season, target_week, historical_features, candidates,
-        schedule_current, sleeper_players, crosswalk, cw_lookup, rosters_raw, artifact,
+        schedule_current, sleeper_players, crosswalk, cw_lookup, rosters_raw, artifact, pbp_current,
     )
     if simulation is not None:
         sim_validation = validate_simulation(simulation)

@@ -9,8 +9,9 @@ feature table:
     trained on ALL history -- the extra 3 quantiles beyond q10/q90 exist
     for src/simulate.py's per-player distributions, not the dashboard's
     floor/ceiling, which only ever reads q10/q90)
-  - feature_columns and cqr_widen_by_10_90/cqr_widen_by_25_75, so
-    predictions always match whatever retrain.yml actually trained even
+  - feature_columns (PER-POSITION -- {position: [...]}, see src/model.py's
+    FEATURE_COLUMNS_BY_POSITION) and cqr_widen_by_10_90/cqr_widen_by_25_75,
+    so predictions always match whatever retrain.yml actually trained even
     if src/model.py's or src/export.py's own constants drift later
   - performance: the walk-forward MAE-vs-baselines table (same shape as
     src/export.py's PERFORMANCE_BY_POSITION), refreshed by every retrain
@@ -54,7 +55,7 @@ _REQUIRED_KEYS = (
 
 def save_model_artifact(
     models: dict,
-    feature_columns: list[str],
+    feature_columns: dict[str, list[str]],
     cqr_widen_by_10_90: dict[str, float],
     cqr_widen_by_25_75: dict[str, float],
     performance: dict,
@@ -65,12 +66,19 @@ def save_model_artifact(
     path: Path = MODEL_ARTIFACT_PATH,
 ) -> Path:
     """Writes the artifact and returns the path actually written, so a
-    caller (scripts/retrain.py) can report its size without guessing."""
+    caller (scripts/retrain.py) can report its size without guessing.
+
+    `feature_columns` is PER-POSITION ({position: [...]}, see
+    src/model.py::FEATURE_COLUMNS_BY_POSITION) -- copied one list deep
+    (not just `dict(feature_columns)`, which would leave each position's
+    list as the SAME object the caller holds) so a caller mutating its own
+    copy afterward can't reach into the saved artifact.
+    """
     artifact = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "model_version": model_version,
         "seasons_trained": list(seasons_trained),
-        "feature_columns": list(feature_columns),
+        "feature_columns": {position: list(cols) for position, cols in feature_columns.items()},
         "cqr_widen_by_10_90": dict(cqr_widen_by_10_90),
         "cqr_widen_by_25_75": dict(cqr_widen_by_25_75),
         "performance": performance,

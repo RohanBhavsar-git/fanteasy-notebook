@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pandas as pd
 
 from src.usage import EWM_HALFLIFE, INSIDE_10_YARDLINE, RZ_YARDLINE, TWO_MINUTE_SECONDS
@@ -299,22 +300,42 @@ def build_team_tendency_table(df: pd.DataFrame, pbp: pd.DataFrame) -> pd.DataFra
     src/export.py calls this directly for the league-wide Team Tendencies
     view.
 
+    The (team, season, week) row set is the UNION of what real pbp
+    produces AND df's own (team, season, week) rows -- not pbp's alone.
+    This matters for a not-yet-played week already present in df (e.g.
+    src/export.py::build_target_week_features' stub row for the upcoming
+    week being predicted): pbp has no rows for a week that hasn't been
+    played, so a pbp-only row set would never produce an entry for it at
+    all, and the model's own QB feature (TEAM_TENDENCY_OUTPUT_COLUMNS)
+    would silently go null even after real prior weeks exist to roll
+    forward. Scaffolding from df too gives that week a row (with NaN RAW
+    values for that week itself -- correct, nothing real happened yet),
+    and _rolling_team's shift(1) still resolves its _ewm3/_s2d from the
+    real prior weeks. Same "derive the key set from df, not from an
+    upstream column's own presence" reasoning build_defense_strength_table
+    already relies on (its `generated` grid comes from df's own rows,
+    including any stub row, not from a separate real-game source).
+
     Args:
-        df: any frame with player_id, position, season (weekly_scored or
-            later is fine) -- used ONLY to resolve a target's position,
-            since pbp itself has no receiver-position column.
-        pbp: from get_pbp().
+        df: any frame with player_id, position, team, season, week
+            (weekly_scored or later is fine) -- position resolves a
+            target's position (pbp itself has no receiver-position
+            column); team/season/week seed the row scaffold above.
+        pbp: from get_pbp(). Real historical rows this function produces
+            depend only on pbp's own (team, season, week) coverage --
+            df's scaffold ADDS rows, it never removes real ones.
 
     Returns:
         team, season, week, plus TEAM_TENDENCY_OUTPUT_COLUMNS and
         TEAM_TENDENCY_SAMPLE_COLUMNS.
     """
-    required = ["player_id", "position", "season"]
+    required = ["player_id", "position", "team", "season", "week"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise KeyError(f"build_team_tendency_table: df is missing columns {missing}")
 
     position_lookup = df[["player_id", "position", "season"]].drop_duplicates(subset=["player_id", "season"])
+    scaffold = df[["team", "season", "week"]].drop_duplicates()
 
     rates = _team_week_play_rates(pbp)
     pace = _team_week_pace(pbp)
@@ -323,6 +344,7 @@ def build_team_tendency_table(df: pd.DataFrame, pbp: pd.DataFrame) -> pd.DataFra
     long_df = (
         rates.merge(pace, on=["team", "season", "week"], how="outer")
         .merge(targets, on=["team", "season", "week"], how="outer")
+        .merge(scaffold, on=["team", "season", "week"], how="outer")
     )
 
     out = long_df[["team", "season", "week"]].copy()
@@ -347,6 +369,16 @@ def add_team_tendency_features(df: pd.DataFrame, pbp: pd.DataFrame) -> pd.DataFr
 
     Idempotent: existing output columns are dropped before recomputing.
 
+    `pbp` can legitimately arrive completely empty (zero columns, not just
+    zero rows) -- src/export.py::build_target_week_features passes that
+    when the current season hasn't started yet and get_pbp itself can't
+    be called (see build_heatmap_snapshot's own comment for the identical
+    condition). Guarded here, before touching any pbp column, rather than
+    at every call site separately -- this is now a core pipeline step
+    (src/pipeline.py::build_raw_features and build_target_week_features
+    both call it), not just the export-layer side artifact
+    build_team_tendencies already guards on its own.
+
     Args:
         df: player-week frame with player_id, position, team, season, week.
         pbp: from get_pbp().
@@ -358,6 +390,10 @@ def add_team_tendency_features(df: pd.DataFrame, pbp: pd.DataFrame) -> pd.DataFr
 
     drop_cols = list(TEAM_TENDENCY_OUTPUT_COLUMNS) + list(TEAM_TENDENCY_SAMPLE_COLUMNS)
     out = df.drop(columns=[c for c in drop_cols if c in df.columns])
+
+    if pbp.empty:
+        nan_cols = pd.DataFrame(np.nan, index=out.index, columns=drop_cols)
+        return pd.concat([out, nan_cols], axis=1)
 
     table = build_team_tendency_table(df, pbp)
     return out.merge(table, on=["team", "season", "week"], how="left")

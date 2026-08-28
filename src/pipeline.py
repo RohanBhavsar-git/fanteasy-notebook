@@ -44,6 +44,7 @@ from src.ingest import (
     get_snap_counts,
     get_weekly_stats,
 )
+from src.team_tendencies import add_team_tendency_features
 from src.usage import (
     FANTASY_POSITIONS,
     ROLLING_SOURCE_COLUMNS,
@@ -192,6 +193,11 @@ def build_raw_features(
     # sufficient -- unlike xFP's own rate table, this doesn't need multiple
     # prior seasons of pbp to be reliable during weekly-only inference.
     df = add_opponent_strength_features(df, schedule)
+    # Team Tendencies (QB model feature -- see src/model.py::
+    # FEATURE_COLUMNS_BY_POSITION) -- resets every season by construction,
+    # same "single-season pbp is fully sufficient" reasoning as opponent
+    # strength just above (unlike xFP's own multi-season rate table).
+    df = add_team_tendency_features(df, pbp)
     return df
 
 

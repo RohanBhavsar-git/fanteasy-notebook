@@ -60,6 +60,7 @@ import pandas as pd
 import shap
 from scipy.stats import spearmanr
 
+from src.team_tendencies import TEAM_TENDENCY_OUTPUT_COLUMNS
 from src.usage import CONTEXT_OUTPUT_COLUMNS, OPPONENT_STRENGTH_OUTPUT_COLUMNS, ROLLING_OUTPUT_COLUMNS
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,42 @@ POSITIONS = ("QB", "RB", "WR", "TE")
 FEATURE_COLUMNS = (
     list(ROLLING_OUTPUT_COLUMNS) + list(CONTEXT_OUTPUT_COLUMNS) + list(OPPONENT_STRENGTH_OUTPUT_COLUMNS)
 )
+
+# Per-position feature sets -- introduced specifically because Team
+# Tendencies (src/team_tendencies.py) couldn't be added to the single
+# shared FEATURE_COLUMNS list above without contradiction. Walk-forward
+# tested (same eval_min_season window/methodology as every other feature
+# family in this pipeline; see PROJECT_CONTEXT.md's Team Tendencies
+# findings for the full table): a real, substantial MAE improvement for
+# QB (-0.18), noise for RB/WR (+0.004/+0.006, doesn't clear noise either
+# direction), and a real DEGRADATION for TE (+0.024, clearly worse). A QB
+# throws every pass his team throws, so team-wide pace/PROE gate QB
+# volume about as directly as a feature can; for RB/WR/TE, the player-
+# level rolling shares already in FEATURE_COLUMNS (target_share_ewm3 and
+# friends) already capture THAT PLAYER'S OWN slice of the team total, so
+# the team-wide aggregate is redundant at best and actively misleads the
+# model at TE specifically.
+#
+# RB and WR are unchanged from FEATURE_COLUMNS (the effect was noise, not
+# a case for either adding or fighting to keep out). TE's exclusion is
+# written explicitly below, not left as "just doesn't get added" --
+# TEAM_TENDENCY_OUTPUT_COLUMNS tested WORSE for TE, so this is a
+# deliberate exclusion a future edit shouldn't casually undo without
+# re-checking that finding.
+FEATURE_COLUMNS_BY_POSITION: dict[str, list[str]] = {
+    "QB": list(FEATURE_COLUMNS) + list(TEAM_TENDENCY_OUTPUT_COLUMNS),
+    "RB": list(FEATURE_COLUMNS),
+    "WR": list(FEATURE_COLUMNS),
+    "TE": list(FEATURE_COLUMNS),  # deliberately excludes TEAM_TENDENCY_OUTPUT_COLUMNS -- tested worse, not just untested
+}
+
+# The union across every position's own list -- for the ONE step that
+# still needs a single flat column set: casting categorical dtypes
+# (roof/surface) consistently across a combined, not-yet-position-split
+# frame BEFORE it gets divided into each position's own columns (see
+# src/export.py::build_target_week_features and walk_forward_predict's
+# own "cast once, before splitting into folds" reasoning).
+ALL_FEATURE_COLUMNS = sorted({col for cols in FEATURE_COLUMNS_BY_POSITION.values() for col in cols})
 
 TARGET_BASELINE_OUTPUT_COLUMNS = ["baseline_season_to_date_avg", "baseline_trailing_3wk_avg"]
 
@@ -761,7 +798,7 @@ def stable_feature_ranking(selections: pd.DataFrame, all_feature_cols: list[str]
 # ==========================================================================
 def train_final_models(
     df: pd.DataFrame,
-    feature_cols: list[str] = FEATURE_COLUMNS,
+    feature_cols: dict[str, list[str]] = FEATURE_COLUMNS_BY_POSITION,
     target_col: str = "custom_points",
     positions: tuple[str, ...] = POSITIONS,
     quantile_alphas: tuple[float, ...] = (0.10, 0.90),
@@ -779,24 +816,40 @@ def train_final_models(
     reused across many weekly inference runs instead of being retrained
     inline on every single export.
 
+    `feature_cols` is PER-POSITION ({position: [...]}, defaulting to
+    FEATURE_COLUMNS_BY_POSITION) rather than one shared list -- see that
+    constant's own comment for why (Team Tendencies helps QB, hurts TE; a
+    single list couldn't have it both ways). Categorical dtypes are cast
+    ONCE across the union of every position's own columns in THIS CALL's
+    `feature_cols` (not the module-level ALL_FEATURE_COLUMNS, so a caller
+    passing its own custom feature_cols -- e.g. a test, or a SHAP
+    ablation -- doesn't get cast against unrelated real column names it
+    never asked for), before the per-position split -- same "cast once
+    before splitting" reasoning as walk_forward_predict.
+
     Returns:
         {position: {"point": LGBMRegressor, "quantiles": {alpha: LGBMRegressor}}}
-        -- positions with no rows in df are silently skipped (mirrors
-        predict_target_week's per-position `if pos_test.empty: continue`).
+        -- positions with no rows in df, or missing from `feature_cols`,
+        are silently skipped (mirrors predict_target_week's per-position
+        `if pos_test.empty: continue`).
     """
-    pos_df = _cast_categoricals(df, feature_cols)
+    all_cols = sorted({col for cols in feature_cols.values() for col in cols})
+    pos_df = _cast_categoricals(df, all_cols)
     models: dict = {}
     for position in positions:
+        cols = feature_cols.get(position)
+        if not cols:
+            continue
         rows = pos_df[pos_df["position"] == position]
         if rows.empty:
             continue
         reg_model = lgb.LGBMRegressor(objective="regression", verbosity=-1, random_state=42)
-        reg_model.fit(rows[feature_cols], rows[target_col])
+        reg_model.fit(rows[cols], rows[target_col])
 
         q_models = {}
         for alpha in quantile_alphas:
             q_model = lgb.LGBMRegressor(objective="quantile", alpha=alpha, verbosity=-1, random_state=42)
-            q_model.fit(rows[feature_cols], rows[target_col])
+            q_model.fit(rows[cols], rows[target_col])
             q_models[alpha] = q_model
 
         models[position] = {"point": reg_model, "quantiles": q_models}
@@ -807,7 +860,7 @@ def predict_with_models(
     test_df: pd.DataFrame,
     models: dict,
     cqr_widen_by_10_90: dict[str, float],
-    feature_cols: list[str] = FEATURE_COLUMNS,
+    feature_cols: dict[str, list[str]] = FEATURE_COLUMNS_BY_POSITION,
     lower_alpha: float = 0.10,
     upper_alpha: float = 0.90,
 ) -> pd.DataFrame:
@@ -820,6 +873,13 @@ def predict_with_models(
     run and a load-artifact-and-predict-later run can never silently
     diverge in how floor/ceiling get built.
 
+    `feature_cols` is PER-POSITION, same shape/reasoning as
+    train_final_models -- and MUST be whichever dict actually trained
+    `models` (predict_target_week_from_artifact passes the artifact's own
+    `feature_columns`, never this module's default, so a weekly run always
+    matches what retrain.yml actually trained even if this constant is
+    edited later).
+
     Same floor <= point <= ceiling clipping as
     src/export.py::predict_target_week: point comes from a SEPARATE model
     than floor/ceiling, so nothing mathematically guarantees the two
@@ -828,16 +888,18 @@ def predict_with_models(
     Returns: player_id, position, point, floor, ceiling -- one row per
     (position, player) present in test_df AND in `models`.
     """
-    pos_df = _cast_categoricals(test_df, feature_cols)
+    all_cols = sorted({col for cols in feature_cols.values() for col in cols})
+    pos_df = _cast_categoricals(test_df, all_cols)
     results = []
     for position, bundle in models.items():
         rows = pos_df[pos_df["position"] == position]
         if rows.empty:
             continue
+        cols = feature_cols[position]
 
-        point_raw = bundle["point"].predict(rows[feature_cols])
-        q_lower = bundle["quantiles"][lower_alpha].predict(rows[feature_cols])
-        q_upper = bundle["quantiles"][upper_alpha].predict(rows[feature_cols])
+        point_raw = bundle["point"].predict(rows[cols])
+        q_lower = bundle["quantiles"][lower_alpha].predict(rows[cols])
+        q_upper = bundle["quantiles"][upper_alpha].predict(rows[cols])
 
         floor_raw = np.minimum(q_lower, q_upper)
         ceiling_raw = np.maximum(q_lower, q_upper)
@@ -867,7 +929,7 @@ def predict_quantiles_with_models(
     models: dict,
     cqr_widen_by_10_90: dict[str, float],
     cqr_widen_by_25_75: dict[str, float],
-    feature_cols: list[str] = FEATURE_COLUMNS,
+    feature_cols: dict[str, list[str]] = FEATURE_COLUMNS_BY_POSITION,
 ) -> pd.DataFrame:
     """
     Predicts the full 5-point CQR-calibrated distribution
@@ -876,6 +938,10 @@ def predict_quantiles_with_models(
     test_df, using per-position models already trained with AT LEAST
     SIMULATION_QUANTILE_ALPHAS (train_final_models with that alpha tuple,
     which scripts/retrain.py passes).
+
+    `feature_cols` is PER-POSITION, same shape/reasoning as
+    predict_with_models -- MUST be whichever dict actually trained
+    `models` (weekly_update.py passes the artifact's own `feature_columns`).
 
     Mirrors predict_with_models's shape (same models dict, same
     _cast_categoricals/per-position loop) but for the simulator's input
@@ -900,22 +966,24 @@ def predict_quantiles_with_models(
     in test_df AND in `models`.
     """
     output_cols = ["player_id", "position", "pred_q10_cqr", "pred_q25_cqr", "pred_q50", "pred_q75_cqr", "pred_q90_cqr"]
-    pos_df = _cast_categoricals(test_df, feature_cols)
+    all_cols = sorted({col for cols in feature_cols.values() for col in cols})
+    pos_df = _cast_categoricals(test_df, all_cols)
     results = []
     for position, bundle in models.items():
         rows = pos_df[pos_df["position"] == position]
         if rows.empty:
             continue
+        cols = feature_cols[position]
 
         missing = [a for a in SIMULATION_QUANTILE_ALPHAS if a not in bundle["quantiles"]]
         if missing:
             raise KeyError(f"predict_quantiles_with_models: {position} model is missing quantile alphas {missing}")
 
-        q10 = bundle["quantiles"][0.10].predict(rows[feature_cols])
-        q25 = bundle["quantiles"][0.25].predict(rows[feature_cols])
-        q50 = bundle["quantiles"][0.50].predict(rows[feature_cols])
-        q75 = bundle["quantiles"][0.75].predict(rows[feature_cols])
-        q90 = bundle["quantiles"][0.90].predict(rows[feature_cols])
+        q10 = bundle["quantiles"][0.10].predict(rows[cols])
+        q25 = bundle["quantiles"][0.25].predict(rows[cols])
+        q50 = bundle["quantiles"][0.50].predict(rows[cols])
+        q75 = bundle["quantiles"][0.75].predict(rows[cols])
+        q90 = bundle["quantiles"][0.90].predict(rows[cols])
 
         lo_1090, hi_1090 = np.minimum(q10, q90), np.maximum(q10, q90)
         lo_2575, hi_2575 = np.minimum(q25, q75), np.maximum(q25, q75)

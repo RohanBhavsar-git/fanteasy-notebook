@@ -139,7 +139,15 @@ def main() -> None:
     print(f"    season-team map: {len(season_team)} players resolved to their real {season} team")
 
     print("[4/6] Building target-week features and predicting...")
-    combined_features = build_target_week_features(weekly_features, candidates, schedule_season, season, target_week)
+    # Fetched here (rather than at Step 5, where the heatmap needs it too)
+    # so build_target_week_features can wire it into Team Tendencies (a QB
+    # model feature) below -- an archived, completed season's pbp is
+    # always fully published, unlike scripts/weekly_update.py's live path,
+    # so this needs no try/except guard.
+    pbp_season = get_pbp([season])
+    combined_features = build_target_week_features(
+        weekly_features, candidates, schedule_season, season, target_week, pbp_season
+    )
     predictions = predict_target_week_from_artifact(combined_features, season, target_week, artifact)
     if predictions.empty:
         raise RuntimeError("predict_target_week_from_artifact returned zero rows -- aborting.")
@@ -159,7 +167,6 @@ def main() -> None:
     n_radar_eligible = sum(1 for r in radar.values() if r["eligible"])
     print(f"    radar: {n_radar_eligible}/{len(radar)} candidates eligible")
 
-    pbp_season = get_pbp([season])
     heatmap = build_heatmap_snapshot(combined_features, pbp_season, season, target_week)
     n_heatmap_eligible = sum(1 for h in heatmap.values() if h["eligible"])
     print(f"    heatmap: {n_heatmap_eligible}/{len(heatmap)} candidates eligible")

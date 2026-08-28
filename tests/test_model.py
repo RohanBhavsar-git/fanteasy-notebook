@@ -383,7 +383,7 @@ def test_train_final_models_fits_one_point_model_and_a_quantile_pair_per_positio
 
     monkeypatch.setattr(model_module.lgb, "LGBMRegressor", _RecordingModel)
 
-    feature_cols = ["feat_a", "feat_b"]
+    feature_cols = {"WR": ["feat_a", "feat_b"], "QB": ["feat_a", "feat_b"]}
     models = train_final_models(df, feature_cols=feature_cols, positions=("WR", "QB"))
 
     n_wr_rows = (df["position"] == "WR").sum()
@@ -429,7 +429,7 @@ def test_predict_with_models_builds_floor_point_ceiling_with_cqr_widening_and_cl
         "feat_a": [0.0, 0.0],
     })
 
-    result = predict_with_models(test_df, models, cqr_widen_by, feature_cols=["feat_a"])
+    result = predict_with_models(test_df, models, cqr_widen_by, feature_cols={"WR": ["feat_a"]})
 
     assert list(result["player_id"]) == ["p1", "p2"]
     # floor/ceiling take min/max of the (crossed) quantile predictions, then widen by 1.0
@@ -452,7 +452,9 @@ def test_predict_with_models_skips_positions_not_present_in_test_df():
     }
     test_df = pd.DataFrame({"player_id": ["p1"], "position": ["WR"], "feat_a": [0.0]})
 
-    result = predict_with_models(test_df, models, {"WR": 0.0, "QB": 0.0}, feature_cols=["feat_a"])
+    result = predict_with_models(
+        test_df, models, {"WR": 0.0, "QB": 0.0}, feature_cols={"WR": ["feat_a"], "QB": ["feat_a"]}
+    )
     assert set(result["position"]) == {"WR"}
 
 
@@ -485,7 +487,7 @@ def test_predict_quantiles_with_models_widens_each_pair_by_its_own_constant_and_
     cqr_25_75 = {"WR": 2.0}
     test_df = pd.DataFrame({"player_id": ["p1"], "position": ["WR"], "feat_a": [0.0]})
 
-    result = predict_quantiles_with_models(test_df, models, cqr_10_90, cqr_25_75, feature_cols=["feat_a"])
+    result = predict_quantiles_with_models(test_df, models, cqr_10_90, cqr_25_75, feature_cols={"WR": ["feat_a"]})
 
     row = result.iloc[0]
     # q10=12, q90=8 -> swapped to lo=8, hi=12, widened by 1.0
@@ -507,4 +509,4 @@ def test_predict_quantiles_with_models_raises_on_missing_alpha():
     test_df = pd.DataFrame({"player_id": ["p1"], "position": ["WR"], "feat_a": [0.0]})
 
     with pytest.raises(KeyError):
-        predict_quantiles_with_models(test_df, models, {"WR": 0.0}, {"WR": 0.0}, feature_cols=["feat_a"])
+        predict_quantiles_with_models(test_df, models, {"WR": 0.0}, {"WR": 0.0}, feature_cols={"WR": ["feat_a"]})
