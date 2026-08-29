@@ -89,11 +89,18 @@ POSITIONS = ("QB", "RB", "WR", "TE")
 # add_opponent_strength_features's docstring.
 #
 # Unlike CONTEXT_OUTPUT_COLUMNS (see FEATURE_COLUMNS_BY_POSITION below),
-# this family is NOT position-differentiated -- Family 5B's own walk-
-# forward test already found a real WR/TE gain and a null-by-construction
-# QB / noise RB result (see PROJECT_CONTEXT.md's Family 5B findings), so
-# it stays in the shared base rather than needing its own per-position
-# split.
+# this family is NOT position-differentiated -- QB is null by
+# construction, and RB/WR/TE all show a real gain when measured against
+# the CURRENT (post-Context-Columns-split) baseline, re-confirmed against
+# the exact production data path (build_feature_table + DEFAULT_LEAGUE_ID,
+# not a notebook-cached intermediate -- see the WR Team Tendencies note
+# below for why that distinction mattered here): RB -0.049, WR -0.009,
+# TE -0.028. The original test found RB at +0.0008 (noise) -- that number
+# was measured against the OLD, pre-split baseline and is stale, not
+# wrong; see PROJECT_CONTEXT.md's Context Columns findings for why an
+# ablation result isn't a fixed property of a family. Stays in the shared
+# base rather than needing its own per-position split since all three
+# non-null positions clear the bar under the current baseline.
 FEATURE_COLUMNS = (
     list(ROLLING_OUTPUT_COLUMNS) + list(OPPONENT_STRENGTH_OUTPUT_COLUMNS)
 )
@@ -105,15 +112,41 @@ FEATURE_COLUMNS = (
 #
 # Team Tendencies (src/team_tendencies.py) -- walk-forward tested (same
 # eval_min_season window/methodology as every other feature family in
-# this pipeline; see PROJECT_CONTEXT.md's Team Tendencies findings for
-# the full table): a real, substantial MAE improvement for QB (-0.18),
-# noise for RB/WR (+0.004/+0.006), and a real DEGRADATION for TE (+0.024).
+# this pipeline). The ORIGINAL block-level test (see PROJECT_CONTEXT.md's
+# Team Tendencies findings) found a real QB improvement (-0.18), noise
+# for RB/WR (+0.004/+0.006), and a real TE degradation (+0.024).
+# Re-measured against the CURRENT baseline (after the Context Columns
+# split), split into its own four sub-metrics (PROE, pace, red-zone
+# split, target distribution), and confirmed against the exact
+# production data path (build_feature_table + DEFAULT_LEAGUE_ID, fresh --
+# see PROJECT_CONTEXT.md's Context Columns findings for the full table
+# and the WR false positive this distinction caught):
+#   - QB: unchanged in direction (-0.18 block); all four sub-metrics
+#     individually help, redundant with each other rather than additive.
+#   - RB: now a real DEGRADATION, not noise (+0.050 block, reproduced on
+#     the clean production path) -- driven mostly by target_distribution
+#     alone (+0.040); PROE/pace/red-zone split are each noise-range alone.
+#   - WR: LOOKED like a real improvement (-0.014 block) in a first pass,
+#     but that number was measured against a notebook-cached feature
+#     table that turned out to differ from the true production build. On
+#     a clean, single-build, apples-to-apples re-check against
+#     build_feature_table + DEFAULT_LEAGUE_ID, the delta was +0.0009 --
+#     noise, matching the ORIGINAL pre-split finding. WR does NOT get
+#     Team Tendencies. Caught before being retrained on, not after.
+#   - TE: the degradation is confirmed at the SUB-METRIC level on the
+#     clean production path too, not just the block -- all four
+#     sub-metrics hurt TE individually (target_distribution worst at
+#     +0.039, PROE +0.020, pace +0.010, red-zone split +0.008), so there
+#     is no beneficial subset to carve out. "Neither" is correct for a
+#     demonstrated reason, not just a block-level number.
 # A QB throws every pass his team throws, so team-wide pace/PROE gate QB
-# volume about as directly as a feature can; for RB/WR/TE, the player-
-# level rolling shares already in FEATURE_COLUMNS (target_share_ewm3 and
-# friends) already capture THAT PLAYER'S OWN slice of the team total, so
-# the team-wide aggregate is redundant at best and actively misleads the
-# model at TE specifically.
+# volume about as directly as a feature can -- that reasoning alone
+# doesn't explain RB's changed sign; see the methodological note in
+# PROJECT_CONTEXT.md's Context Columns findings (an ablation result is
+# conditional both on the rest of the model's feature set AND on which
+# build of the "same" feature table it was measured against -- verify
+# against the exact production path before trusting a number enough to
+# ship it).
 #
 # Game context (Family 5) -- CONTEXT_OUTPUT_COLUMNS split into
 # VEGAS_SCHEDULE_OUTPUT_COLUMNS and WEATHER_OUTPUT_COLUMNS (see
@@ -152,11 +185,25 @@ FEATURE_COLUMNS_BY_POSITION: dict[str, list[str]] = {
     ),
     "RB": list(FEATURE_COLUMNS) + list(VEGAS_SCHEDULE_OUTPUT_COLUMNS),
     # weather deliberately excluded for RB -- measured +0.015 MAE (real degradation), not just untested
+    # Team Tendencies also deliberately excluded for RB -- measured +0.050 MAE block-level degradation
+    # against the current baseline, reproduced on the exact production data path (not just a
+    # notebook-cached one -- see the WR note just below for why that check mattered) -- worse than the
+    # original pre-split +0.0038 "noise" reading, driven mostly by target_distribution alone (+0.040);
+    # PROE/pace/red-zone split are each noise-range alone
     "WR": list(FEATURE_COLUMNS) + list(WEATHER_OUTPUT_COLUMNS),
     # Vegas/schedule deliberately excluded for WR -- measured -0.005 MAE (noise, doesn't clear the bar)
+    # Team Tendencies ALSO deliberately excluded for WR -- a first pass measured -0.014 MAE (real
+    # improvement) and this was briefly added, but that number came from a notebook-cached feature
+    # table that differed from the true production build. Re-checked with a clean, single-build,
+    # same-run comparison against build_feature_table + DEFAULT_LEAGUE_ID (the exact path
+    # scripts/retrain.py uses): +0.0009 MAE -- noise, matching the ORIGINAL pre-split finding. Reverted
+    # before being retrained on. Don't re-add without re-verifying against the real production path,
+    # not a data/processed/ cache file -- see PROJECT_CONTEXT.md's Context Columns findings.
     "TE": list(FEATURE_COLUMNS),
     # both Vegas/schedule (+0.022) and weather (+0.028) deliberately excluded for TE -- both real degradations;
-    # TEAM_TENDENCY_OUTPUT_COLUMNS also excluded -- tested worse separately, see the Team Tendencies findings above
+    # TEAM_TENDENCY_OUTPUT_COLUMNS also excluded -- confirmed at the sub-metric level on the clean
+    # production path: PROE +0.020, pace +0.010, red-zone split +0.008, target_distribution +0.039 --
+    # every one hurts TE individually, so no subset helps either; "neither" is correct, not just untested
 }
 
 # The union across every position's own list -- for the ONE step that
