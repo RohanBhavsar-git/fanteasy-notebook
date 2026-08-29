@@ -189,6 +189,28 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > features are present but on which BUILD of the data it was measured
 > against, and every delta recorded anywhere in this document should be
 > read that way, not as permanent.
+> **QB xFP (Aug 2026) is also done** — the last gap in the metric set:
+> `xfp`/`fp_over_expected` were null for every QB row; `src/usage.py::
+> add_xfp_features` gained a QB-specific bucket-rate model over dropbacks
+> and designed rush attempts (kept as its own rate table, not pooled with
+> RB/WR/TE's target/carry one), scored with this league's real rules via
+> `compute_custom_score`. Split-half correlation (the check that
+> matters) shows a real, substantial drop from raw points (QB: 0.70 raw
+> vs. 0.37 `fp_over_expected`; RB/WR/TE pooled, reproduced fresh: 0.80 vs.
+> 0.19) — real, though a smaller relative drop than skill positions,
+> plausibly because QB accuracy skill persists more than a receiver's
+> catch variance does within the same bucket. Real 2025 spot-check
+> (Josh Allen +80.5, Cam Ward -58.5) matches known season narratives.
+> Fumble attribution needed a real fix beyond copying the existing
+> target/carry pattern — 41.5% of dropback-play fumbles belong to the
+> receiver, not the QB, verified directly. UI paths (`getXfpLeaders`,
+> Players table, Draft Prep) needed no logic changes at all, only
+> stale-comment fixes — they were already null-safe, not QB-filtered.
+> Deliberately read-only on the model side: `FEATURE_COLUMNS_BY_POSITION`
+> is untouched, no retrain. See **QB xFP findings** below for the full
+> bucket counts, the fumble-attribution fix, and two flagged-not-fixed
+> items (a pre-existing QB-scramble dilution of the RB/WR/TE carry rate
+> table, and Family 5B still not extended to QB).
 > See **Verification status** near the end before treating any pipeline
 > claim as settled.
 
@@ -940,6 +962,172 @@ No retrain was triggered by this round — the already-committed artifact
 already reflects this exact configuration, confirmed by the clean
 production-path numbers matching it exactly: QB 6.1738, RB 4.1519, WR
 3.9299, TE 3.0055.
+
+---
+
+## QB xFP findings (Aug 2026)
+
+The last real gap in the metric set: `xfp`/`fp_over_expected` were forced
+to null for every QB row (`src/usage.py::add_xfp_features`'s final line),
+since the original xFP model only ever covered targets and carries. Built
+now as a QB-specific bucket-rate model over dropbacks and designed rush
+attempts, reusing the exact same machinery (`_bucket_rate_table`,
+`_xfp_table_for_universe`) as RB/WR/TE's target/carry model, kept as a
+SEPARATE rate table rather than pooled with it — a QB dropback and a WR
+target aren't the same opportunity type, and a QB rush near the goal line
+scores at a materially different rate than an RB carry there.
+
+**Bucket design, counts reported before finalizing, same discipline as
+the original xFP work.** Full 2018-2025 pbp, restricted to real QB player
+ids (the raw pbp masks alone aren't QB-specific — `qb_scramble == 0`
+being true on an RB carry doesn't mean the rusher IS a QB; same reason
+`add_volume_features`'s own `designed_rush_attempts` has to be nulled for
+non-QB rows AFTER its merge rather than computed QB-only from the start):
+
+*Dropbacks* (`qb_dropback == 1`, excluding 2pt tries) split cleanly into
+three subtypes verified directly against real pbp — a real pass attempt
+(pass_attempt==1, sack==0; 144,045 plays), a sack (pass_attempt==1,
+sack==1; 10,244 plays, scores 0 unless the QB himself fumbles — sack
+YARDAGE LOST is never counted as passing_yards, matching the official
+stat), or a scramble (rush_attempt==1, qb_scramble==1; 7,441 plays, scores
+as a rush — passer_player_id is null on every one, verified 7,441/7,441,
+falls back to rusher_player_id). Bucketed by `TARGET_FIELD_POS_BINS`
+(inside_10 9,622 / 10-20 11,856 / 20-50 48,880 / beyond_50 89,887 plays —
+all comfortably large), with inside_10 alone further split by an
+"obvious passing down" flag (3rd/4th down, 7+ to go) — checked
+empirically, not assumed: mean points per dropback there are 1.49
+(standard) vs. 1.14 (obvious), a real ~0.35 gap at n=8,832/790, while the
+identical split inside the other three field-position bands moves the
+mean by at most ~0.03 (noise). Splitting everywhere the counts merely
+ALLOW it would have added sparsity for zero benefit outside the goal
+line, so only inside_10 gets it.
+
+*Designed rush attempts* (same mask as `designed_rush_attempts`
+elsewhere in this pipeline: `rush_attempt==1 & qb_scramble==0 &
+qb_kneel==0`, restricted to real QBs; 6,278 plays) bucketed by
+`CARRY_FIELD_POS_BINS` (finer near the goal, reused as-is). The
+"weighted toward the goal line" framing is a measured fact, not a
+description: mean points per QB rush go 0.23 (beyond_50) -> 0.33
+(20-50) -> 0.66 (10-20) -> 1.30 (5-10) -> 3.05 (inside_5) — a real,
+monotonic, 13x jump end to end, including between the two thinnest bands
+(5-10 at n=332, inside_5 at n=751) — merging those would blend two
+genuinely different rates, not tidy up a thin sample.
+
+**Fumble attribution needed a real fix, not a copy of the existing
+pattern.** `_target_play_frame`/`_carry_play_frame` safely attribute the
+play-level `fumble` flag to the row's own player, because a target/carry
+row's "owner" is almost always who fumbled. A dropback row's owner is the
+QB, but a completed-pass fumble is very often the RECEIVER's, not the
+QB's — verified directly: 1,097 of 2,641 real fumbles on dropback plays
+(41.5%) belong to the receiver after the catch. Blindly reusing the
+existing pattern would have double-charged the QB for fumbles already
+counted against the receiver's own bucket. Fixed by checking
+`fumbled_1_player_id`/`fumbled_2_player_id` against the QB's own id
+before counting a fumble at all — confirmed the gate isn't just
+theoretical caution: 1,321/1,326 sack fumbles and 100/100 scramble
+fumbles ARE the QB's own, so the fix changes real outcomes, not zero
+cases. Pick-six detection reuses `add_pick_six_column`'s exact
+`td_team == defteam` condition.
+
+**Split-half correlation — the check that matters, run for QB and
+reproduced fresh for RB/WR/TE** (the "0.22 vs. 0.73" figures once
+mentioned for the original xFP weren't found committed anywhere in this
+repo to verify against directly, so this reproduces the same test from
+scratch rather than trusting a recalled number). Methodology: within each
+player-season, split into odd/even weeks (not a strict first-half/
+second-half split, which would confound "regression to the mean" with a
+real in-season trend — a rookie improving, a late-season injury),
+require >=3 games in each half, Pearson-correlate each half's per-game
+average against the other:
+
+| | raw `custom_points` | `fp_over_expected` |
+|---|---|---|
+| QB (n=318 player-seasons) | 0.7033 | **0.3676** |
+| RB/WR/TE pooled (n=2,899-2,905) | 0.8048 | **0.1892** |
+| RB only (n=847-849) | 0.8213 | 0.1935 |
+| WR only (n=1,362-1,364) | 0.7783 | 0.1944 |
+| TE only (n=690-692) | 0.7658 | 0.1517 |
+
+QB's `fp_over_expected` correlation (0.37) is real and substantially
+lower than QB's own raw-points correlation (0.70, roughly half) — the
+metric passes the check as specified. It's also NOT as dramatically
+stripped as RB/WR/TE's (0.19 vs. 0.80, a much bigger relative drop) —
+plausibly real, not a bug: dropback buckets are necessarily coarser than
+target buckets (5 buckets vs. ~11), and a QB's own accuracy/decision-
+making skill is a bigger share of what determines the outcome within a
+bucket than a receiver's catch variance is within a target bucket — an
+accurate passer beating the league-average completion rate for a given
+down/distance/field-position situation is real, persistent skill, not
+noise, and this design doesn't (and isn't trying to) strip that out.
+Worth knowing, not a reason to doubt the metric — it still clears the
+bar the check sets.
+
+**Real 2025 season spot-check, characterized against real, known
+outcomes** (`scripts/archive_season.py 2025`, regenerated locally to
+confirm the REAL production pipeline, not just a scratch computation —
+matched a hand-computed check exactly: Josh Allen +80.49, Cam Ward
+-58.51, Geno Smith -43.37). Top positive: Josh Allen (+80.5), Drake Maye
+(+72.6), Matthew Stafford (+58.0), Jalen Hurts (+42.6), Lamar Jackson
+(+40.9) — all real, well-documented efficient/high-conversion 2025
+seasons. Bottom negative: Cam Ward (-58.5, the Titans' real rookie #1
+pick with a widely-reported rough, inefficient debut season), Geno Smith
+(-43.4, real reported decline after moving to Las Vegas), Joe Flacco
+(-32.7), Tua Tagovailoa (-23.5) — all real, characterizable down or
+struggling seasons. The extremes on both ends match real-world reputation
+plausibly, the same standard every other spot-check in this pipeline is
+held to.
+
+**UI paths were already unblocked by construction, not by a filter that
+needed removing.** Checked before changing anything: `getXfpLeaders()`,
+the Players table's `p.fpOverExp`, and Draft Prep's own column all read
+`fp_over_expected` unconditionally and drop a row only when the VALUE is
+null — there was never an explicit `position !== 'QB'` filter to remove,
+only comments and tooltips asserting "RB/WR/TE only; xFP has no passing
+counterpart for QBs," which were true when written and are false now.
+Updated those (both `index.html` and `src/export.py`'s comments) rather
+than touching any working logic. Verified live via Playwright against a
+locally-regenerated 2025 archive: the Dashboard's xFP Regression panel
+shows Josh Allen/Drake Maye/Cam Ward/Geno Smith mixed in naturally
+alongside Puka Nacua/Jahmyr Gibbs/Jerry Jeudy (not a separate QB
+section), the Players table shows 32 QB rows with real FP Over Exp
+values (not dashes), zero console errors.
+
+**Two things found and flagged, not fixed, in this pass:**
+- **A pre-existing imprecision in the ALREADY-SHIPPED RB/WR/TE xFP,
+  found incidentally while building this:** `_carry_play_frame`'s own
+  mask (`rush_attempt == 1`, not QB-gated) means a scrambling QB's
+  carries have always been pooled into the RB/WR/TE carry bucket RATE
+  TABLE too (previously invisible because the QB's own resulting xfp got
+  discarded by the null-forcing step this change removed). ~7,441
+  scrambles against a much larger multi-season RB/WR/TE carry
+  population — a real but likely small dilution, not chased down or
+  fixed here (fixing it would mean re-deriving the RB/WR/TE rate table
+  and re-validating their own already-shipped numbers, out of scope for
+  a QB-side addition).
+- **Family 5B (opponent strength) still doesn't cover QB.** Its own
+  out-of-scope comment used to say "no equivalent model exists for QB
+  passing production" — no longer true, but extending Family 5B to QB
+  needs its own defense-side aggregation of QB xfp allowed (bucketed the
+  way Family 5B already buckets RB/WR/TE), which hasn't been built. A
+  real, buildable follow-up now, not attempted in this pass.
+
+**Read-only on the model side, as asked.** `FEATURE_COLUMNS_BY_POSITION`
+in `src/model.py` is untouched — QB xfp/fp_over_expected (and their
+rolled `_ewm3`/`_s2d`/`_vol` variants, which now populate automatically
+for QB via the existing generic `ROLLING_SOURCE_COLUMNS` machinery, no
+code change needed there either) are NOT model features yet. Whether
+they'd help the QB point/floor/ceiling model is a separate, unmeasured
+question for a later pass. No retrain, no model artifact change.
+
+**Committed vs. not, as of this writing:** `src/usage.py` (the feature
+itself), `tests/test_no_leakage.py` (6 new correctness tests --
+sack-yardage exclusion, scramble routing, fumble attribution, pick-six
+detection, kneel/non-QB exclusion, QB-id filtering), `index.html`, and
+`src/export.py` (stale-comment fixes) are working-tree changes, not yet
+committed. `data/processed/weekly_features.parquet` was regenerated
+locally (gitignored, required for `scripts/archive_season.py` to see the
+new QB xfp) and `data/output/archive/2025.json` was regenerated locally
+to verify end-to-end — neither has been committed or pushed.
 
 ---
 
@@ -2832,6 +3020,7 @@ assumptions as facts.
 | Context Columns split (`VEGAS_SCHEDULE_OUTPUT_COLUMNS`/`WEATHER_OUTPUT_COLUMNS`, `src/usage.py`/`src/model.py`) is a real, position-differentiated improvement, not a re-labeling of the old block-level result | **Verified** — same walk-forward methodology as every other feature family in this pipeline (2024-2025 eval window, full 2018-2025 history). Splitting `CONTEXT_OUTPUT_COLUMNS` surfaced a real RB effect (−0.027 Vegas gain, +0.015 weather harm) the whole-block test had averaged into a false "noise" reading (−0.008); TE's block-level degradation held up unchanged when split (+0.022 Vegas, +0.028 weather, both real and same-direction). QB's proposed "Vegas + Team Tendencies, no weather" list was walk-forward-checked BEFORE being committed and found to regress the model by +0.073 MAE vs. the already-committed baseline (weather's solo effect is ~0, but its effect on top of Vegas+TT isn't) — QB keeps all three families instead, verified unchanged at 6.1738. Post-split re-verification against the real, wired `FEATURE_COLUMNS_BY_POSITION`: QB 6.1738 (exactly unchanged), RB 4.1519 (−0.019), WR 3.9299 (−0.009), TE 3.0055 (−0.008) — all four at or better than the pre-split committed baseline. `scripts/retrain.py`/`weekly_update.py`/`archive_season.py 2023/2024/2025` all re-run for real against the refreshed artifact; all 4 `validate_export` reports passed clean. See **Context Columns findings** for the full tables, the QB Vegas/Team-Tendencies redundancy factorial, and the methodological point about family-level ablations hiding opposite-signed sub-effects (flagged as untested at the sub-family level for Team Tendencies and Family 5B too). |
 | Team Tendencies and Family 5B sub-metric ablations (the two families flagged above as untested below the block level) don't change `FEATURE_COLUMNS_BY_POSITION`, and a real false-positive was caught before being retrained on | **Verified — and the verification process itself is the finding.** Same walk-forward methodology, both families split into their natural sub-metrics (Team Tendencies: PROE/pace/red-zone split/target distribution; Family 5B: unadjusted/schedule-adjusted). TE's Team Tendencies exclusion confirmed at the sub-metric level (all four hurt individually — no beneficial subset exists). A WR Team Tendencies candidate (−0.014, measured against a notebook-cached `data/processed/weekly_features.parquet` that had silently drifted from production — see the notebook-drift row below) was briefly implemented, then re-checked with a clean, single-build comparison against `build_feature_table(HISTORICAL_SEASONS, DEFAULT_LEAGUE_ID)` — the exact call `scripts/retrain.py` makes — and found to be +0.0009 (noise). Reverted before any retrain happened. RB's Family 5B and Team Tendencies sub-metric numbers were independently re-checked on the same clean path and reproduced within ±0.001 of their first measurement, confirming the WR case was an isolated data-source artifact, not a sign every number needed re-checking. Net: `FEATURE_COLUMNS_BY_POSITION` is unchanged from before this investigation; no retrain was triggered. See **Sub-Metric Ablation & the WR Data-Source Catch** for the full tables. |
 | `notebooks/03_usage_features.ipynb` matches `src/pipeline.py::build_feature_table`'s real production feature chain | **Verified — and was NOT true before this check.** The notebook's pipeline cell never got `add_team_tendency_features` added when Team Tendencies shipped; `data/processed/` being gitignored meant nothing caught it. Fixed (import + call added), re-run end to end (373 columns, exactly matching `build_feature_table`), and a static guard test added (`tests/test_pipeline.py::test_notebook_03_feature_chain_matches_build_feature_table`, regex-comparing `add_*_features` calls on both sides, no data dependency) so a future drift fails a test instead of silently producing an incomplete `weekly_features.parquet` again. This exact gap is what caused the WR false positive in the row above. |
+| QB xFP (`src/usage.py`'s dropback + designed-rush bucket model) is leakage-free, fumble/pick-six attribution is correct, and `fp_over_expected` behaves like a real luck signal for QB, not a re-labeled non-signal | **Verified** — 6 new white-box unit tests pass (`tests/test_no_leakage.py`: sack-yardage exclusion from passing_yards, scramble-yardage routing to rushing, fumble attribution to the QB not the receiver, pick-six detection's `td_team == defteam` gate, kneel/scramble/non-QB exclusion from the designed-rush population, QB-id filtering), plus the existing black-box future-truncation tests (`test_xfp_no_future_leakage`/`test_xfp_idempotent`) pass unchanged since they already exercised the full `weekly_scored` frame including QB rows. Split-half correlation (odd/even weeks within each player-season, >=3 games/half): QB raw `custom_points` r=0.7033 vs. `fp_over_expected` r=0.3676 (n=318) — a real, substantial drop, the metric passes the check. Reproduced the same test fresh for RB/WR/TE (pooled r=0.8048 raw vs. 0.1892 `fp_over_expected`, n=2,899-2,905) since the "0.22 vs. 0.73" figures once recalled for the original xFP weren't found committed anywhere to verify against directly. Real 2025 season spot-check via a locally-regenerated `scripts/archive_season.py 2025` (not a scratch computation) matches known outcomes: Josh Allen +80.5, Drake Maye +72.6, Matthew Stafford +58.0 at the positive extreme (real efficient/high-conversion 2025 seasons); Cam Ward −58.5, Geno Smith −43.4 at the negative extreme (real, widely-reported down seasons). Playwright-verified live: the Dashboard's xFP Regression panel and the Players table's FP Over Exp column both now show real QB values mixed naturally with RB/WR/TE (no separate QB section, no dashes), zero console errors. See **QB xFP findings** for the full bucket counts, the fumble-attribution fix, and what's flagged-not-fixed. |
 
 ## What's outstanding
 
@@ -2852,6 +3041,9 @@ assumptions as facts.
 - **Season archives beyond 2023-2025** — 2023, 2024, and 2025 are archived and in the selector; 2021 and 2022 were deliberately skipped (roster turnover makes them less useful for draft prep, not a technical limitation). `src/ingest.py::SEASON_LEAGUE_IDS` already has both their real league_ids, and `get_archive_candidates()` was verified against all 5 seasons before scoping down (see Phase 9 findings). Adding either later is `python scripts/archive_season.py <year>` plus one new entry in `index.html`'s `SEASON_OPTIONS` — no code changes needed, just a decision to do it.
 - **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
 - ~~The committed exports don't have Family 5B's `matchup`/`defense_rankings` keys yet.~~ **Done** — `scripts/weekly_update.py` and `scripts/archive_season.py 2025/2024/2023` were all re-run for real; the live export and all 3 archives now carry real `matchup`/`defense_rankings`/`weekly_matchup` data (the live export's is honestly empty since 2026 has zero games played yet). See **Family 5B findings**.
+- **QB xFP is not yet a model feature.** `add_xfp_features` now populates real `xfp`/`fp_over_expected` (and their rolled variants) for QB, but `FEATURE_COLUMNS_BY_POSITION` is untouched (deliberately read-only for this pass) — whether adding it helps the QB point/floor/ceiling model is a separate, unmeasured question. See **QB xFP findings**.
+- **Family 5B (opponent strength) still doesn't cover QB**, even though the QB xfp it would need to reuse now exists — extending it needs its own defense-side aggregation of QB xfp allowed, not attempted yet. See **QB xFP findings**.
+- **A pre-existing imprecision in RB/WR/TE's own xFP, found while building the QB version**: `_carry_play_frame`'s mask isn't QB-gated, so a scrambling QB's carries have always been pooled into the RB/WR/TE carry bucket RATE TABLE too (previously invisible — the QB's own resulting value was discarded by the null-forcing step that's now gone). Not chased down or fixed — see **QB xFP findings**.
 - **The committed model artifact (`models/fanteasy_model.joblib`) predates Family 5B** — it was trained before `FEATURE_COLUMNS` grew the four opponent-strength columns, so `weekly_update.py`'s actual point/floor/ceiling predictions are NOT yet using this feature as a model input (the artifact is self-describing and uses its own saved `feature_columns`, by design — see `predict_target_week_from_artifact`'s docstring). The `matchup`/`defense_rankings` export keys themselves are unaffected (built independently of the model artifact) and ARE real. `retrain.yml`'s next run will train against the new feature set automatically, no code change needed — not triggered this session (a real retrain wasn't requested).
 
 ---

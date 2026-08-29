@@ -81,11 +81,14 @@ Design note on spread_line's sign (add_context_features):
 Design note on xFP's rate table (add_xfp_features):
     See that function's own docstring for the full reasoning. Short
     version: the bucket rate for week N is an EXPANDING, GLOBAL average
-    over every target/carry strictly before week N -- crossing season
-    boundaries deliberately, since two seasons of pbp isn't enough to
-    reset the clock every September. QB xfp only covers rushing
-    opportunities, not passing -- QB fp_over_expected is not a
-    meaningful luck signal under this design.
+    over every target/carry (or, for QB, dropback/designed-rush) strictly
+    before week N -- crossing season boundaries deliberately, since two
+    seasons of pbp isn't enough to reset the clock every September. QB
+    xfp covers dropbacks (the full realized value of a dropback --
+    completion, incompletion, interception, sack, or scramble) and
+    designed rush attempts, using the exact same bucket-rate machinery as
+    RB/WR/TE's target/carry buckets, kept as a SEPARATE rate table (a
+    dropback and a WR target aren't the same opportunity type).
 
 Design note on the season boundary in rolling aggregates (add_rolling_features):
     See that function's own docstring for the full reasoning. Short
@@ -862,6 +865,29 @@ TARGET_FIELD_POS_LABELS = ["inside_10", "10-20", "20-50", "beyond_50"]
 CARRY_FIELD_POS_BINS = [-float("inf"), 5, 10, 20, 50, float("inf")]
 CARRY_FIELD_POS_LABELS = ["inside_5", "5-10", "10-20", "20-50", "beyond_50"]
 
+# QB dropback buckets reuse TARGET_FIELD_POS_BINS/LABELS exactly (same
+# boundaries -- a dropback's own field position compresses scoring value
+# the same way a target's does). The inside_10 band alone is further split
+# by an "obvious passing down" flag -- checked empirically against full
+# 2018-2025 play counts before deciding, not assumed: mean points per
+# dropback differ by ~0.35 between the two there (1.49 standard vs. 1.14
+# obvious, both well populated at n=8,832/790), while the identical split
+# inside the other three field-position bands moves the mean by at most
+# ~0.03 -- noise, not signal. Splitting everywhere the counts merely ALLOW
+# it would add bucket sparsity for zero benefit outside the goal line, so
+# this only splits where the rate itself demonstrably differs.
+QB_OBVIOUS_PASSING_DOWNS = (3, 4)
+QB_OBVIOUS_PASSING_DISTANCE = 7
+
+# QB designed-rush buckets reuse CARRY_FIELD_POS_BINS/LABELS exactly (finer
+# near the goal line than the dropback bins) -- verified this granularity
+# matters, not assumed: mean points per QB designed rush go 0.23
+# (beyond_50) -> 0.33 (20-50) -> 0.66 (10-20) -> 1.30 (5-10) -> 3.05
+# (inside_5), a real, monotonic, goal-line-driven jump at every step,
+# including between the two thinnest bands (5-10 at n=332, inside_5 at
+# n=751 across the full 2018-2025 history) -- merging those would blend
+# two genuinely different rates, not just tidy up a thin sample.
+
 # Merges decided from full 2024-2025 play counts (see the step-3 report --
 # every count and mean was printed before this decision, per the request
 # not to silently trust a thin bucket):
@@ -977,10 +1003,17 @@ def _scored_play_universe(pbp: pd.DataFrame, scoring_settings: dict) -> pd.DataF
     league's rules and labeled with its (merged) bucket. Long format:
     player_id, season, week, bucket, points -- one row per play.
 
-    This covers targets and carries only, not a QB's own pass attempts.
-    A QB's rushing opportunities are represented (their carries score
-    like anyone else's); their passing production has no xFP counterpart
-    at all under this design. See add_xfp_features's docstring.
+    This covers targets and carries only, not a QB's own passing
+    production or designed rushes -- see _qb_scored_play_universe for
+    the QB-specific analogue (a separate rate table, not pooled with this
+    one). NOTE: _carry_play_frame's own mask isn't QB-gated, so a QB
+    scramble (rush_attempt == 1) can still appear in THIS universe too --
+    add_xfp_features drops any QB player_id from this table's contribution
+    before merging, so it never competes with the QB-specific value below,
+    but the scramble play itself still contributes to the RB/WR/TE-wide
+    carry bucket RATE it's pooled into. Not fixed here (a pre-existing
+    imprecision, flagged not chased -- see PROJECT_CONTEXT.md's QB xFP
+    findings).
     """
     targets = _target_play_frame(pbp)
     targets["points"] = compute_custom_score(targets, scoring_settings, warn=False)
@@ -990,6 +1023,167 @@ def _scored_play_universe(pbp: pd.DataFrame, scoring_settings: dict) -> pd.DataF
 
     cols = ["player_id", "season", "week", "bucket", "points"]
     return pd.concat([targets[cols], carries[cols]], ignore_index=True)
+
+
+def _qb_player_ids(df: pd.DataFrame) -> set:
+    """
+    Distinct player_id values tagged QB anywhere in df. Needed to restrict
+    the pbp-derived dropback/designed-rush populations to real QBs: the
+    raw pbp masks alone are NOT QB-specific (qb_scramble is a QB-only
+    flag, but it being 0 on a row doesn't mean the rusher IS a QB -- it's
+    simply always 0 on a non-QB run too), the same reason
+    add_volume_features's own designed_rush_attempts column has to be
+    nulled for non-QB rows AFTER its merge rather than computed QB-only
+    from the start.
+    """
+    return set(df.loc[df["position"] == "QB", "player_id"].unique())
+
+
+def _dropback_play_frame(pbp: pd.DataFrame, qb_ids: set) -> pd.DataFrame:
+    """
+    One row per QB dropback (qb_dropback == 1), restricted to real QBs
+    and excluding two-point tries, with ONLY the stat columns
+    compute_custom_score needs to score that single play.
+
+    Covers every realized outcome of a dropback -- verified directly
+    against full 2018-2025 pbp, dropbacks split cleanly into exactly
+    three mutually-exclusive subtypes (plus a negligible 4-row anomaly):
+    a real pass attempt (completion, incompletion, or interception --
+    pass_attempt == 1, sack == 0), a sack (pass_attempt == 1, sack == 1,
+    scores 0 unless the QB himself fumbles), or a scramble (rush_attempt
+    == 1, qb_scramble == 1, scores as a rush -- attributed via
+    rusher_player_id, since passer_player_id is null on every scramble
+    row, verified 7,441/7,441). Sack YARDAGE LOST is never counted as
+    passing_yards -- the official stat excludes it, and pass_attempt == 1
+    fires on sack rows too (see this module's own Family 1 design note),
+    so passing_yards is explicitly gated to real-pass rows only.
+
+    Fumble attribution requires checking WHO fumbled
+    (fumbled_1_player_id/fumbled_2_player_id), not just the play-level
+    fumble flag: verified 1,097 of 2,641 real fumbles on dropback plays
+    (41.5%) belong to the RECEIVER after a completed catch, not the QB --
+    attributing the play-level flag blindly (as _target_play_frame/
+    _carry_play_frame already safely do, since a target/carry row's
+    "owner" IS almost always who fumbled) would incorrectly charge the
+    QB for fumbles already being counted against the receiver's own
+    bucket. 1,321/1,326 sack fumbles and 100/100 scramble fumbles ARE the
+    QB's own, confirming the gate isn't just theoretical caution.
+
+    Bucket: TARGET_FIELD_POS_BINS/LABELS on yardline_100, with inside_10
+    further split by QB_OBVIOUS_PASSING_DOWNS/DISTANCE -- see that
+    constant's own comment for why only inside_10 gets this split.
+    """
+    mask = (
+        (pbp["season_type"] == "REG") & (pbp["qb_dropback"] == 1)
+        & (pbp["two_point_attempt"] == 0)
+    )
+    src = pbp.loc[mask].copy()
+    src["qb_id"] = src["passer_player_id"].where(
+        src["passer_player_id"].notna(), src["rusher_player_id"]
+    )
+    src = src[src["qb_id"].isin(qb_ids)]
+
+    is_real_pass = (src["pass_attempt"] == 1) & (src["sack"] == 0)
+    is_scramble = src["qb_scramble"] == 1
+    qb_is_fumbler = (
+        (src["fumbled_1_player_id"] == src["qb_id"])
+        | (src["fumbled_2_player_id"] == src["qb_id"])
+    )
+    pick_six = (
+        (src["interception"] == 1) & (src["return_touchdown"] == 1)
+        & (src["td_team"] == src["defteam"])
+    )
+
+    field_pos_band = pd.cut(src["yardline_100"], TARGET_FIELD_POS_BINS,
+                             labels=TARGET_FIELD_POS_LABELS, right=True)
+    obvious = (
+        src["down"].isin(QB_OBVIOUS_PASSING_DOWNS)
+        & (src["ydstogo"] >= QB_OBVIOUS_PASSING_DISTANCE)
+    )
+    is_inside_10 = field_pos_band.astype(str) == "inside_10"
+    inside_10_split = obvious.map({True: "inside_10|obvious", False: "inside_10|standard"})
+    bucket = "dropback:" + field_pos_band.astype(str).where(~is_inside_10, inside_10_split)
+
+    return pd.DataFrame({
+        "player_id": src["qb_id"].to_numpy(),
+        "season": src["season"].to_numpy(),
+        "week": src["week"].to_numpy(),
+        "bucket": bucket.to_numpy(),
+        "passing_yards": src["yards_gained"].where(is_real_pass, 0.0).fillna(0).to_numpy(),
+        "passing_tds": src["pass_touchdown"].fillna(0).to_numpy(),
+        "passing_interceptions": src["interception"].fillna(0).to_numpy(),
+        "pass_int_tds": pick_six.astype(float).to_numpy(),
+        "rushing_yards": src["yards_gained"].where(is_scramble, 0.0).fillna(0).to_numpy(),
+        "rushing_tds": src["rush_touchdown"].where(is_scramble, 0.0).fillna(0).to_numpy(),
+        "fumbles_total": src["fumble"].where(qb_is_fumbler, 0.0).fillna(0).to_numpy(),
+        "fumbles_lost_total": src["fumble_lost"].where(qb_is_fumbler, 0.0).fillna(0).to_numpy(),
+    })
+
+
+def _qb_rush_play_frame(pbp: pd.DataFrame, qb_ids: set) -> pd.DataFrame:
+    """
+    One row per QB DESIGNED rush attempt -- same mask as
+    _qb_dropback_features's own designed_rush_attempts (rush_attempt ==
+    1, qb_scramble == 0, qb_kneel == 0), restricted to real QBs and
+    excluding two-point tries. A scramble is NOT a designed run (see
+    _dropback_play_frame, where it's bucketed instead) and a kneel is not
+    a real scoring opportunity at all -- same exclusions as elsewhere in
+    this pipeline.
+
+    Field-position bins reuse CARRY_FIELD_POS_BINS/LABELS -- see that
+    constant's own comment for the real, goal-line-driven rate jump that
+    justifies the finer resolution near the goal.
+    """
+    mask = (
+        (pbp["season_type"] == "REG") & (pbp["rush_attempt"] == 1)
+        & (pbp["qb_scramble"] == 0) & (pbp["qb_kneel"] == 0)
+        & pbp["rusher_player_id"].notna() & (pbp["two_point_attempt"] == 0)
+    )
+    src = pbp.loc[mask]
+    src = src[src["rusher_player_id"].isin(qb_ids)]
+
+    qb_is_fumbler = (
+        (src["fumbled_1_player_id"] == src["rusher_player_id"])
+        | (src["fumbled_2_player_id"] == src["rusher_player_id"])
+    )
+    field_pos_band = pd.cut(src["yardline_100"], CARRY_FIELD_POS_BINS,
+                             labels=CARRY_FIELD_POS_LABELS, right=True)
+
+    return pd.DataFrame({
+        "player_id": src["rusher_player_id"].to_numpy(),
+        "season": src["season"].to_numpy(),
+        "week": src["week"].to_numpy(),
+        "bucket": ("qb_rush:" + field_pos_band.astype(str)).to_numpy(),
+        "rushing_yards": src["yards_gained"].fillna(0).to_numpy(),
+        "rushing_tds": src["rush_touchdown"].fillna(0).to_numpy(),
+        "fumbles_total": src["fumble"].where(qb_is_fumbler, 0.0).fillna(0).to_numpy(),
+        "fumbles_lost_total": src["fumble_lost"].where(qb_is_fumbler, 0.0).fillna(0).to_numpy(),
+    })
+
+
+def _qb_scored_play_universe(df: pd.DataFrame, pbp: pd.DataFrame, scoring_settings: dict) -> pd.DataFrame:
+    """
+    Every real QB dropback and designed rush attempt, scored per-play with
+    this league's rules and labeled with its bucket. Long format:
+    player_id, season, week, bucket, points -- the QB-only analogue of
+    _scored_play_universe, kept as a SEPARATE rate table rather than
+    pooled with the RB/WR/TE target/carry universe: a QB dropback and a
+    WR target aren't the same opportunity type, and a QB rush near the
+    goal line scores at a materially different rate than an RB carry
+    there (see QB_OBVIOUS_PASSING_DOWNS/CARRY_FIELD_POS_BINS's own
+    comments) -- blending them would let one leak into (and dilute) the
+    other's rate.
+    """
+    qb_ids = _qb_player_ids(df)
+
+    dropbacks = _dropback_play_frame(pbp, qb_ids)
+    dropbacks["points"] = compute_custom_score(dropbacks, scoring_settings, warn=False)
+
+    rushes = _qb_rush_play_frame(pbp, qb_ids)
+    rushes["points"] = compute_custom_score(rushes, scoring_settings, warn=False)
+
+    cols = ["player_id", "season", "week", "bucket", "points"]
+    return pd.concat([dropbacks[cols], rushes[cols]], ignore_index=True)
 
 
 def _bucket_rate_table(plays: pd.DataFrame, season: int, week: int) -> pd.Series:
@@ -1007,33 +1201,67 @@ def _bucket_rate_table(plays: pd.DataFrame, season: int, week: int) -> pd.Series
     return before.groupby("bucket")["points"].mean()
 
 
+def _xfp_table_for_universe(plays: pd.DataFrame, cutoffs: list) -> pd.DataFrame:
+    """
+    Shared expanding-window, point-in-time-safe xfp computation over any
+    long-format (player_id, season, week, bucket, points) play universe --
+    factored out so the skill-position (target+carry) and QB (dropback+
+    designed-rush) universes can each run through the identical mechanism
+    without duplicating it. See add_xfp_features's own docstring for the
+    full point-in-time reasoning; this is the per-week loop body that used
+    to live inline there.
+    """
+    xfp_parts = []
+    for season, week in cutoffs:
+        this_week = plays[(plays["season"] == season) & (plays["week"] == week)]
+        if this_week.empty:
+            continue
+        rate_table = _bucket_rate_table(plays, season, week)
+        rates = this_week["bucket"].map(rate_table)
+        grouped = rates.groupby(this_week["player_id"])
+        total = grouped.sum(min_count=1)
+        any_null = grouped.apply(lambda s: s.isna().any())
+        total = total.where(~any_null)
+        part = total.reset_index(name="xfp")
+        part["season"] = season
+        part["week"] = week
+        xfp_parts.append(part)
+
+    if not xfp_parts:
+        return pd.DataFrame(columns=["player_id", "season", "week", "xfp"])
+    return pd.concat(xfp_parts, ignore_index=True)
+
+
 def add_xfp_features(
     df: pd.DataFrame, pbp: pd.DataFrame, scoring_settings: dict
 ) -> pd.DataFrame:
     """
     Add xfp (expected fantasy points from opportunity alone) and
-    fp_over_expected = custom_points - xfp.
+    fp_over_expected = custom_points - xfp, for every position including
+    QB.
 
-    For each player-week, xfp sums the bucket rate for every target and
-    carry the player actually had that week, where each bucket's rate is
-    the league-average points per play in that bucket computed from
-    every play STRICTLY BEFORE that week (see _bucket_rate_table) --
+    For each RB/WR/TE player-week, xfp sums the bucket rate for every
+    target and carry the player actually had that week. For each QB
+    player-week, xfp sums the bucket rate for every dropback and
+    designed rush attempt they actually had -- the same bucket-rate
+    mechanism, applied to the play types Family 1 (step 3) originally
+    skipped (see _qb_scored_play_universe). Either way, each bucket's
+    rate is the league-average points per play in that bucket computed
+    from every play STRICTLY BEFORE that week (see _bucket_rate_table) --
     an expanding, point-in-time-safe window that crosses season
     boundaries (unlike the in-season-only rule for Family 6's rolling
     aggregates -- see the point-in-time note below).
 
-    IMPORTANT SCOPE GAP: this covers targets and carries only, per the
-    spec's Family 1(step 3) bucket list -- there is no bucket for a QB's
-    own pass attempts. A QB's xfp would only reflect their rushing
-    opportunities; their (much larger) passing production has no
-    counterpart in xfp at all, so QB fp_over_expected would read as
-    strongly "positive" for essentially every passing QB regardless of
-    luck -- not a real signal, an artifact of what wasn't modeled. Rather
-    than ship a column that looks like a luck metric but isn't, xfp and
-    fp_over_expected are explicitly forced to null for QB rows below.
-    This must never reach a dashboard panel as if it meant something for
-    QBs -- fix by adding a passing-yardage bucket family, not by
-    interpreting the null as "no opinion."
+    The two rate tables (skill-position and QB) are computed and applied
+    completely separately, then concatenated before the single merge onto
+    df -- a QB dropback and a WR target are different opportunity types
+    and must not share a bucket-rate estimate (see
+    _qb_scored_play_universe's own comment). Any QB player_id is
+    explicitly dropped from the skill-position table's contribution
+    first: _carry_play_frame's own mask isn't QB-gated (a QB scramble is
+    still `rush_attempt == 1`), so a scrambling QB could otherwise pick up
+    a partial, WRONG xfp here (their scrambles alone, via the RB/WR/TE
+    carry rate) that would compete with their real, complete QB xfp below.
 
     Point-in-time note: the rate table is expanding and GLOBAL, not
     reset at each season boundary. Week 1 of 2025 draws on the entirety
@@ -1060,16 +1288,15 @@ def add_xfp_features(
 
     Returns:
         Copy of df with XFP_OUTPUT_COLUMNS added.
-        xfp and fp_over_expected are null for every QB row -- see the
-        SCOPE GAP note above. Not "unknown", deliberately not modeled.
-        xfp is 0 (not null) for an RB/WR/TE player-week with zero
-        qualifying plays (zero targets and zero non-kneel carries) -- a
-        known value, since summing zero opportunities is trivially zero
-        regardless of whether any rate table exists yet.
-        xfp is null when the player had at least one target/carry that
+        xfp is 0 (not null) for a player-week with zero qualifying plays
+        (zero targets/carries for RB/WR/TE, zero dropbacks/designed
+        rushes for QB) -- a known value, since summing zero opportunities
+        is trivially zero regardless of whether any rate table exists
+        yet.
+        xfp is null when the player had at least one qualifying play that
         week but at least one of those plays fell in a bucket with NO
         historical plays before that week -- most common in the first
-        few weeks of 2024, before the rarer merged buckets have
+        few weeks of 2018, before the rarer merged buckets have
         accumulated data. A single unresolvable play nulls the whole
         week rather than silently under-counting it (no fake data).
     """
@@ -1079,49 +1306,30 @@ def add_xfp_features(
         raise KeyError(f"add_xfp_features: df is missing columns {missing}")
 
     out = df.drop(columns=[c for c in XFP_OUTPUT_COLUMNS if c in df.columns])
-
-    plays = _scored_play_universe(pbp, scoring_settings)
-
     cutoffs = sorted(set(zip(out["season"], out["week"])))
-    xfp_parts = []
-    for season, week in cutoffs:
-        this_week = plays[(plays["season"] == season) & (plays["week"] == week)]
-        if this_week.empty:
-            continue
-        rate_table = _bucket_rate_table(plays, season, week)
-        rates = this_week["bucket"].map(rate_table)
-        grouped = rates.groupby(this_week["player_id"])
-        total = grouped.sum(min_count=1)
-        any_null = grouped.apply(lambda s: s.isna().any())
-        total = total.where(~any_null)
-        part = total.reset_index(name="xfp")
-        part["season"] = season
-        part["week"] = week
-        xfp_parts.append(part)
 
-    xfp_table = (
-        pd.concat(xfp_parts, ignore_index=True) if xfp_parts
-        else pd.DataFrame(columns=["player_id", "season", "week", "xfp"])
-    )
+    skill_plays = _scored_play_universe(pbp, scoring_settings)
+    qb_plays = _qb_scored_play_universe(out, pbp, scoring_settings)
+    qb_ids = _qb_player_ids(out)
 
+    skill_xfp = _xfp_table_for_universe(skill_plays, cutoffs)
+    skill_xfp = skill_xfp[~skill_xfp["player_id"].isin(qb_ids)]
+    qb_xfp = _xfp_table_for_universe(qb_plays, cutoffs)
+
+    xfp_table = pd.concat([skill_xfp, qb_xfp], ignore_index=True)
     out = out.merge(xfp_table, on=["player_id", "season", "week"], how="left")
 
+    all_play_keys = (
+        set(zip(skill_plays["player_id"], skill_plays["season"], skill_plays["week"]))
+        | set(zip(qb_plays["player_id"], qb_plays["season"], qb_plays["week"]))
+    )
     had_any_play = pd.Series(
         list(zip(out["player_id"], out["season"], out["week"]))
-    ).isin(set(zip(plays["player_id"], plays["season"], plays["week"])))
+    ).isin(all_play_keys)
     zero_opportunity = (~had_any_play.to_numpy()) & out["xfp"].isna()
     out.loc[zero_opportunity, "xfp"] = 0.0
 
     out["fp_over_expected"] = out["custom_points"] - out["xfp"]
-
-    # xFP covers targets and carries only -- a QB's passing production
-    # (the bulk of their real points) has no bucket and no counterpart
-    # here. Leaving xfp/fp_over_expected computed for QB rows would show
-    # every passing QB as wildly "over expected", which isn't a luck
-    # signal, it's just points that were never modeled. Null them
-    # outright rather than let a QB row masquerade as a real estimate --
-    # this must never reach a dashboard panel as if it meant something.
-    out.loc[out["position"] == "QB", ["xfp", "fp_over_expected"]] = pd.NA
 
     return out
 
@@ -1132,17 +1340,14 @@ def add_xfp_features(
 # PHASE_2B_6_SPEC.md's Family 5 named this and deferred it: "Opponent
 # defensive strength by position, computed on prior weeks only -- fantasy
 # points allowed to RB/WR/TE, opponent-adjusted if practical." QB is out of
-# scope here for the SAME reason it's out of scope for xFP itself (see
-# add_xfp_features's docstring): xFP only has a bucket-rate model for
-# targets and carries, built entirely from the receiver's/rusher's own
-# expected value -- there is no equivalent model for a QB's passing
-# production (yards/TDs, a completely different scoring path), so "how many
-# xFP does this defense allow to opposing QBs" has no honest answer under
-# this design. Fixing that means a second, independent expected-passing-
-# points model (bucketed by down/distance/field position the way targets
-# and carries are), not an extension of this one -- out of scope here, not
-# silently skipped: no QB column below is ever populated, the same
-# disclosed-gap pattern xfp/fp_over_expected already use for QB rows.
+# scope here -- NOT for the reason xFP itself once was (xFP now has a real
+# QB bucket-rate model too, see _qb_scored_play_universe/add_xfp_features),
+# but because extending THIS metric to QB would need its own defense-side
+# aggregation of QB xfp allowed (bucketed by down/distance/field position
+# the way dropbacks/designed rushes are), which hasn't been built. That's a
+# real, buildable follow-up now that the QB xfp it would reuse exists --
+# out of scope for this pass, not silently skipped: no QB column below is
+# ever populated, disclosed rather than hidden.
 #
 # The metric: for each defense, in each week, the xFP (NOT raw actual
 # points) that the OPPOSING team's RB/WR/TE group generated that week.
@@ -1679,9 +1884,10 @@ def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
         (heaviest in week 1 of each season, by construction), wherever
         the underlying source column is itself null for that position
         (e.g. dropbacks_ewm3 is null for every RB/WR/TE row, same as
-        dropbacks itself; xfp_ewm3 is null for every QB row), or -- for
-        prev_season_* only -- wherever the player has no row at all in
-        the immediately prior season.
+        dropbacks itself -- xfp_ewm3 is NOT in this category any more,
+        now that add_xfp_features populates real xfp for QB rows too), or
+        -- for prev_season_* only -- wherever the player has no row at
+        all in the immediately prior season.
     """
     required = ["player_id", "season", "week", "offense_pct"] + ROLLING_SOURCE_COLUMNS
     missing = [c for c in required if c not in df.columns]

@@ -176,9 +176,9 @@ MONTE_CARLO_CALIBRATION_CAVEAT = (
 # it -- unlike a single usage-share's volatility, xFP already blends
 # targets, carries, and field position into one points-scale number, so
 # its volatility reads as "swings in scoring OPPORTUNITY" rather than one
-# narrow usage metric. Null for QB by construction (xfp has no passing
-# counterpart, see add_xfp_features's docstring) -- same disclosed gap
-# already true of every other xFP-derived field in this export.
+# narrow usage metric. Populates for QB too now that add_xfp_features has
+# a QB dropback/designed-rush bucket model (see PROJECT_CONTEXT.md's QB
+# xFP findings) -- null just means thin history, not a QB-only gap.
 USAGE_EXPORT_COLUMNS = [
     "target_share_ewm3", "touch_share_ewm3", "offense_pct_ewm3",
     "snap_share_delta_3wk", "rz_target_share_ewm3", "rz_carry_share_ewm3",
@@ -1280,10 +1280,10 @@ def build_weekly_xfp(historical_features: pd.DataFrame, target_season: int) -> p
     shows ONE season's bars at a time, and a stray prior-season week
     would just be dead data the chart never reads.
 
-    Rows with a null xfp (QB, always -- xfp has no passing counterpart;
-    or any other player-week xfp itself came back null for) are dropped
-    here, not zero-filled, matching every other null-means-absent
-    convention in this export.
+    Rows with a null xfp (thin bucket history -- see add_xfp_features's
+    own docstring for when that happens) are dropped here, not
+    zero-filled, matching every other null-means-absent convention in
+    this export.
 
     Returns: player_id, week, xfp -- one row per (player, played week).
     Can be empty (e.g. the target season has no games played yet).

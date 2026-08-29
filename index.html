@@ -3337,12 +3337,14 @@
     return { risers, fallers };
   }
 
-  // Season-long xFP luck leaderboard. RB/WR/TE only by construction -- xfp
-  // has no counterpart for QB passing production (see PROJECT_CONTEXT.md's
-  // design decisions), so every QB row's fp_over_expected is already null
-  // and drops out of `rows` on its own, with no explicit position filter
-  // needed here. fp_over_expected > 0 means scoring ABOVE what opportunity
-  // alone implies -- a luck indicator, not a prediction.
+  // Season-long xFP luck leaderboard. Covers QB now too (src/usage.py's
+  // add_xfp_features gained a dropback + designed-rush bucket model for
+  // QB -- see PROJECT_CONTEXT.md's QB xFP findings), not just RB/WR/TE.
+  // Still no explicit position filter needed here -- a player only drops
+  // out of `rows` if fp_over_expected itself is null (an early-history
+  // bucket-coverage gap, not a position gap). fp_over_expected > 0 means
+  // scoring ABOVE what opportunity alone implies -- a luck indicator, not
+  // a prediction.
   function getXfpLeaders(limit) {
     const players = state.advancedStats?.players;
     if (!players) return { positive: [], negative: [] };
@@ -3493,7 +3495,7 @@
       <div class="panel">
         <div class="panel-header">
           <div class="panel-title">xFP Regression</div>
-          <div class="panel-note">Luck indicator, not a prediction · RB/WR/TE only</div>
+          <div class="panel-note">Luck indicator, not a prediction</div>
         </div>
         ${body}
       </div>
@@ -6135,10 +6137,11 @@
       // export, not tied to the selected proj week -- read unconditionally,
       // same as the Dashboard's Usage Trending/xFP Regression panels
       // (see their own comments for why no getMyProj-style week gate
-      // applies here). fp_over_expected/xfp_vol are already null for QB
-      // straight from the export (xFP has no passing counterpart -- see
-      // src/usage.py::add_xfp_features), so no position check is needed
-      // here to get the "dash for QBs" behavior; it falls out for free.
+      // applies here). fp_over_expected/xfp_vol now populate for QB too
+      // (src/usage.py::add_xfp_features gained a QB dropback + designed-
+      // rush bucket model -- see PROJECT_CONTEXT.md's QB xFP findings);
+      // no position check is needed here either way -- null only means
+      // "not enough bucket history yet", not "wrong position".
       const advanced = getAdvancedPlayer(p.player_id);
       const trendHeadline = getPlayerTrendHeadline(advanced?.trend);
       p.trendSignal = trendHeadline?.signal ?? null;
@@ -6180,8 +6183,8 @@
     const xfpSeasonMismatch = xfpSeason != null && season != null && Number(xfpSeason) !== Number(season);
     const fpOverExpLabel = xfpSeasonMismatch ? `FP Over Exp (${xfpSeason})` : 'FP Over Exp';
     const fpOverExpTooltip = xfpSeasonMismatch
-      ? `${xfpSeason} season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection. Showing ${xfpSeason} because ${season} has no games played yet. RB/WR/TE only; xFP has no passing counterpart for QBs.`
-      : `Season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection. RB/WR/TE only; xFP has no passing counterpart for QBs.`;
+      ? `${xfpSeason} season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection. Showing ${xfpSeason} because ${season} has no games played yet.`
+      : `Season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection.`;
 
     const teamOptions = ['ALL', ...NFL_TEAMS].sort();
     const totalRostered = state.players.filter(p => p.ownerRosterId).length;
@@ -6293,7 +6296,7 @@
               <th class="right" data-sort="myProj" title="${myProjTooltip()}">My Proj (Wk ${playerWeek}, experimental) ${f.sortBy === 'myProj' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th class="right" data-sort="trendSignal" title="This player's single biggest usage-share signal this season (target/carry/snap share vs. their own baseline) — a directional read, not a prediction. Season-level, independent of the projection week above.">Trend ${f.sortBy === 'trendSignal' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th class="right" data-sort="fpOverExp" title="${fpOverExpTooltip}">${fpOverExpLabel} ${f.sortBy === 'fpOverExp' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
-              <th class="right" data-sort="volatility" title="Week-to-week swing in this player's expected points (xFP) this season, in points — not a quality rating. RB/WR/TE only; xFP has no passing counterpart for QBs.">Volatility ${f.sortBy === 'volatility' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th class="right" data-sort="volatility" title="Week-to-week swing in this player's expected points (xFP) this season, in points — not a quality rating.">Volatility ${f.sortBy === 'volatility' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
               <th>Status</th>
             </tr>
           </thead>
@@ -6549,8 +6552,9 @@
     // (see src/export.py's USAGE_EXPORT_COLUMNS comment for why xfp_vol and
     // not a raw usage-share volatility). Shown as a plain points figure,
     // not normalized into a 0-100 "score" -- the raw number IS the label.
-    // Null for QB by construction (xfp has no passing counterpart) and for
-    // anyone without enough season-to-date games yet.
+    // Populates for QB now too (add_xfp_features gained a QB bucket model
+    // -- see PROJECT_CONTEXT.md's QB xFP findings); null just means not
+    // enough season-to-date games or bucket history yet, any position.
     const volatility = getAdvancedPlayer(p.player_id)?.usage?.xfp_vol;
     const volatilityCard = volatility != null
       ? `<div class="injury-stat-value">${volatility.toFixed(1)}</div><div class="injury-stat-sub">pts, week-to-week swing</div>`
@@ -7666,8 +7670,9 @@
     rows.sort((a, b) => {
       let valA = a[f.sortBy], valB = b[f.sortBy];
       // Nulls sort to the bottom regardless of direction (same convention
-      // as the Players table -- QB is a common, expected case for
-      // FP Over Exp/Volatility here, not a rare edge case).
+      // as the Players table). FP Over Exp/Volatility now populate for
+      // QB too (see PROJECT_CONTEXT.md's QB xFP findings) -- a null here
+      // just means thin bucket/game history, not a QB-shaped gap.
       if (valA == null && valB == null) return 0;
       if (valA == null) return 1;
       if (valB == null) return -1;
@@ -7724,8 +7729,8 @@
             <tr>
               <th data-sort="name" class="${f.sortBy === 'name' ? 'sorted' : ''}">Player ${sortArrow('name')}</th>
               <th class="right" data-sort="seasonPts" title="Real total fantasy points scored in the ${season} season, and games played -- grounding context for every column here.">Season Pts ${sortArrow('seasonPts')}</th>
-              <th class="right" data-sort="fpOverExp" title="${season} points scored above what this player's opportunity (targets, carries, field position) implied. Positive = scored more than their usage predicted — a fade candidate. Negative = scored less — a buy-low candidate. A luck indicator, not a rating. RB/WR/TE only; xFP has no passing counterpart for QBs.">FP Over Exp ${sortArrow('fpOverExp')}</th>
-              <th class="right" data-sort="volatility" title="Week-to-week swing in this player's expected points (xFP) during the ${season} season, in points. Lower = steadier floor player; higher = boom-or-bust ceiling player. RB/WR/TE only; xFP has no passing counterpart for QBs.">Volatility ${sortArrow('volatility')}</th>
+              <th class="right" data-sort="fpOverExp" title="${season} points scored above what this player's opportunity (targets/carries/field position for RB/WR/TE, dropbacks/designed rushes for QB) implied. Positive = scored more than their usage predicted — a fade candidate. Negative = scored less — a buy-low candidate. A luck indicator, not a rating.">FP Over Exp ${sortArrow('fpOverExp')}</th>
+              <th class="right" data-sort="volatility" title="Week-to-week swing in this player's expected points (xFP) during the ${season} season, in points. Lower = steadier floor player; higher = boom-or-bust ceiling player.">Volatility ${sortArrow('volatility')}</th>
               <th class="right" data-sort="volumePct" title="Percentile rank among startable players at this position for the ${season} season's volume metric (Pass/Touch/Target Volume, by position — see the label under each value). A rank, not a rating.">Volume ${sortArrow('volumePct')}</th>
               <th class="right" data-sort="efficiencyPct" title="Percentile rank among startable players at this position for the ${season} season's efficiency metric (EPA/Dropback, Yards/Carry, or YAC/Reception, by position — see the label under each value). A rank, not a rating.">Efficiency ${sortArrow('efficiencyPct')}</th>
               <th class="right" data-sort="trendSignal" title="This player's single biggest usage-share signal (target/carry/snap share vs. their own baseline) over the final games of the ${season} season -- who was ascending or fading heading into the offseason. A directional read, not a prediction.">End-of-Season Trend ${sortArrow('trendSignal')}</th>

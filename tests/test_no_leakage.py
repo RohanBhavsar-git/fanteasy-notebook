@@ -63,6 +63,9 @@ from src.usage import (  # noqa: E402
     add_xfp_features,
     build_defense_strength_table,
     _bucket_rate_table,
+    _dropback_play_frame,
+    _qb_player_ids,
+    _qb_rush_play_frame,
     _team_week_opponent,
 )
 
@@ -323,6 +326,129 @@ def test_xfp_idempotent(weekly_scored, pbp, scoring_settings):
     once = add_xfp_features(weekly_scored, pbp, scoring_settings)
     twice = add_xfp_features(once, pbp, scoring_settings)
     pd.testing.assert_frame_equal(once, twice)
+
+
+# ==========================================================================
+# QB xFP -- correctness tests the black-box future-truncation pattern above
+# can't catch (these are routing/attribution bugs, not leakage bugs), using
+# small synthetic pbp rows rather than real cached data for precise control.
+# ==========================================================================
+def _play(**overrides) -> dict:
+    """One synthetic pbp row with safe, inert defaults -- every field a
+    caller doesn't override is a real column name _dropback_play_frame/
+    _qb_rush_play_frame actually reads, set to a value that contributes
+    nothing to any bucket/stat unless a test deliberately changes it."""
+    base = dict(
+        season_type="REG", season=2024, week=3,
+        qb_dropback=0, two_point_attempt=0,
+        passer_player_id=None, rusher_player_id=None,
+        pass_attempt=0, sack=0, qb_scramble=0, qb_kneel=0, rush_attempt=0,
+        fumbled_1_player_id=None, fumbled_2_player_id=None,
+        interception=0, return_touchdown=0, td_team=None, defteam="OPP",
+        yardline_100=50, down=1, ydstogo=10,
+        yards_gained=0, pass_touchdown=0, rush_touchdown=0,
+        fumble=0, fumble_lost=0,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_dropback_play_frame_excludes_sack_yardage_from_passing_yards():
+    """
+    pass_attempt == 1 fires on sack rows too (this module's own Family 1
+    design note) -- a sack's negative yards_gained (yardage LOST) must
+    never be counted as passing_yards, since the official passing_yards
+    stat excludes it.
+    """
+    pbp = pd.DataFrame([
+        _play(qb_dropback=1, passer_player_id="QB1", pass_attempt=1, sack=1, yards_gained=-7),
+    ])
+    frame = _dropback_play_frame(pbp, qb_ids={"QB1"})
+    assert frame.loc[0, "passing_yards"] == 0.0
+
+
+def test_dropback_play_frame_routes_scramble_yards_to_rushing_not_passing():
+    """
+    A scramble (qb_dropback == 1, rush_attempt == 1, qb_scramble == 1) has
+    a null passer_player_id -- attribution must fall back to
+    rusher_player_id -- and its yardage is a RUSH, not a pass.
+    """
+    pbp = pd.DataFrame([
+        _play(qb_dropback=1, passer_player_id=None, rusher_player_id="QB1",
+              rush_attempt=1, qb_scramble=1, yards_gained=15, rush_touchdown=1),
+    ])
+    frame = _dropback_play_frame(pbp, qb_ids={"QB1"})
+    assert frame.loc[0, "player_id"] == "QB1"
+    assert frame.loc[0, "passing_yards"] == 0.0
+    assert frame.loc[0, "rushing_yards"] == 15.0
+    assert frame.loc[0, "rushing_tds"] == 1.0
+
+
+def test_dropback_play_frame_attributes_fumble_to_qb_not_receiver():
+    """
+    A real, measured risk (41.5% of dropback-play fumbles belong to the
+    RECEIVER after a completed catch, not the QB -- see
+    _dropback_play_frame's own docstring): the play-level fumble flag must
+    only count toward the QB's own bucket when the QB himself is the
+    identified fumbler (fumbled_1_player_id/fumbled_2_player_id), not
+    whenever fumble == 1 on the play.
+    """
+    pbp = pd.DataFrame([
+        # completed pass, RECEIVER fumbles -- must NOT charge the QB
+        _play(qb_dropback=1, passer_player_id="QB1", pass_attempt=1,
+              yards_gained=8, fumble=1, fumble_lost=1, fumbled_1_player_id="WR1"),
+        # sack, QB himself fumbles -- must charge the QB
+        _play(qb_dropback=1, passer_player_id="QB1", pass_attempt=1, sack=1,
+              yards_gained=-5, fumble=1, fumble_lost=1, fumbled_1_player_id="QB1"),
+    ])
+    frame = _dropback_play_frame(pbp, qb_ids={"QB1"})
+    assert list(frame["fumbles_total"]) == [0.0, 1.0]
+    assert list(frame["fumbles_lost_total"]) == [0.0, 1.0]
+
+
+def test_dropback_play_frame_detects_pick_six_only_when_defense_actually_scores():
+    """
+    Same td_team == defteam condition add_pick_six_column uses -- an
+    interception return fumbled back into the offense's own end zone
+    (interception == 1, return_touchdown == 1, but td_team is the
+    OFFENSE) must not be scored as a pick-six against the QB.
+    """
+    pbp = pd.DataFrame([
+        _play(qb_dropback=1, passer_player_id="QB1", pass_attempt=1,
+              interception=1, return_touchdown=1, td_team="OPP", defteam="OPP"),
+        _play(qb_dropback=1, passer_player_id="QB1", pass_attempt=1,
+              interception=1, return_touchdown=1, td_team="OFF", defteam="OPP"),
+    ])
+    frame = _dropback_play_frame(pbp, qb_ids={"QB1"})
+    assert list(frame["pass_int_tds"]) == [1.0, 0.0]
+
+
+def test_qb_rush_play_frame_excludes_kneels_scrambles_and_non_qb_rushers():
+    """
+    Same designed_rush_attempts mask as _qb_dropback_features (kneel and
+    scramble excluded), PLUS restricted to real QB ids -- the raw pbp mask
+    alone (rush_attempt == 1, qb_scramble == 0, qb_kneel == 0) matches any
+    non-QB rusher too (qb_scramble is simply always 0 on an RB carry, it
+    doesn't mean the rusher IS a QB).
+    """
+    pbp = pd.DataFrame([
+        _play(rush_attempt=1, qb_kneel=1, rusher_player_id="QB1", yardline_100=40),  # kneel -- excluded
+        _play(rush_attempt=1, qb_scramble=1, rusher_player_id="QB1", yardline_100=40),  # scramble -- excluded here
+        _play(rush_attempt=1, rusher_player_id="QB1", yardline_100=3, yards_gained=3, rush_touchdown=1),  # real designed run
+        _play(rush_attempt=1, rusher_player_id="RB1", yardline_100=3, yards_gained=3, rush_touchdown=1),  # non-QB -- excluded
+    ])
+    frame = _qb_rush_play_frame(pbp, qb_ids={"QB1"})
+    assert len(frame) == 1
+    assert frame.iloc[0]["player_id"] == "QB1"
+    assert frame.iloc[0]["rushing_tds"] == 1.0
+
+
+def test_qb_player_ids_returns_only_qb_position_rows():
+    df = pd.DataFrame({
+        "player_id": ["QB1", "RB1", "QB2"],
+        "position": ["QB", "RB", "QB"],
+    })
+    assert _qb_player_ids(df) == {"QB1", "QB2"}
 
 
 # ==========================================================================
