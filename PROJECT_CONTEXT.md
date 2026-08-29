@@ -133,7 +133,29 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > next `weekly_update.py` run. See **Team Tendencies findings** below for
 > the full tables and reasoning, including a flagged-not-chased note on
 > `CONTEXT_OUTPUT_COLUMNS` (Family 5) as a plausible next candidate for the
-> same helps-QB/redundant-elsewhere pattern.
+> same helps-QB/redundant-elsewhere pattern. **That candidate is now
+> chased (Aug 2026): `CONTEXT_OUTPUT_COLUMNS` is split into
+> `VEGAS_SCHEDULE_OUTPUT_COLUMNS`/`WEATHER_OUTPUT_COLUMNS` (`src/usage.py`),
+> both position-differentiated in `FEATURE_COLUMNS_BY_POSITION`** — a
+> block-level test of the whole family (matching how Team Tendencies and
+> Family 5B were each tested) would have reported RB as noise; splitting
+> the family revealed a real Vegas gain and a real weather harm that had
+> been canceling each other out. The methodological lesson generalizes
+> beyond this one family — see **Context Columns findings** below,
+> including the explicit caution that no other feature family in this
+> pipeline has been re-checked at the sub-family level yet. QB keeps all
+> of Vegas + weather + Team Tendencies (weather's SOLO effect is ~0, but
+> removing it from an already-Vegas+TT QB model cost +0.073 MAE — a real
+> interaction the solo number alone would have missed); RB keeps Vegas
+> only; WR keeps weather only; TE keeps neither. Walk-forward re-verified
+> against the real wired pipeline post-split: QB unchanged (6.1738, exactly
+> the prior committed number), RB 4.1519 (−0.019 vs. its prior baseline),
+> WR 3.9299 (−0.009), TE 3.0055 (−0.008) — all four at or better than what
+> was committed before this change. `scripts/retrain.py` was run for real
+> again (same "artifact schema changed underneath `FEATURE_COLUMNS_BY_
+> POSITION`'s own values, not just its shape" reasoning as the Team
+> Tendencies follow-up above), and all 4 exports (live + 2023/2024/2025
+> archives) were regenerated against the refreshed artifact.
 > See **Verification status** near the end before treating any pipeline
 > claim as settled.
 
@@ -595,6 +617,161 @@ and the real sample-size line. The live, pre-season 2026 export (zero
 games played league-wide, same honest state every other trailing signal
 in this pipeline shows right now) renders the "not enough plays yet" empty
 state, not an error or a blank panel.
+
+---
+
+## Context Columns findings (Aug 2026)
+
+The flagged-not-chased candidate from the Team Tendencies findings above,
+now tested with the identical walk-forward methodology (same
+`eval_min_season` window `scripts/retrain.py` uses, `walk_forward_predict`/
+`FEATURE_COLUMNS_BY_POSITION` unchanged, full 2018-2025 history).
+
+**First pass: the whole family, in vs. out — looked like an echo of Team
+Tendencies, fainter.**
+
+| Position | MAE without | MAE with (whole `CONTEXT_OUTPUT_COLUMNS` block) | Delta |
+|---|---|---|---|
+| QB | 6.3338 | 6.1738 | **−0.160 (real)** |
+| RB | 4.1789 | 4.1712 | −0.008 (read as noise) |
+| WR | 3.9439 | 3.9386 | −0.005 (read as noise) |
+| TE | 3.0055 | 3.0135 | +0.008 (small, same direction as Team Tendencies' own TE result) |
+
+Same shape as Team Tendencies at first glance: real QB gain, nothing
+resolvable elsewhere. Taken at face value, this would have shipped
+"QB only," exactly like Team Tendencies did.
+
+**Splitting the block changed the read for RB.** `CONTEXT_OUTPUT_COLUMNS`
+was partitioned into `VEGAS_SCHEDULE_OUTPUT_COLUMNS` (is_home, days_rest,
+spread, game_total, team_implied_total) and `WEATHER_OUTPUT_COLUMNS`
+(roof, surface, temp, wind) — Vegas prices in expected scoring
+environment/game script directly; weather is a distinct physical
+mechanism with no reason to move in the same direction. Tested
+separately, same methodology:
+
+| Position | Vegas/schedule alone | Weather alone |
+|---|---|---|
+| QB | **−0.087 (real)** | −0.001 (flat alone — see the interaction note below) |
+| RB | **−0.027 (real)** | **+0.015 (real degradation)** |
+| WR | −0.005 (noise) | **−0.014 (small real)** |
+| TE | **+0.022 (real degradation)** | **+0.028 (real degradation)** |
+
+RB's whole-block reading (−0.008, "noise") was two real, opposite-signed
+effects almost exactly canceling: a genuine −0.027 Vegas gain and a
+genuine +0.015 weather harm, averaging out to a number small enough to
+dismiss. The block-level test wasn't wrong about the arithmetic — it just
+asked the wrong question. TE is the control case that shows the split
+isn't manufacturing signal out of noise: both subfamilies hurt TE
+independently and in the same direction there, so splitting TE's number
+doesn't change its conclusion, only RB's.
+
+**QB: Vegas/schedule and Team Tendencies overlap heavily — a factorial
+check, not an assumption.** Both describe offense-wide volume/environment
+(Vegas via game_total/spread, Team Tendencies via PROE/pace), so crossing
+them (both in/out) rather than just adding both to the same list:
+
+| | No Vegas | Vegas |
+|---|---|---|
+| **No Team Tendencies** | 6.5604 | 6.3230 (Δ −0.237) |
+| **Team Tendencies** | 6.3338 (Δ −0.227) | 6.2472 (Δ −0.087) |
+
+Each factor's solo effect (~−0.23) shrinks to about a third of that
+(~−0.08) once the other is already present, and the combined move
+(6.5604 → 6.2472 = −0.313) is well short of the naively-additive
+prediction (−0.464). Substantially redundant, not additive — but not
+fully redundant either, since each still contributes on top of the other.
+
+**QB: weather's solo effect is flat, but dropping it costs real MAE
+anyway — an interaction, not noise.** Weather alone tested as ~0 for QB
+(−0.001), which reads like a clean exclusion. But removing weather from a
+Vegas+Team-Tendencies QB feature set measured 6.2472 — **0.073 MAE worse**
+than keeping all three together (6.1738, the actual committed baseline).
+Weather's contribution to QB only shows up in combination with Vegas/TT
+already present, not on its own. Caught specifically because the intended
+"QB: Vegas + TT, no weather" list was walk-forward-checked against the
+current baseline BEFORE being committed — it would have shipped a real
+regression if the solo-weather number had been trusted on its own.
+
+**Final per-position resolution** (`FEATURE_COLUMNS_BY_POSITION`,
+`src/model.py`, exclusions written explicitly in the dict literal with
+their measured deltas in comments, same convention as Team Tendencies'
+own TE exclusion):
+
+| Position | Vegas/schedule | Weather | Team Tendencies |
+|---|---|---|---|
+| QB | ✅ | ✅ (kept despite flat solo effect — see interaction above) | ✅ |
+| RB | ✅ | ❌ (+0.015, real degradation) | — (untested for RB in that pass, unchanged from before) |
+| WR | ❌ (−0.005, noise) | ✅ | — |
+| TE | ❌ (+0.022, real degradation) | ❌ (+0.028, real degradation) | ❌ (unchanged from Team Tendencies) |
+
+Re-verified against the real, wired pipeline after the split landed:
+
+| Position | MAE (post-split) | vs. prior committed baseline |
+|---|---|---|
+| QB | 6.1738 | exactly unchanged (same three families as before, just now assembled from explicit per-subfamily inclusion instead of one block) |
+| RB | 4.1519 | **−0.019, better** |
+| WR | 3.9299 | **−0.009, better** |
+| TE | 3.0055 | **−0.008, better** |
+
+All four positions land at or better than what was committed before this
+change — RB and WR are the two where the split is doing real work the
+block-level test couldn't see; QB and TE end up in the same place the
+block-level test would have put them, for different (now explicit rather
+than accidental) reasons.
+
+**The methodological finding, not just the numbers.** A family-level
+ablation tests "does this whole bundle help," which silently assumes
+every column in the bundle moves the same direction. When it doesn't —
+RB's case exactly — the bundle's own opposite-signed effects cancel into
+a false "no signal" reading, not a small-but-real one. This isn't
+specific to Family 5: **every feature family tested so far in this
+pipeline was tested at the whole-block level**, not the sub-column level
+— Team Tendencies' four sub-metrics (PROE, pace, red-zone split, target
+distribution by position) were walk-forward-tested as one
+`TEAM_TENDENCY_OUTPUT_COLUMNS` block, and Family 5B's opponent-strength
+columns (unadjusted vs. schedule-adjusted `xfp`-allowed, per position)
+were likewise tested as one `OPPONENT_STRENGTH_OUTPUT_COLUMNS` block.
+Neither has been re-checked at the sub-family level the way Family 5 just
+was. This doesn't mean either one is hiding a canceled effect — TE's
+result above shows a block CAN legitimately have every member point the
+same direction — only that it hasn't been checked, and this session is
+the first time that check would have mattered enough to catch something.
+Flagged, not chased, in this pass.
+
+**Retrain and re-export, real not deferred** (same "the artifact's own
+per-position values changed underneath `FEATURE_COLUMNS_BY_POSITION`, not
+just its shape" reasoning as the Team Tendencies follow-up above —
+deferring would ship stale per-position feature lists baked into an
+artifact trained on the old ones). `scripts/retrain.py` was re-run for
+real against the new split; `scripts/weekly_update.py` (live export) and
+`scripts/archive_season.py 2023/2024/2025` were all re-run against the
+refreshed artifact. All four `validate_export` reports passed clean
+(`floor_le_point_le_ceiling`, crosswalk match rates unchanged from their
+pre-split values, `n_team_tendencies: 32` on every archive) — this change
+doesn't touch anything about how Team Tendencies, radar, heatmap, or
+matchup data are computed, only which context columns feed the point/
+floor/ceiling model per position.
+
+**A stale-notebook gap found and worked around, not fixed.**
+`notebooks/03_usage_features.ipynb` (the documented, "exploratory,
+cell-by-cell reference" source of `data/processed/weekly_features.parquet`
+that `scripts/archive_season.py` reads directly) never had
+`add_team_tendency_features` added to its own feature-building cell when
+Team Tendencies landed — `src/pipeline.py::build_raw_features` (the
+production path `scripts/retrain.py` actually uses) calls it, but the
+notebook's own cell 10 doesn't. `data/processed/` is gitignored, so this
+never surfaced as a diff; it surfaced here because the on-disk
+`weekly_features.parquet` predated Team Tendencies entirely (no
+`proe`/`pace` columns) despite PROJECT_CONTEXT.md already describing that
+work as shipped and archive-verified — that prior verification pass must
+have used a since-overwritten local copy, not this notebook's actual
+output. Worked around by regenerating `weekly_features.parquet` directly
+via `build_feature_table()` (the same function `scripts/retrain.py`
+calls) rather than re-running the notebook, so this pass's archives are
+correct — but the notebook itself is still stale and would reproduce the
+same gap if run as-is. Not fixed in this pass (out of scope for a
+feature-selection change); worth a small follow-up to add the missing
+call to notebook 03's cell 10 and cell 4's imports.
 
 ---
 
@@ -2484,6 +2661,7 @@ assumptions as facts.
 | Family 5B opponent defensive strength (`add_opponent_strength_features`/`build_defense_strength_table`) is leakage-free, its opponent-adjustment sign is correct, and it measurably (if modestly) improves WR/TE walk-forward MAE | **Verified** — 8 new leakage tests pass (future-truncation + a same-week/next-week perturbation test, same two-pattern approach as every other family; 54 tests total in `tests/test_no_leakage.py`), plus a direct sign check on the opponent-adjustment correction using real 2018-2025 data. Walk-forward MAE (2024-2025 eval window, same methodology as the published Phase 6 table): QB unchanged (null by construction), RB +0.0008 (noise), WR −0.0100, TE −0.0179 — real for WR/TE, but small: matchup is a much weaker signal than its reputation in fantasy advice suggests, not the headline lever role/volume already are. See the finding stated plainly in **Family 5B findings**, not just this table. |
 | `build_season_defense_rankings`/`build_weekly_matchup` (the season-ARCHIVE-specific, non-point-in-time-safe retrospective versions of Family 5B) are correct, and the real regenerated 2025/2024/2023 archives + live export carry real `matchup`/`defense_rankings`/`weekly_matchup` data | **Verified** — a hand-worked 4-team round-robin fixture confirms the opponent-adjustment math exactly (all four teams' TRUE, schedule-independent defense quality converges to the same number post-adjustment despite different raw "allowed" values from facing a different mix of opponents); a second fixture confirms `build_weekly_matchup`'s rank is computed fresh within each (week, position) snapshot (not leaked across weeks) and correctly dedupes two players facing the same opponent in the same week to the same rank. `scripts/weekly_update.py` and `scripts/archive_season.py 2025/2024/2023` were all re-run for real after this landed — the live export's `matchup`/`defense_rankings` are honestly empty (2026 has zero real games played yet), and all 3 archives carry real, populated `defense_rankings` (32/32 teams ranked per position) and `weekly_matchup` (5,801-6,037 real player-week rows per season). Frontend/data verified against the REAL regenerated 2025 archive specifically (no faked payload) via Playwright: the Matchup Ratings panel's real favorable/tough lists read plausibly against characterizable 2025 defensive reputations (BAL/IND/JAX most WR-favorable, MIN/CAR/CIN least; DEN/HOU/TB least RB-favorable; CIN #1 most TE-favorable but NOT in the WR list, LAC/BUF/KC least TE-favorable) — independently reproducing the same directions the earlier notebook spot-check found; the Players table's Matchup column, switched to a real Week 10, showed 62/100 visible WR rows populated with real favorability badges via the new `weekly_matchup` fallback in `getMatchup()`. Zero new console errors. See **Family 5B findings**. |
 | Phase 10 Draft Prep: default-tab logic, independent season selection, condensed radar axis mapping, and the null-last sort comparator all behave correctly; the fade/buy-low signal is characterizable on real players | **Verified** — Playwright against the real production config (unmodified `LEAGUE_ID`, real committed archives): default sub-tab correctly follows `hasDraftBoard` in both directions (opens on Draft Board when the active season has a real completed draft — true for the default 2025 season; opens on Draft Prep when it doesn't — confirmed by switching to the real, `pre_draft`, 0-picks 2026 league before the Draft tab's first visit in a fresh session). Season switching 2025→2024→2023→2025 in Draft Prep's own dropdown returned distinct, correct real data each time, independent of the main season selector's own value throughout. An isolated synthetic-array test of the exact comparator confirmed nulls sort strictly last in both directions, distinct from a real `0` (same guarantee already proven for the Players table's identical comparator). Fixed one real regression this surfaced: the new Board/Prep toggle shares the `.view-toggle-btn` CSS class with the pre-existing Grid/List toggle, and the old unscoped `.view-toggle-btn` listener would have matched the new buttons too and corrupted `state.draftView` — scoped to `.view-toggle-btn[data-view]`; confirmed both toggles now operate independently with no cross-talk. `xfp.season_actual` (Season Pts) confirmed real and correctly populated for QB despite `season_xfp` being null (traced to `build_xfp_summary` summing `custom_points` and `xfp` as separate columns, not gated together) — spot-checked against Mahomes/Stafford/Prescott's real 2025 season totals, no Python change needed. Top fade candidates (Puka Nacua +75.5, Jahmyr Gibbs +69.2, De'Von Achane +56.1) and top buy-low candidates (Justin Jefferson −46.2, Jerry Jeudy −58.2, Mike Evans −28.1) from the real 2025 archive all characterize plausibly against real-world player profiles (ascending/explosive players outperforming a touch-volume model, established talents having injury/situational down years) — see **Phase 10 findings** for the full list and reasoning. Table width fits its panel at 1440px. Zero unexplained console errors throughout. |
+| Context Columns split (`VEGAS_SCHEDULE_OUTPUT_COLUMNS`/`WEATHER_OUTPUT_COLUMNS`, `src/usage.py`/`src/model.py`) is a real, position-differentiated improvement, not a re-labeling of the old block-level result | **Verified** — same walk-forward methodology as every other feature family in this pipeline (2024-2025 eval window, full 2018-2025 history). Splitting `CONTEXT_OUTPUT_COLUMNS` surfaced a real RB effect (−0.027 Vegas gain, +0.015 weather harm) the whole-block test had averaged into a false "noise" reading (−0.008); TE's block-level degradation held up unchanged when split (+0.022 Vegas, +0.028 weather, both real and same-direction). QB's proposed "Vegas + Team Tendencies, no weather" list was walk-forward-checked BEFORE being committed and found to regress the model by +0.073 MAE vs. the already-committed baseline (weather's solo effect is ~0, but its effect on top of Vegas+TT isn't) — QB keeps all three families instead, verified unchanged at 6.1738. Post-split re-verification against the real, wired `FEATURE_COLUMNS_BY_POSITION`: QB 6.1738 (exactly unchanged), RB 4.1519 (−0.019), WR 3.9299 (−0.009), TE 3.0055 (−0.008) — all four at or better than the pre-split committed baseline. `scripts/retrain.py`/`weekly_update.py`/`archive_season.py 2023/2024/2025` all re-run for real against the refreshed artifact; all 4 `validate_export` reports passed clean. See **Context Columns findings** for the full tables, the QB Vegas/Team-Tendencies redundancy factorial, and the methodological point about family-level ablations hiding opposite-signed sub-effects (flagged as untested at the sub-family level for Team Tendencies and Family 5B too). |
 
 ## What's outstanding
 

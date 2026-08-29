@@ -756,6 +756,18 @@ CONTEXT_OUTPUT_COLUMNS = [
     "roof", "surface", "temp", "wind",
 ]
 
+# Two-way partition of CONTEXT_OUTPUT_COLUMNS for src/model.py's per-
+# position feature selection -- add_context_features() itself is
+# unaffected and still computes every CONTEXT_OUTPUT_COLUMNS column
+# regardless of which subset a given position's model actually trains on.
+# Split out because a family-level walk-forward ablation of the whole
+# block masked a real, opposite-signed pair of effects at RB (Vegas
+# helped, weather hurt, and the two nearly canceled into a false "no
+# signal" at the block level) -- see PROJECT_CONTEXT.md's Context Columns
+# findings for the full per-position numbers.
+VEGAS_SCHEDULE_OUTPUT_COLUMNS = ["is_home", "days_rest", "spread", "game_total", "team_implied_total"]
+WEATHER_OUTPUT_COLUMNS = ["roof", "surface", "temp", "wind"]
+
 
 def _team_week_context(schedule: pd.DataFrame) -> pd.DataFrame:
     """

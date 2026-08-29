@@ -28,7 +28,11 @@ part of this module:
         describe week N's PREGAME circumstances (schedule, Vegas lines,
         weather forecast) -- genuinely knowable before kickoff, so unlike
         every other family's "current week" columns, using them as-is
-        (not lagged) is correct, not a leak.
+        (not lagged) is correct, not a leak. Unlike ROLLING_OUTPUT_COLUMNS,
+        this family is NOT used as one shared block -- see
+        FEATURE_COLUMNS_BY_POSITION's own comment for why it's split into
+        VEGAS_SCHEDULE_OUTPUT_COLUMNS/WEATHER_OUTPUT_COLUMNS and included
+        per position, not per family.
     xfp/fp_over_expected (current week) are deliberately excluded even
     though they sound like features -- xfp for week N requires knowing the
     player's ACTUAL week-N opportunities (targets/carries that week), which
@@ -61,52 +65,98 @@ import shap
 from scipy.stats import spearmanr
 
 from src.team_tendencies import TEAM_TENDENCY_OUTPUT_COLUMNS
-from src.usage import CONTEXT_OUTPUT_COLUMNS, OPPONENT_STRENGTH_OUTPUT_COLUMNS, ROLLING_OUTPUT_COLUMNS
+from src.usage import (
+    OPPONENT_STRENGTH_OUTPUT_COLUMNS,
+    ROLLING_OUTPUT_COLUMNS,
+    VEGAS_SCHEDULE_OUTPUT_COLUMNS,
+    WEATHER_OUTPUT_COLUMNS,
+)
 
 logger = logging.getLogger(__name__)
 
 POSITIONS = ("QB", "RB", "WR", "TE")
 
 # OPPONENT_STRENGTH_OUTPUT_COLUMNS (Family 5B -- opponent defensive
-# strength by position) is, like CONTEXT_OUTPUT_COLUMNS, a describes-
-# THIS-WEEK'S-MATCHUP family rather than a describes-the-player-over-time
-# one: each value already IS a trailing, shift(1)-safe summary of the
-# player's OPPONENT (not the player), so it's used as-is here rather than
-# being fed through Family 6's rolling treatment a second time -- doing
-# that would average together different opponents across different weeks,
-# the same reason CONTEXT_OUTPUT_COLUMNS itself is excluded from
-# ROLLING_SOURCE_COLUMNS (see usage.py's comment on that exclusion). Null
-# for QB by construction -- see add_opponent_strength_features's docstring.
+# strength by position) is, like the Family 5 context columns below, a
+# describes-THIS-WEEK'S-MATCHUP family rather than a describes-the-player-
+# over-time one: each value already IS a trailing, shift(1)-safe summary
+# of the player's OPPONENT (not the player), so it's used as-is here
+# rather than being fed through Family 6's rolling treatment a second
+# time -- doing that would average together different opponents across
+# different weeks, the same reason CONTEXT_OUTPUT_COLUMNS itself is
+# excluded from ROLLING_SOURCE_COLUMNS (see usage.py's comment on that
+# exclusion). Null for QB by construction -- see
+# add_opponent_strength_features's docstring.
+#
+# Unlike CONTEXT_OUTPUT_COLUMNS (see FEATURE_COLUMNS_BY_POSITION below),
+# this family is NOT position-differentiated -- Family 5B's own walk-
+# forward test already found a real WR/TE gain and a null-by-construction
+# QB / noise RB result (see PROJECT_CONTEXT.md's Family 5B findings), so
+# it stays in the shared base rather than needing its own per-position
+# split.
 FEATURE_COLUMNS = (
-    list(ROLLING_OUTPUT_COLUMNS) + list(CONTEXT_OUTPUT_COLUMNS) + list(OPPONENT_STRENGTH_OUTPUT_COLUMNS)
+    list(ROLLING_OUTPUT_COLUMNS) + list(OPPONENT_STRENGTH_OUTPUT_COLUMNS)
 )
 
-# Per-position feature sets -- introduced specifically because Team
-# Tendencies (src/team_tendencies.py) couldn't be added to the single
-# shared FEATURE_COLUMNS list above without contradiction. Walk-forward
-# tested (same eval_min_season window/methodology as every other feature
-# family in this pipeline; see PROJECT_CONTEXT.md's Team Tendencies
-# findings for the full table): a real, substantial MAE improvement for
-# QB (-0.18), noise for RB/WR (+0.004/+0.006, doesn't clear noise either
-# direction), and a real DEGRADATION for TE (+0.024, clearly worse). A QB
-# throws every pass his team throws, so team-wide pace/PROE gate QB
+# Per-position feature sets. Two families ride on top of the shared
+# FEATURE_COLUMNS base, both position-differentiated because a single
+# shared list can't help one position while excluding another that the
+# same column set hurts:
+#
+# Team Tendencies (src/team_tendencies.py) -- walk-forward tested (same
+# eval_min_season window/methodology as every other feature family in
+# this pipeline; see PROJECT_CONTEXT.md's Team Tendencies findings for
+# the full table): a real, substantial MAE improvement for QB (-0.18),
+# noise for RB/WR (+0.004/+0.006), and a real DEGRADATION for TE (+0.024).
+# A QB throws every pass his team throws, so team-wide pace/PROE gate QB
 # volume about as directly as a feature can; for RB/WR/TE, the player-
 # level rolling shares already in FEATURE_COLUMNS (target_share_ewm3 and
 # friends) already capture THAT PLAYER'S OWN slice of the team total, so
 # the team-wide aggregate is redundant at best and actively misleads the
 # model at TE specifically.
 #
-# RB and WR are unchanged from FEATURE_COLUMNS (the effect was noise, not
-# a case for either adding or fighting to keep out). TE's exclusion is
-# written explicitly below, not left as "just doesn't get added" --
-# TEAM_TENDENCY_OUTPUT_COLUMNS tested WORSE for TE, so this is a
-# deliberate exclusion a future edit shouldn't casually undo without
-# re-checking that finding.
+# Game context (Family 5) -- CONTEXT_OUTPUT_COLUMNS split into
+# VEGAS_SCHEDULE_OUTPUT_COLUMNS and WEATHER_OUTPUT_COLUMNS (see
+# usage.py's own comment on that split) after a block-level ablation of
+# the whole family masked a real, opposite-signed pair of effects at RB
+# (Vegas helped, weather hurt, and the two nearly canceled into a false
+# "no signal" reading at the block level -- +/-0.008 combined vs. -0.027
+# for Vegas alone and +0.015 for weather alone). Walk-forward tested per
+# subfamily per position, same methodology, full numbers in
+# PROJECT_CONTEXT.md's Context Columns findings:
+#
+#   position | Vegas/schedule alone | weather alone
+#   ---------|-----------------------|---------------
+#   QB       | -0.087 (real)         | -0.001 (noise alone -- see below)
+#   RB       | -0.027 (real)         | +0.015 (real degradation)
+#   WR       | -0.005 (noise)        | -0.014 (small real)
+#   TE       | +0.022 (real degrad.) | +0.028 (real degradation)
+#
+# QB is the one exception to "include only what tested positive alone":
+# Vegas/schedule and Team Tendencies overlap heavily for QB (a factorial
+# test found each factor's solo effect of ~-0.23 shrinks to ~-0.08 once
+# the other is already present -- redundant, not additive, though neither
+# is fully subsumed by the other). Weather's OWN solo effect for QB is
+# ~0, which would argue for dropping it -- but dropping weather from an
+# already-Vegas+TT QB feature set measured +0.073 MAE WORSE than keeping
+# all three together (6.2472 vs. the committed 6.1738): a real
+# interaction, not redundancy. So QB keeps weather despite its flat solo
+# number -- don't drop it on that number alone without re-checking this
+# interaction.
 FEATURE_COLUMNS_BY_POSITION: dict[str, list[str]] = {
-    "QB": list(FEATURE_COLUMNS) + list(TEAM_TENDENCY_OUTPUT_COLUMNS),
-    "RB": list(FEATURE_COLUMNS),
-    "WR": list(FEATURE_COLUMNS),
-    "TE": list(FEATURE_COLUMNS),  # deliberately excludes TEAM_TENDENCY_OUTPUT_COLUMNS -- tested worse, not just untested
+    "QB": (
+        list(FEATURE_COLUMNS)
+        + list(VEGAS_SCHEDULE_OUTPUT_COLUMNS)
+        + list(WEATHER_OUTPUT_COLUMNS)  # kept despite a ~0 solo effect -- see the interaction note above
+        + list(TEAM_TENDENCY_OUTPUT_COLUMNS)
+    ),
+    "RB": list(FEATURE_COLUMNS) + list(VEGAS_SCHEDULE_OUTPUT_COLUMNS),
+    # weather deliberately excluded for RB -- measured +0.015 MAE (real degradation), not just untested
+    "WR": list(FEATURE_COLUMNS) + list(WEATHER_OUTPUT_COLUMNS),
+    # Vegas/schedule deliberately excluded for WR -- measured -0.005 MAE (noise, doesn't clear the bar)
+    "TE": list(FEATURE_COLUMNS),
+    # both Vegas/schedule (+0.022) and weather (+0.028) deliberately excluded for TE -- both real degradations;
+    # TEAM_TENDENCY_OUTPUT_COLUMNS also excluded -- tested worse separately, see the Team Tendencies findings above
 }
 
 # The union across every position's own list -- for the ONE step that
