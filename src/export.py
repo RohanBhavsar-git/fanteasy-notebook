@@ -68,6 +68,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
+from src.kicker_defense import DEFENSE_STATS_OUTPUT_COLUMNS, KICKER_STATS_OUTPUT_COLUMNS
 from src.model import (
     ALL_FEATURE_COLUMNS, FEATURE_COLUMNS_BY_POSITION, _cast_categoricals, predict_quantiles_with_models,
     predict_with_models, train_final_models,
@@ -179,11 +180,27 @@ MONTE_CARLO_CALIBRATION_CAVEAT = (
 # narrow usage metric. Populates for QB too now that add_xfp_features has
 # a QB dropback/designed-rush bucket model (see PROJECT_CONTEXT.md's QB
 # xFP findings) -- null just means thin history, not a QB-only gap.
+#
+# QB-specific fields (dropbacks/designed_rush_attempts/rushing_share_of_
+# points/cpoe/epa_per_dropback, all _s2d -- season-to-date, matching the
+# "per game"/"this season" framing these were requested under) replace
+# the old Opportunity Shares panel FOR QB ONLY on the dashboard side --
+# snap %/target share/carry share/red-zone share are meaningless for a
+# player who takes every offensive snap and has no target share at all.
+# All five were already computed (Family 1/3's own volume/efficiency
+# columns) but never exported until now; rushing_share_of_points is the
+# one genuinely new computation (add_qb_rushing_share_feature) -- see
+# that function's own docstring for why it's the most decision-relevant
+# number here (this league pays 0.1/rushing yard and 6/rushing TD against
+# 0.04/passing yard and 4/passing TD). Null for RB/WR/TE, same convention
+# as every other position-specific field in this block.
 USAGE_EXPORT_COLUMNS = [
     "target_share_ewm3", "touch_share_ewm3", "offense_pct_ewm3",
     "snap_share_delta_3wk", "rz_target_share_ewm3", "rz_carry_share_ewm3",
     "prev_season_target_share", "prev_season_touch_share", "prev_season_offense_pct",
     "xfp_vol",
+    "dropbacks_s2d", "designed_rush_attempts_s2d", "rushing_share_of_points_s2d",
+    "cpoe_s2d", "epa_per_dropback_s2d",
 ]
 
 # Phase 3' trend block: src/usage.py's internal column-name feature ->
@@ -471,6 +488,7 @@ def build_target_week_features(
     target_season: int,
     target_week: int,
     pbp: pd.DataFrame,
+    scoring_settings: dict,
 ) -> pd.DataFrame:
     """
     Returns the COMBINED frame (real history + one stub row per candidate
@@ -492,6 +510,11 @@ def build_target_week_features(
     comment for the identical condition); add_team_tendency_features
     guards that itself.
 
+    `scoring_settings` feeds add_qb_rushing_share_feature (an export-layer
+    QB descriptive signal, not a model feature -- see that function's own
+    docstring), the same "never hardcode this league's scoring weights"
+    reasoning compute_custom_score already follows everywhere else.
+
     Categorical columns (roof, surface) are cast ONCE here, on the combined
     frame, so the later train/predict split always shares the same category
     set -- the same reason src/model.py's walk_forward_predict casts before
@@ -500,7 +523,7 @@ def build_target_week_features(
     from src.team_tendencies import add_team_tendency_features
     from src.usage import (
         ROLLING_SOURCE_COLUMNS, add_context_features, add_opponent_strength_features,
-        add_rolling_features, add_trend_features,
+        add_qb_rushing_share_feature, add_rolling_features, add_trend_features,
     )
 
     stub = candidates.copy()
@@ -524,6 +547,9 @@ def build_target_week_features(
     # (add_trend_features's outputs are never added to FEATURE_COLUMNS), so
     # running it here doesn't change what predict_target_week trains on.
     combined = add_trend_features(combined)
+    # QB rushing-share-of-points -- same "downstream of the model's own
+    # feature set" reasoning as add_trend_features just above.
+    combined = add_qb_rushing_share_feature(combined, scoring_settings)
     combined = add_team_tendency_features(combined, pbp)
     combined = _cast_categoricals(combined, ALL_FEATURE_COLUMNS)
     return combined
@@ -1679,6 +1705,93 @@ def assemble_player_advanced_stats(
 
 
 # ==========================================================================
+# STEP 5B: kicker and team-defense entries (src/kicker_defense.py)
+# ==========================================================================
+# K and DEF were never in the export at all before this -- neither is part
+# of scoped_predictions (no model prediction exists for either position;
+# see CLAUDE.md's scope boundaries), so assemble_player_advanced_stats'
+# whole per-row loop above structurally can't produce an entry for them.
+# Built and merged in separately instead of forcing them through that
+# QB/RB/WR/TE-shaped loop -- a genuinely different, smaller schema
+# (kicker_stats/defense_stats only; no projection/usage/trend/xfp/radar/
+# heatmap/monte_carlo/matchup, which simply don't apply), same
+# "absent, not null, for a field that doesn't apply to this position"
+# convention every other family in this export already follows.
+def build_kicker_stats_export(kicker_season_stats: pd.DataFrame, crosswalk: pd.DataFrame) -> dict:
+    """
+    {sleeper_id: {"team", "kicker_stats"}} for every real K player
+    build_kicker_season_stats covers -- crosswalked from gsis_id (that
+    function's own player_id) to sleeper_id, the same join every other
+    export function uses. A K player with no crosswalk match is silently
+    dropped (same "can't show what can't be identified" outcome
+    get_export_candidates' own crosswalk step produces for QB/RB/WR/TE),
+    not asserted here -- this function has no report-dict return to
+    surface a match rate through.
+    """
+    if kicker_season_stats.empty:
+        return {}
+    cw = crosswalk.dropna(subset=["gsis_id", "sleeper_id"]).drop_duplicates(subset=["gsis_id"])
+    merged = kicker_season_stats.merge(cw[["gsis_id", "sleeper_id"]], left_on="player_id", right_on="gsis_id", how="inner")
+
+    out = {}
+    for _, row in merged.iterrows():
+        out[row["sleeper_id"]] = {
+            "team": row["team"],
+            "kicker_stats": {
+                col: (None if pd.isna(row[col]) else round(float(row[col]), 4))
+                for col in KICKER_STATS_OUTPUT_COLUMNS
+            },
+        }
+    return out
+
+
+# nflverse's own team codes differ from Sleeper's for exactly one team
+# (SLEEPER_TO_NFLVERSE_TEAM = {"LAR": "LA"}) -- build_defense_season_stats
+# works entirely in nflverse's code space (pbp/schedule), but a DEF entry
+# must be keyed by Sleeper's OWN player_id (which IS the team's Sleeper
+# code, verified directly against Sleeper's real player DB: one DEF entry
+# per team, player_id == that team's abbreviation) for the dashboard's
+# existing getAdvancedPlayer(player_id) lookup to find it. Inverted here
+# rather than adding a second, competing normalization direction to
+# SLEEPER_TO_NFLVERSE_TEAM itself.
+NFLVERSE_TO_SLEEPER_TEAM = {v: k for k, v in SLEEPER_TO_NFLVERSE_TEAM.items()}
+
+
+def build_defense_stats_export(defense_season_stats: pd.DataFrame) -> dict:
+    """
+    {sleeper_team_code: {"team", "defense_stats"}} for every real NFL team
+    build_defense_season_stats covers -- keyed directly by team code (see
+    NFLVERSE_TO_SLEEPER_TEAM's own comment for the one team that needs
+    converting), no crosswalk needed the way a real player does.
+    """
+    out = {}
+    for _, row in defense_season_stats.iterrows():
+        sleeper_team = NFLVERSE_TO_SLEEPER_TEAM.get(row["team"], row["team"])
+        out[sleeper_team] = {
+            "team": sleeper_team,
+            "defense_stats": {
+                col: (None if pd.isna(row[col]) else round(float(row[col]), 4))
+                for col in DEFENSE_STATS_OUTPUT_COLUMNS
+            },
+        }
+    return out
+
+
+def merge_kicker_and_defense_entries(payload: dict, kicker_export: dict, defense_export: dict) -> dict:
+    """
+    Adds K/DEF entries directly into payload["players"] -- the SAME
+    top-level dict QB/RB/WR/TE already populate, keyed the same way
+    (sleeper_id), so the dashboard's existing getAdvancedPlayer(player_id)
+    lookup finds a K or DEF entry too, with no new client-side lookup path
+    needed. Mutates and returns payload for convenience; callers already
+    hold the same dict reference either way.
+    """
+    payload["players"].update(kicker_export)
+    payload["players"].update(defense_export)
+    return payload
+
+
+# ==========================================================================
 # STEP 6: validation
 # ==========================================================================
 def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
@@ -1692,27 +1805,47 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         crosswalk's sleeper_id column)
       - projection.point/floor/ceiling are never null
       - floor <= point <= ceiling on every row
+
+    K/DEF entries (kicker_stats/defense_stats present) are a genuinely
+    different, smaller schema -- no projection/radar/heatmap/monte_carlo/
+    matchup at all, see merge_kicker_and_defense_entries's own docstring --
+    so every check below that reads one of those keys is scoped to
+    `full_player_entries` (everything else) rather than `players` as a
+    whole. K/DEF get their OWN checks further down instead.
     """
     real_sleeper_ids = set(crosswalk["sleeper_id"].dropna())
     players = payload["players"]
 
-    unknown_keys = [pid for pid in players if pid not in real_sleeper_ids]
+    # DEF entries are keyed by team code (Sleeper's own player_id for a team
+    # defense IS that team's abbreviation -- verified directly against
+    # Sleeper's real player DB), never by a gsis-crosswalked sleeper_id, so
+    # they're excluded from this specific check -- bad_defense_stats below
+    # validates their fields instead.
+    unknown_keys = [
+        pid for pid, p in players.items()
+        if pid not in real_sleeper_ids and "defense_stats" not in p
+    ]
     assert not unknown_keys, f"{len(unknown_keys)} player keys are not real Sleeper IDs: {unknown_keys[:5]}"
 
+    full_player_entries = {
+        pid: p for pid, p in players.items()
+        if "kicker_stats" not in p and "defense_stats" not in p
+    }
+
     null_projection = [
-        pid for pid, p in players.items()
+        pid for pid, p in full_player_entries.items()
         if p["projection"]["point"] is None or p["projection"]["floor"] is None or p["projection"]["ceiling"] is None
     ]
     assert not null_projection, f"{len(null_projection)} players have a null projection field: {null_projection[:5]}"
 
     out_of_order = [
-        pid for pid, p in players.items()
+        pid for pid, p in full_player_entries.items()
         if not (p["projection"]["floor"] <= p["projection"]["point"] <= p["projection"]["ceiling"])
     ]
     assert not out_of_order, f"{len(out_of_order)} players violate floor <= point <= ceiling: {out_of_order[:5]}"
 
     bad_radar_percentiles = [
-        pid for pid, p in players.items()
+        pid for pid, p in full_player_entries.items()
         if p["radar"]["eligible"]
         and any(ax["percentile"] is not None and not (0 <= ax["percentile"] <= 100) for ax in p["radar"]["axes"])
     ]
@@ -1721,7 +1854,7 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
     )
 
     bad_heatmap_shares = [
-        pid for pid, p in players.items()
+        pid for pid, p in full_player_entries.items()
         if p["heatmap"]["eligible"]
         and any(
             abs(sum(z["share"] for z in g["zones"]) - 1.0) > 0.01 or any(z["count"] < 0 for z in g["zones"])
@@ -1733,9 +1866,9 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         f"or contain a negative count: {bad_heatmap_shares[:5]}"
     )
 
-    n_with_monte_carlo = sum(1 for p in players.values() if p.get("monte_carlo") is not None)
+    n_with_monte_carlo = sum(1 for p in full_player_entries.values() if p.get("monte_carlo") is not None)
     bad_monte_carlo = [
-        pid for pid, p in players.items()
+        pid for pid, p in full_player_entries.items()
         if p.get("monte_carlo") is not None
         and (
             not (0 <= p["monte_carlo"]["boom_prob"] <= 1)
@@ -1798,8 +1931,31 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         f"team_tendencies has a share outside [0, 1] for: {bad_team_tendency_shares[:5]}"
     )
 
+    # K/DEF entries -- rates (pat_rate, fg_rate_*) must be within [0, 1]
+    # where present (null is fine -- a zero-attempt band); games_played
+    # must be non-negative. No radar/heatmap/monte_carlo/matchup checks
+    # apply to these at all (see this function's own docstring).
+    kicker_entries = {pid: p for pid, p in players.items() if "kicker_stats" in p}
+    defense_entries = {pid: p for pid, p in players.items() if "defense_stats" in p}
+
+    rate_keys = ["pat_rate", "fg_rate_under_30", "fg_rate_30_39", "fg_rate_40_49", "fg_rate_50_plus"]
+    bad_kicker_rates = [
+        pid for pid, p in kicker_entries.items()
+        if any(v is not None and not (0 <= v <= 1) for k, v in p["kicker_stats"].items() if k in rate_keys)
+        or p["kicker_stats"]["games_played"] < 0
+    ]
+    assert not bad_kicker_rates, f"{len(bad_kicker_rates)} kicker entries have a rate outside [0, 1]: {bad_kicker_rates[:5]}"
+
+    bad_defense_stats = [
+        pid for pid, p in defense_entries.items()
+        if p["defense_stats"]["games_played"] < 0
+        or p["defense_stats"]["sacks"] < 0
+        or p["defense_stats"]["interceptions"] < 0
+    ]
+    assert not bad_defense_stats, f"{len(bad_defense_stats)} defense entries have a negative count: {bad_defense_stats[:5]}"
+
     return {
-        "n_players": len(players),
+        "n_players": len(full_player_entries),
         "all_keys_real_sleeper_ids": True,
         "no_null_projections": True,
         "floor_le_point_le_ceiling": True,
@@ -1814,6 +1970,10 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         "defense_rankings_positions": list(defense_rankings.keys()),
         "n_team_tendencies": len(team_tendencies),
         "team_tendency_shares_in_range": True,
+        "n_kicker_stats": len(kicker_entries),
+        "kicker_rates_in_range": True,
+        "n_defense_stats": len(defense_entries),
+        "defense_stats_non_negative": True,
     }
 
 

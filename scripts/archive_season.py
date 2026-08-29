@@ -49,16 +49,17 @@ import pandas as pd  # noqa: E402
 
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
-    CAVEATS, assemble_player_advanced_stats, build_heatmap_snapshot, build_radar_snapshot,
-    build_season_defense_rankings, build_season_team_tendencies, build_target_week_features,
-    build_trend_snapshot, build_usage_snapshot, build_weekly_matchup, build_weekly_xfp, build_xfp_summary,
-    get_archive_candidates, get_export_scope, get_season_team_map, predict_target_week_from_artifact,
-    validate_export,
+    CAVEATS, assemble_player_advanced_stats, build_defense_stats_export, build_heatmap_snapshot,
+    build_kicker_stats_export, build_radar_snapshot, build_season_defense_rankings, build_season_team_tendencies,
+    build_target_week_features, build_trend_snapshot, build_usage_snapshot, build_weekly_matchup, build_weekly_xfp,
+    build_xfp_summary, get_archive_candidates, get_export_scope, get_season_team_map, merge_kicker_and_defense_entries,
+    predict_target_week_from_artifact, validate_export,
 )
 from src.ingest import (  # noqa: E402
     DATA_OUTPUT, SEASON_LEAGUE_IDS, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
-    get_sleeper_rosters,
+    get_sleeper_rosters, get_weekly_stats,
 )
+from src.kicker_defense import build_defense_season_stats, build_kicker_season_stats  # noqa: E402
 
 TOP_N_FREE_AGENTS = 300
 
@@ -104,7 +105,7 @@ def main() -> None:
         )
     league_id = SEASON_LEAGUE_IDS[season]
 
-    print(f"[1/6] Loading model artifact + real {season} league/schedule/rosters (league {league_id})...")
+    print(f"[1/7] Loading model artifact + real {season} league/schedule/rosters (league {league_id})...")
     artifact = load_model_artifact()
     league = get_sleeper_league(league_id, refresh=True)
     assert int(league["season"]) == season, f"league {league_id} reports season {league['season']}, expected {season}"
@@ -113,7 +114,7 @@ def main() -> None:
     target_week = determine_archive_target_week(schedule_season, season)
     print(f"    target: season {season}, one past its real final week -> stub week {target_week}")
 
-    print("[2/6] Loading full cached historical features (2018-2025, from 03_usage_features.ipynb)...")
+    print("[2/7] Loading full cached historical features (2018-2025, from 03_usage_features.ipynb)...")
     weekly_features = pd.read_parquet(PROJECT_ROOT / "data" / "processed" / "weekly_features.parquet")
     print(f"    weekly_features: {len(weekly_features):,} rows, seasons {weekly_features['season'].min()}-{weekly_features['season'].max()}")
     season_rows = weekly_features[weekly_features["season"] == season]
@@ -129,7 +130,7 @@ def main() -> None:
     # Sleeper player DB (see its own docstring for why that matters).
     crosswalk = get_id_crosswalk()
 
-    print("[3/6] Building archive candidates (team from history, not from today's Sleeper snapshot)...")
+    print("[3/7] Building archive candidates (team from history, not from today's Sleeper snapshot)...")
     candidates, candidate_report = get_archive_candidates(weekly_features, crosswalk)
     print(f"    candidate report: {candidate_report}")
     if candidates.empty:
@@ -138,7 +139,7 @@ def main() -> None:
     season_team = get_season_team_map(weekly_features, season)
     print(f"    season-team map: {len(season_team)} players resolved to their real {season} team")
 
-    print("[4/6] Building target-week features and predicting...")
+    print("[4/7] Building target-week features and predicting...")
     # Fetched here (rather than at Step 5, where the heatmap needs it too)
     # so build_target_week_features can wire it into Team Tendencies (a QB
     # model feature) below -- an archived, completed season's pbp is
@@ -146,7 +147,8 @@ def main() -> None:
     # so this needs no try/except guard.
     pbp_season = get_pbp([season])
     combined_features = build_target_week_features(
-        weekly_features, candidates, schedule_season, season, target_week, pbp_season
+        weekly_features, candidates, schedule_season, season, target_week, pbp_season,
+        league["scoring_settings"],
     )
     predictions = predict_target_week_from_artifact(combined_features, season, target_week, artifact)
     if predictions.empty:
@@ -162,7 +164,7 @@ def main() -> None:
     weekly_matchup = build_weekly_matchup(weekly_features, season)
     print(f"    weekly matchup: {len(weekly_matchup)} (player, week) rows for season {season}")
 
-    print("[5/6] Building radar + heatmap (real pbp for the season)...")
+    print("[5/7] Building radar + heatmap (real pbp for the season)...")
     radar = build_radar_snapshot(combined_features, season, target_week, league["roster_positions"], len(rosters_raw))
     n_radar_eligible = sum(1 for r in radar.values() if r["eligible"])
     print(f"    radar: {n_radar_eligible}/{len(radar)} candidates eligible")
@@ -190,7 +192,22 @@ def main() -> None:
     team_tendencies = build_season_team_tendencies(weekly_features, pbp_season, season)
     print(f"    team tendencies: {len(team_tendencies)}/32 teams")
 
-    print("[6/6] Scoping, assembling, validating, writing...")
+    # K and DEF are out of scope for the projection model (see CLAUDE.md's
+    # scope boundaries) and never appear in weekly_features/candidates at
+    # all (FANTASY_POSITIONS excludes both), so this is a real, separate
+    # fetch + aggregation, not a re-slice of anything built above. Raw
+    # weekly stats needed fresh here since K rows never enter
+    # weekly_scored/weekly_features to begin with; pbp_season/
+    # schedule_season are already fetched above and reused as-is.
+    print("[6/7] Building kicker + team-defense season stats...")
+    weekly_stats_season = get_weekly_stats([season])
+    kicker_season_stats = build_kicker_season_stats(weekly_stats_season, season)
+    defense_season_stats = build_defense_season_stats(pbp_season, schedule_season, season)
+    kicker_export = build_kicker_stats_export(kicker_season_stats, crosswalk)
+    defense_export = build_defense_stats_export(defense_season_stats)
+    print(f"    kicker_stats: {len(kicker_export)} real kickers, defense_stats: {len(defense_export)} teams")
+
+    print("[7/7] Scoping, assembling, validating, writing...")
     rostered_sleeper_ids = {pid for r in rosters_raw for pid in (r.get("players") or [])}
     cw_lookup = crosswalk.dropna(subset=["sleeper_id", "gsis_id"]).drop_duplicates(subset=["sleeper_id"])
     sleeper_to_gsis = dict(zip(cw_lookup["sleeper_id"], cw_lookup["gsis_id"]))
@@ -210,6 +227,7 @@ def main() -> None:
         team_tendencies=team_tendencies,
     )
     payload["simulation"] = None  # a hypothetical post-season week has no real matchups to simulate
+    payload = merge_kicker_and_defense_entries(payload, kicker_export, defense_export)
     print(f"    crosswalk match rate: {crosswalk_report}")
 
     validation_report = validate_export(payload, crosswalk)

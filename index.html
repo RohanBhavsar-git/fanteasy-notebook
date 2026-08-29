@@ -3646,6 +3646,191 @@
     `;
   }
 
+  // QB Context: replaces Opportunity Shares for QB. Snap %/target share/
+  // carry share/red-zone share are meaningless for a position that takes
+  // every offensive snap and never has a target or carry share -- this
+  // panel leads with Rushing Share of Points instead, because this league
+  // pays 0.1/rush yard and 6/rush TD against 0.04/pass yard and 4/pass TD,
+  // so a rushing QB banks real points before he ever throws. That's the
+  // single most decision-relevant QB number this dashboard had nowhere to
+  // show before src/usage.py::add_qb_rushing_share_feature existed.
+  // Same three-state honesty pattern as renderPositionProfilePanel: no
+  // `usage` block at all reads as "awaiting model output"; a real block
+  // with a null field (week 1, before shift(1) has a prior game to read)
+  // reads as "no games yet" per stat, same null branch as shareCard below.
+  function renderQBContextPanel(p) {
+    const advanced = getAdvancedPlayer(p.player_id);
+    if (!advanced) {
+      return `
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">QB Context</div>
+            <div class="panel-note">Dropback &amp; rushing profile, season to date</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">📋</div>
+            <div class="pd-placeholder-title">Awaiting model output</div>
+            <div class="pd-placeholder-text">
+              Once <code>player_advanced_stats.json</code> covers this player, rushing share of points,
+              dropback volume, and passing efficiency will appear here.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    const usage = advanced.usage || {};
+    const rushShare = usage.rushing_share_of_points_s2d;
+    const statCard = (icon, iconClass, label, formatted, sub) => `
+      <div class="injury-stat-card">
+        <div class="injury-stat-icon ${iconClass}">${icon}</div>
+        <div class="injury-stat-content">
+          <div class="injury-stat-label">${label}</div>
+          ${formatted != null
+            ? `<div class="injury-stat-value">${formatted}</div><div class="injury-stat-sub">${sub}</div>`
+            : `<div class="injury-stat-value" style="color: var(--text-muted);">—</div><div class="injury-stat-sub">No games yet</div>`}
+        </div>
+      </div>
+    `;
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">QB Context</div>
+          <div class="panel-note">Dropback &amp; rushing profile, season to date</div>
+        </div>
+        <div class="injury-stat-grid" style="grid-template-columns: 1fr;">
+          ${statCard('🏃', 'orange', 'Rushing Share of Points', rushShare != null ? `${(rushShare * 100).toFixed(1)}%` : null,
+            'Share of this player\'s own custom points that came from rushing -- this league pays 0.1/yd + 6/TD on the ground vs. 0.04/yd + 4/TD through the air')}
+        </div>
+        <div class="injury-stat-grid" style="margin-top: 10px;">
+          ${statCard('🏈', 'blue', 'Dropbacks', usage.dropbacks_s2d != null ? usage.dropbacks_s2d.toFixed(1) : null, 'Per game')}
+          ${statCard('🔄', 'orange', 'Designed Rush Att', usage.designed_rush_attempts_s2d != null ? usage.designed_rush_attempts_s2d.toFixed(1) : null, 'Per game')}
+          ${statCard('🎯', 'purple', 'CPOE', usage.cpoe_s2d != null ? `${usage.cpoe_s2d >= 0 ? '+' : ''}${usage.cpoe_s2d.toFixed(1)}%` : null, 'Completion % over expected')}
+          ${statCard('⚡', 'red', 'EPA / Dropback', usage.epa_per_dropback_s2d != null ? usage.epa_per_dropback_s2d.toFixed(2) : null, 'Real per-play value, pass + sack')}
+        </div>
+      </div>
+    `;
+  }
+
+  // Kicker Stats: replaces Opportunity Shares for K. A kicker has no
+  // snaps, targets, or carries -- what matters is accuracy, and accuracy
+  // varies enormously by distance, so this shows PAT rate plus FG rate
+  // broken out by band rather than one blended FG% that would hide a
+  // 50+ specialist behind a mediocre inside-30 sample (or vice versa).
+  // Built by src/kicker_defense.py::build_kicker_season_stats from
+  // nflverse's weekly stats, which ship FG makes pre-binned by distance --
+  // no play-by-play parsing needed. Season-to-date real totals, not a
+  // point-in-time feature (see that module's docstring) -- no leakage
+  // concern, so no shift(1) here, unlike every stat above.
+  function renderKickerStatsPanel(p) {
+    const advanced = getAdvancedPlayer(p.player_id);
+    const stats = advanced?.kicker_stats;
+    if (!stats) {
+      return `
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Kicker Stats</div>
+            <div class="panel-note">Season to date</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">📋</div>
+            <div class="pd-placeholder-title">Awaiting model output</div>
+            <div class="pd-placeholder-text">
+              Once <code>player_advanced_stats.json</code> covers this player, PAT rate, FG rate by distance
+              band, and attempts per game will appear here.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    const statCard = (icon, iconClass, label, value, sub, isPct) => `
+      <div class="injury-stat-card">
+        <div class="injury-stat-icon ${iconClass}">${icon}</div>
+        <div class="injury-stat-content">
+          <div class="injury-stat-label">${label}</div>
+          ${value != null
+            ? `<div class="injury-stat-value">${isPct ? (value * 100).toFixed(1) + '%' : value}</div><div class="injury-stat-sub">${sub}</div>`
+            : `<div class="injury-stat-value" style="color: var(--text-muted);">—</div><div class="injury-stat-sub">No attempts in this band</div>`}
+        </div>
+      </div>
+    `;
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Kicker Stats</div>
+          <div class="panel-note">${stats.games_played} games this season</div>
+        </div>
+        <div class="injury-stat-grid">
+          ${statCard('🥅', 'blue', 'PAT Rate', stats.pat_rate, `${stats.pat_made}/${stats.pat_att}`, true)}
+          ${statCard('🎯', 'orange', 'FG Under 30', stats.fg_rate_under_30, 'Make rate', true)}
+          ${statCard('🎯', 'purple', 'FG 30-39', stats.fg_rate_30_39, 'Make rate', true)}
+          ${statCard('🎯', 'red', 'FG 40-49', stats.fg_rate_40_49, 'Make rate', true)}
+        </div>
+        <div class="injury-stat-grid" style="margin-top: 10px;">
+          ${statCard('🎯', 'blue', 'FG 50+', stats.fg_rate_50_plus, 'Make rate', true)}
+          ${statCard('🔢', 'orange', 'Attempts', stats.attempts_per_game.toFixed(1), 'FG attempts per game', false)}
+        </div>
+      </div>
+    `;
+  }
+
+  // Defense Stats: replaces Opportunity Shares for DEF (a team unit has
+  // no individual snaps/targets/carries at all). Built by
+  // src/kicker_defense.py::build_defense_season_stats from real pbp +
+  // schedule aggregation -- sacks/interceptions/yards allowed from pbp,
+  // points allowed and games_played from the schedule's own real scores
+  // (not pbp play-counts), so a team with zero sacks this season still
+  // shows 0, not a dropped row. Season-to-date real totals, same no-
+  // leakage reasoning as the kicker panel above.
+  function renderDefenseStatsPanel(p) {
+    const advanced = getAdvancedPlayer(p.player_id);
+    const stats = advanced?.defense_stats;
+    if (!stats) {
+      return `
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Defense Stats</div>
+            <div class="panel-note">Season to date</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">📋</div>
+            <div class="pd-placeholder-title">Awaiting model output</div>
+            <div class="pd-placeholder-text">
+              Once <code>player_advanced_stats.json</code> covers this team, sacks, interceptions, yards
+              allowed, and points allowed will appear here.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    const statCard = (icon, iconClass, label, value, sub) => `
+      <div class="injury-stat-card">
+        <div class="injury-stat-icon ${iconClass}">${icon}</div>
+        <div class="injury-stat-content">
+          <div class="injury-stat-label">${label}</div>
+          <div class="injury-stat-value">${value}</div>
+          <div class="injury-stat-sub">${sub}</div>
+        </div>
+      </div>
+    `;
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Defense Stats</div>
+          <div class="panel-note">${stats.games_played} games this season</div>
+        </div>
+        <div class="injury-stat-grid">
+          ${statCard('🛡️', 'red', 'Sacks', stats.sacks, 'This season')}
+          ${statCard('🙌', 'blue', 'Interceptions', stats.interceptions, 'This season')}
+          ${statCard('✈️', 'orange', 'Pass Yds Allowed', stats.pass_yards_allowed_per_game.toFixed(1), 'Per game')}
+          ${statCard('🏃', 'purple', 'Rush Yds Allowed', stats.rush_yards_allowed_per_game.toFixed(1), 'Per game')}
+        </div>
+        <div class="injury-stat-grid" style="margin-top: 10px;">
+          ${statCard('🔥', 'red', 'Points Allowed', stats.points_allowed_per_game.toFixed(1), 'Per game')}
+        </div>
+      </div>
+    `;
+  }
+
   // Player Detail's plain opportunity-share readout -- no radar, no
   // percentile, no interpretation, just the trailing numbers themselves.
   // Snap %/Target Share come from the export's `usage` block; Carry Share
@@ -3657,7 +3842,16 @@
   // metric), not usage.rz_target_share_ewm3/rz_carry_share_ewm3 separately
   // -- those two have different denominators and can't be added together,
   // see PROJECT_CONTEXT.md's design decisions.
+  //
+  // QB/K/DEF dispatch to their own panels above -- snap %/target share/
+  // carry share/red-zone share only mean something for a position that
+  // splits offensive touches with teammates (RB/WR/TE). This function's
+  // own name stayed put since renderPlayerDetail's call site shouldn't
+  // need to know that dispatch happens at all.
   function renderOpportunitySharesPanel(p, season, week) {
+    if (p.position === 'QB') return renderQBContextPanel(p);
+    if (p.position === 'K') return renderKickerStatsPanel(p);
+    if (p.position === 'DEF') return renderDefenseStatsPanel(p);
     const advanced = getAdvancedPlayer(p.player_id);
     if (!advanced) {
       return `
@@ -3836,6 +4030,12 @@
   // the real chart. Chart.js instantiation happens after this string is
   // inserted into the DOM -- see renderPlayerDetail's post-innerHTML block.
   function renderPositionProfilePanel(p) {
+    // Phases 4/5 only ever built radar/heatmap axes for QB/RB/WR/TE --
+    // K and DEF will NEVER get a `radar` key, not "not yet." An "Awaiting
+    // model output" placeholder that can never resolve promises something
+    // that isn't coming, so this drops the panel entirely for those two
+    // positions instead of showing a permanent dead end.
+    if (p.position === 'K' || p.position === 'DEF') return '';
     const advanced = getAdvancedPlayer(p.player_id);
     const radar = advanced?.radar;
 
@@ -4268,6 +4468,11 @@
   // getHeatmapTitle() is unchanged -- already live, gives the per-position
   // title ("Route Tree", "Rushing Direction & Receiving", etc.).
   function renderFieldHeatmapPanel(p) {
+    // Same reasoning as renderPositionProfilePanel's own K/DEF guard --
+    // there is no field-position data for a kicker or a team defense unit,
+    // and there never will be, so this drops the panel entirely rather
+    // than showing "Awaiting field data" forever.
+    if (p.position === 'K' || p.position === 'DEF') return '';
     const advanced = getAdvancedPlayer(p.player_id);
     const heatmap = advanced?.heatmap;
 
@@ -6686,10 +6891,12 @@
       ${renderOpportunitySharesPanel(p, season, currentWeek)}
       ${renderMonteCarloPanel(p, season, currentWeek)}
 
+      ${p.position === 'K' || p.position === 'DEF' ? '' : `
       <div class="pd-analytics-grid">
         ${renderPositionProfilePanel(p)}
         ${renderFieldHeatmapPanel(p)}
       </div>
+      `}
 
       <div class="panel" style="margin-top: 16px;">
         <div class="panel-header">

@@ -56,18 +56,20 @@ import pandas as pd  # noqa: E402
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
     CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_defense_rankings,
-    build_heatmap_snapshot, build_matchup_simulation, build_matchup_snapshot, build_playoff_odds,
-    build_player_simulation_metrics, build_radar_snapshot, build_starter_quantile_rows,
-    build_target_week_features, build_team_game_id_lookup, build_team_tendencies, build_trend_snapshot,
-    build_usage_snapshot, build_weekly_matchup, build_weekly_xfp, build_xfp_summary, get_export_candidates,
-    get_export_scope, predict_target_week_from_artifact, validate_export, validate_simulation,
+    build_defense_stats_export, build_heatmap_snapshot, build_kicker_stats_export, build_matchup_simulation,
+    build_matchup_snapshot, build_playoff_odds, build_player_simulation_metrics, build_radar_snapshot,
+    build_starter_quantile_rows, build_target_week_features, build_team_game_id_lookup, build_team_tendencies,
+    build_trend_snapshot, build_usage_snapshot, build_weekly_matchup, build_weekly_xfp, build_xfp_summary,
+    get_export_candidates, get_export_scope, merge_kicker_and_defense_entries, predict_target_week_from_artifact,
+    validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
     DATA_OUTPUT, DEFAULT_LEAGUE_ID, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
-    get_sleeper_matchups, get_sleeper_players, get_sleeper_projections, get_sleeper_rosters,
+    get_sleeper_matchups, get_sleeper_players, get_sleeper_projections, get_sleeper_rosters, get_weekly_stats,
 )
+from src.kicker_defense import build_defense_season_stats, build_kicker_season_stats  # noqa: E402
 from src.model import predict_quantiles_with_models, sleeper_projected_points  # noqa: E402
-from src.pipeline import build_raw_features, build_weekly_scored  # noqa: E402
+from src.pipeline import _is_unpublished_season_error, build_raw_features, build_weekly_scored  # noqa: E402
 
 TOP_N_FREE_AGENTS = 300
 
@@ -174,7 +176,8 @@ def build_simulation_block(
     def week_quantiles(week: int) -> pd.DataFrame:
         if week not in quantiles_cache:
             week_features = build_target_week_features(
-                historical_features, candidates, schedule_current, current_season, week, pbp_current
+                historical_features, candidates, schedule_current, current_season, week, pbp_current,
+                scoring_settings,
             )
             # MUST filter to just this week's stub rows before predicting --
             # week_features is the FULL combined frame (all of
@@ -253,7 +256,7 @@ def build_simulation_block(
 
 
 def main() -> None:
-    print("[1/7] Loading model artifact...")
+    print("[1/8] Loading model artifact...")
     artifact = load_model_artifact()
     print(
         f"    model_version={artifact['model_version']} trained_at={artifact['trained_at']} "
@@ -262,7 +265,7 @@ def main() -> None:
 
     league = get_sleeper_league(DEFAULT_LEAGUE_ID, refresh=True)
     current_season = int(league["season"])
-    print(f"[2/7] League {DEFAULT_LEAGUE_ID}: season={current_season} status={league.get('status')}")
+    print(f"[2/8] League {DEFAULT_LEAGUE_ID}: season={current_season} status={league.get('status')}")
 
     schedule_current = get_schedule([current_season], refresh=True)
     target_week = determine_target_week(schedule_current)
@@ -271,7 +274,7 @@ def main() -> None:
         return
     print(f"    target: {current_season} week {target_week}")
 
-    print("[3/7] Fetching current-season data and building this season's raw features...")
+    print("[3/8] Fetching current-season data and building this season's raw features...")
     weekly_scored_current = build_weekly_scored([current_season], DEFAULT_LEAGUE_ID)
     raw_current = build_raw_features(weekly_scored_current, [current_season], DEFAULT_LEAGUE_ID)
     print(f"    {len(raw_current):,} real rows played so far this season")
@@ -285,7 +288,7 @@ def main() -> None:
     sleeper_players = get_sleeper_players()
     crosswalk = get_id_crosswalk()
 
-    print("[4/7] Building target-week features and predicting...")
+    print("[4/8] Building target-week features and predicting...")
     candidates, candidate_report = get_export_candidates(historical_features, sleeper_players, crosswalk)
     print(f"    candidate report: {candidate_report}")
     if candidates.empty:
@@ -322,7 +325,8 @@ def main() -> None:
         pbp_current = pd.DataFrame()  # every pbp-consuming call below treats an empty pbp as "nothing computed yet"
 
     combined_features = build_target_week_features(
-        historical_features, candidates, schedule_current, current_season, target_week, pbp_current
+        historical_features, candidates, schedule_current, current_season, target_week, pbp_current,
+        league["scoring_settings"],
     )
     predictions = predict_target_week_from_artifact(combined_features, current_season, target_week, artifact)
     if predictions.empty:
@@ -362,7 +366,7 @@ def main() -> None:
     weekly_matchup = build_weekly_matchup(historical_features, current_season)
     print(f"    weekly matchup: {len(weekly_matchup)} (player, week) rows for season {current_season}")
 
-    print("[5/7] Scoping to real rosters + top free agents, assembling JSON...")
+    print("[5/8] Scoping to real rosters + top free agents, assembling JSON...")
     rosters_raw = get_sleeper_rosters(DEFAULT_LEAGUE_ID, refresh=True)
     rostered_sleeper_ids = {pid for r in rosters_raw for pid in (r.get("players") or [])}
     cw_lookup = crosswalk.dropna(subset=["sleeper_id", "gsis_id"]).drop_duplicates(subset=["sleeper_id"])
@@ -405,6 +409,32 @@ def main() -> None:
     )
     print(f"    player Monte Carlo metrics: {len(player_sim_metrics)} candidates")
 
+    # K and DEF are out of scope for the projection model and never appear
+    # in weekly_scored/historical_features at all (FANTASY_POSITIONS
+    # excludes both), so this is a real, separate fetch scoped to just
+    # the current live season -- pbp_current/schedule_current are already
+    # fetched above and reused as-is; K needs a fresh raw weekly-stats
+    # fetch since K rows never enter weekly_scored to begin with. Same
+    # "a not-yet-published season 404s, that's expected here, not a bug"
+    # tolerance build_weekly_scored's own current-season call already
+    # applies -- this is the second caller in this pipeline that
+    # legitimately expects it (see build_weekly_scored's own docstring).
+    print("[6/8] Building kicker + team-defense season stats...")
+    try:
+        weekly_stats_current = get_weekly_stats([current_season])
+    except ConnectionError as e:
+        if not _is_unpublished_season_error(e):
+            raise
+        print(f"    weekly stats: season {current_season} has no published stats yet -- kicker_stats will be empty.")
+        weekly_stats_current = pd.DataFrame(
+            columns=["player_id", "player_display_name", "team", "position", "season", "week", "season_type"]
+        )
+    kicker_season_stats = build_kicker_season_stats(weekly_stats_current, current_season)
+    defense_season_stats = build_defense_season_stats(pbp_current, schedule_current, current_season)
+    kicker_export = build_kicker_stats_export(kicker_season_stats, crosswalk)
+    defense_export = build_defense_stats_export(defense_season_stats)
+    print(f"    kicker_stats: {len(kicker_export)} real kickers, defense_stats: {len(defense_export)} teams")
+
     payload, crosswalk_report = assemble_player_advanced_stats(
         scoped_predictions, usage, trend, xfp_summary, weekly_xfp, radar, heatmap, crosswalk,
         current_season, target_week, xfp_season, artifact["seasons_trained"], artifact["model_version"],
@@ -416,12 +446,13 @@ def main() -> None:
         weekly_matchup=weekly_matchup,
         team_tendencies=team_tendencies,
     )
+    payload = merge_kicker_and_defense_entries(payload, kicker_export, defense_export)
     print(f"    crosswalk match rate: {crosswalk_report}")
 
     validation_report = validate_export(payload, crosswalk)
     print(f"    validation: {validation_report}")
 
-    print("[6/7] Simulating matchup win probability + playoff odds...")
+    print("[7/8] Simulating matchup win probability + playoff odds...")
     simulation = build_simulation_block(
         league, DEFAULT_LEAGUE_ID, current_season, target_week, historical_features, candidates,
         schedule_current, sleeper_players, crosswalk, cw_lookup, rosters_raw, artifact, pbp_current,
@@ -433,7 +464,7 @@ def main() -> None:
         print("    no real matchups for this league yet (pre-draft/off-season) -- simulation is null")
     payload["simulation"] = simulation
 
-    print("[7/7] Writing output...")
+    print("[8/8] Writing output...")
     out_path = DATA_OUTPUT / "player_advanced_stats.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:

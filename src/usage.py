@@ -2143,6 +2143,95 @@ def add_trend_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ==========================================================================
+# QB RUSHING SHARE OF POINTS — export-layer descriptive signal
+# ==========================================================================
+# What share of a QB's own custom_points came from rushing (rush_yd +
+# rush_td + rush_2pt) rather than passing. This league pays 0.1/rushing
+# yard and 6/rushing TD against 0.04/passing yard and 4/passing TD, so a
+# rushing QB banks points before he throws a single pass -- the single
+# most decision-relevant number the old Opportunity Shares panel never
+# showed for QB (snap %/target share/carry share/red-zone share are all
+# meaningless for a starting quarterback, who takes every snap and has no
+# target share at all).
+#
+# Not a model feature, same reasoning as Family 7's rz_opportunity_share:
+# an export-layer descriptive signal, downstream of the model's own
+# feature set (FEATURE_COLUMNS_BY_POSITION), not folded in without a
+# measured reason -- see PROJECT_CONTEXT.md's QB xFP as a Model Feature
+# findings for what "folded in without measuring" already cost once.
+QB_RUSHING_SHARE_OUTPUT_COLUMNS = [
+    "rushing_share_of_points", "rushing_share_of_points_ewm3", "rushing_share_of_points_s2d",
+]
+
+
+def add_qb_rushing_share_feature(df: pd.DataFrame, scoring_settings: dict) -> pd.DataFrame:
+    """
+    Add rushing_share_of_points (QB-only) and its point-in-time-safe
+    _ewm3/_s2d rolled versions -- same recipe as add_trend_features's own
+    rz_opportunity_share: window the RAW per-week ratio, then shift(1)
+    within (player_id, season), so week N's rolled values never see week
+    N's own row.
+
+    rushing_share_of_points = (rushing_yards*rush_yd + rushing_tds*rush_td
+    + rushing_2pt_conversions*rush_2pt) / custom_points, using THIS
+    league's real scoring weights (never hardcoded -- a league that
+    reweights rushing vs. passing would silently change what "banks
+    points" means). Null wherever custom_points is exactly 0 that week (a
+    share with a zero denominator has no defined value, same convention
+    as scramble_rate), and null for every non-QB row -- the concept
+    doesn't apply to a player who doesn't throw.
+
+    Idempotent: existing output columns are dropped before recomputing.
+
+    Args:
+        df: player-week frame with player_id, position, season, week,
+            custom_points, rushing_yards, rushing_tds,
+            rushing_2pt_conversions (i.e. weekly_scored's own raw columns,
+            still present at this point in the pipeline).
+        scoring_settings: from get_sleeper_league()["scoring_settings"].
+
+    Returns:
+        Copy of df with QB_RUSHING_SHARE_OUTPUT_COLUMNS added.
+    """
+    required = ["player_id", "position", "season", "week", "custom_points",
+                "rushing_yards", "rushing_tds", "rushing_2pt_conversions"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"add_qb_rushing_share_feature: df is missing columns {missing}")
+
+    out = df.drop(columns=[c for c in QB_RUSHING_SHARE_OUTPUT_COLUMNS if c in df.columns])
+
+    rush_yd_wt = float(scoring_settings.get("rush_yd") or 0)
+    rush_td_wt = float(scoring_settings.get("rush_td") or 0)
+    rush_2pt_wt = float(scoring_settings.get("rush_2pt") or 0)
+    rushing_points = (
+        out["rushing_yards"].fillna(0) * rush_yd_wt
+        + out["rushing_tds"].fillna(0) * rush_td_wt
+        + out["rushing_2pt_conversions"].fillna(0) * rush_2pt_wt
+    )
+    share = (rushing_points / out["custom_points"]).where(out["custom_points"] != 0)
+    rushing_share_of_points = share.where(out["position"] == "QB").rename("rushing_share_of_points")
+
+    sorted_share = rushing_share_of_points.reindex(out.index).to_frame().join(out[["player_id", "season", "week"]])
+    sorted_share = sorted_share.sort_values(["player_id", "season", "week"])
+    group_keys = [sorted_share["player_id"], sorted_share["season"]]
+    grouped = sorted_share.groupby(["player_id", "season"], sort=False)
+
+    def _shift_within_group(s: pd.Series) -> pd.Series:
+        return s.groupby(group_keys, sort=False).shift(1)
+
+    ewm_raw = grouped["rushing_share_of_points"].ewm(halflife=EWM_HALFLIFE, min_periods=1).mean().droplevel([0, 1])
+    s2d_raw = grouped["rushing_share_of_points"].expanding().mean().droplevel([0, 1])
+
+    new_cols = pd.DataFrame({
+        "rushing_share_of_points": rushing_share_of_points,
+        "rushing_share_of_points_ewm3": _shift_within_group(ewm_raw),
+        "rushing_share_of_points_s2d": _shift_within_group(s2d_raw),
+    }).reindex(out.index)
+    return pd.concat([out, new_cols], axis=1)
+
+
 def get_usage_trend_leaders(
     df: pd.DataFrame,
     season: int,

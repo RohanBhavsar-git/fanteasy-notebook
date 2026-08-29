@@ -55,6 +55,7 @@ from src.usage import (  # noqa: E402
     add_context_features,
     add_efficiency_features,
     add_opponent_strength_features,
+    add_qb_rushing_share_feature,
     add_rolling_features,
     add_situational_features,
     add_snap_features,
@@ -449,6 +450,60 @@ def test_qb_player_ids_returns_only_qb_position_rows():
         "position": ["QB", "RB", "QB"],
     })
     assert _qb_player_ids(df) == {"QB1", "QB2"}
+
+
+# ==========================================================================
+# QB rushing share of points -- export-layer descriptive signal
+# ==========================================================================
+def test_qb_rushing_share_null_for_non_qb_and_real_for_qb():
+    scoring = {"rush_yd": 0.1, "rush_td": 6, "rush_2pt": 2}
+    df = pd.DataFrame({
+        "player_id": ["QB1", "RB1"],
+        "position": ["QB", "RB"],
+        "season": [2024, 2024],
+        "week": [1, 1],
+        "custom_points": [20.0, 20.0],
+        "rushing_yards": [50.0, 50.0],
+        "rushing_tds": [1.0, 1.0],
+        "rushing_2pt_conversions": [0.0, 0.0],
+    })
+    out = add_qb_rushing_share_feature(df, scoring)
+    # rushing_points = 50*0.1 + 1*6 = 11.0; share = 11/20 = 0.55
+    assert out.loc[out["player_id"] == "QB1", "rushing_share_of_points"].iloc[0] == pytest.approx(0.55)
+    assert pd.isna(out.loc[out["player_id"] == "RB1", "rushing_share_of_points"].iloc[0])
+
+
+def test_qb_rushing_share_null_when_custom_points_is_zero():
+    scoring = {"rush_yd": 0.1, "rush_td": 6, "rush_2pt": 2}
+    df = pd.DataFrame({
+        "player_id": ["QB1"], "position": ["QB"], "season": [2024], "week": [1],
+        "custom_points": [0.0], "rushing_yards": [0.0], "rushing_tds": [0.0],
+        "rushing_2pt_conversions": [0.0],
+    })
+    out = add_qb_rushing_share_feature(df, scoring)
+    assert pd.isna(out["rushing_share_of_points"].iloc[0])
+
+
+def test_qb_rushing_share_rolled_columns_never_see_their_own_week():
+    """Same shift(1)-within-group mechanism as add_trend_features's own
+    rz_opportunity_share -- week 2's _s2d must reflect only week 1."""
+    scoring = {"rush_yd": 0.1, "rush_td": 6, "rush_2pt": 2}
+    df = pd.DataFrame({
+        "player_id": ["QB1", "QB1"],
+        "position": ["QB", "QB"],
+        "season": [2024, 2024],
+        "week": [1, 2],
+        "custom_points": [20.0, 20.0],
+        "rushing_yards": [100.0, 0.0],  # week 1: big rushing share; week 2: zero rushing
+        "rushing_tds": [0.0, 0.0],
+        "rushing_2pt_conversions": [0.0, 0.0],
+    })
+    out = add_qb_rushing_share_feature(df, scoring)
+    week1 = out[out["week"] == 1].iloc[0]
+    week2 = out[out["week"] == 2].iloc[0]
+    assert pd.isna(week1["rushing_share_of_points_s2d"])  # no prior week yet
+    # week 2's s2d must equal week 1's raw share (100*0.1/20 = 0.5), not week 2's own (0.0)
+    assert week2["rushing_share_of_points_s2d"] == pytest.approx(0.5)
 
 
 # ==========================================================================

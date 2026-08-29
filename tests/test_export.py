@@ -17,7 +17,9 @@ from src.export import (  # noqa: E402
     assemble_player_advanced_stats,
     assemble_simulation_block,
     build_defense_rankings,
+    build_defense_stats_export,
     build_heatmap_snapshot,
+    build_kicker_stats_export,
     build_matchup_simulation,
     build_matchup_snapshot,
     build_playoff_odds,
@@ -35,6 +37,7 @@ from src.export import (  # noqa: E402
     get_export_candidates,
     get_export_scope,
     get_season_team_map,
+    merge_kicker_and_defense_entries,
     normalize_team_code,
     position_starter_counts,
     validate_export,
@@ -198,6 +201,10 @@ def test_build_target_week_features_new_season_row_is_null_in_season_and_carries
         row = {
             "player_id": "p1", "position": "WR", "team": "KC",
             "season": 2025, "week": week, "offense_pct": 0.8,
+            # add_qb_rushing_share_feature's own required columns -- unused
+            # for a WR row (masked to null there) but must exist.
+            "custom_points": 10.0, "rushing_yards": 0.0, "rushing_tds": 0.0,
+            "rushing_2pt_conversions": 0.0,
         }
         for col in ROLLING_SOURCE_COLUMNS:
             row[col] = 5.0
@@ -213,8 +220,10 @@ def test_build_target_week_features_new_season_row_is_null_in_season_and_carries
         "temp": np.nan, "wind": np.nan,
     }])
 
+    scoring_settings = {"rush_yd": 0.1, "rush_td": 6, "rush_2pt": 2}
     combined = build_target_week_features(
-        historical, candidates, schedule, target_season=2026, target_week=1, pbp=pd.DataFrame()
+        historical, candidates, schedule, target_season=2026, target_week=1, pbp=pd.DataFrame(),
+        scoring_settings=scoring_settings,
     )
     stub_row = combined[(combined["season"] == 2026) & (combined["week"] == 1)].iloc[0]
 
@@ -708,6 +717,12 @@ def test_assemble_and_validate_export_round_trip():
         "prev_season_touch_share": [np.nan, 0.45],
         "prev_season_offense_pct": [0.9, 0.65],
         "xfp_vol": [np.nan, 3.2],
+        # QB-specific fields -- real for the QB row (00-0001), null for RB
+        "dropbacks_s2d": [35.2, np.nan],
+        "designed_rush_attempts_s2d": [3.1, np.nan],
+        "rushing_share_of_points_s2d": [0.22, np.nan],
+        "cpoe_s2d": [1.8, np.nan],
+        "epa_per_dropback_s2d": [0.12, np.nan],
     })
     trend = pd.DataFrame({
         "player_id": ["00-0001", "00-0002"],
@@ -781,6 +796,12 @@ def test_assemble_and_validate_export_round_trip():
     assert payload["players"]["4984"]["usage"]["xfp_vol"] is None
     assert payload["players"]["5001"]["usage"]["xfp_vol"] == pytest.approx(3.2)
 
+    # QB-specific fields ride the same usage block, real for the QB (4984 =
+    # gsis 00-0001) and null for the RB (5001 = gsis 00-0002).
+    assert payload["players"]["4984"]["usage"]["rushing_share_of_points_s2d"] == pytest.approx(0.22)
+    assert payload["players"]["4984"]["usage"]["dropbacks_s2d"] == pytest.approx(35.2)
+    assert payload["players"]["5001"]["usage"]["rushing_share_of_points_s2d"] is None
+
     # Phase 3' trend block: renamed to human-readable keys, null-safe,
     # direction strings pass through untouched.
     assert payload["players"]["4984"]["trend"]["snap_share"] == {
@@ -808,6 +829,41 @@ def test_assemble_and_validate_export_round_trip():
 
     validation = validate_export(payload, crosswalk)
     assert validation["n_players"] == 2
+
+    # K/DEF entries merge into the SAME players dict, with a genuinely
+    # different (smaller) schema -- no projection/usage/trend/xfp/radar/
+    # heatmap at all. validate_export must not choke on them, and n_players
+    # must stay scoped to the "full" QB/RB/WR/TE-shaped entries -- K/DEF get
+    # their own n_kicker_stats/n_defense_stats counts instead.
+    kicker_stats = pd.DataFrame({
+        "player_id": ["00-0099"], "player_display_name": ["Test Kicker"], "team": ["KC"],
+        "games_played": [10], "fg_made": [15], "fg_att": [17],
+        "pat_made": [20], "pat_att": [21], "pat_rate": [0.9524],
+        "attempts_per_game": [1.7],
+        "fg_rate_under_30": [1.0], "fg_rate_30_39": [0.9], "fg_rate_40_49": [0.8], "fg_rate_50_plus": [0.5],
+    })
+    crosswalk_with_k = pd.concat([crosswalk, pd.DataFrame({
+        "gsis_id": ["00-0099"], "sleeper_id": ["9001"],
+    })], ignore_index=True)
+    kicker_export = build_kicker_stats_export(kicker_stats, crosswalk_with_k)
+    assert set(kicker_export.keys()) == {"9001"}
+    assert kicker_export["9001"]["kicker_stats"]["fg_made"] == pytest.approx(15.0)
+
+    defense_stats = pd.DataFrame({
+        "team": ["KC"], "games_played": [10], "sacks": [25.0], "interceptions": [8.0],
+        "pass_yards_allowed_per_game": [210.0], "rush_yards_allowed_per_game": [100.0],
+        "points_allowed_per_game": [20.0],
+    })
+    defense_export = build_defense_stats_export(defense_stats)
+    assert set(defense_export.keys()) == {"KC"}
+
+    payload = merge_kicker_and_defense_entries(payload, kicker_export, defense_export)
+    assert set(payload["players"].keys()) == {"4984", "5001", "9001", "KC"}
+
+    validation2 = validate_export(payload, crosswalk_with_k)
+    assert validation2["n_players"] == 2  # unchanged -- K/DEF excluded from this count
+    assert validation2["n_kicker_stats"] == 1
+    assert validation2["n_defense_stats"] == 1
 
 
 def test_assemble_player_advanced_stats_wires_season_team_when_provided():

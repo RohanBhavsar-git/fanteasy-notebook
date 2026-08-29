@@ -69,9 +69,12 @@ logger = logging.getLogger(__name__)
 # `required` check); custom_points is the one extra column
 # src/export.py::build_xfp_summary needs that ISN'T itself part of
 # ROLLING_SOURCE_COLUMNS (xfp is; the actual outcome it's compared against
-# is not).
+# is not). rushing_yards/rushing_tds/rushing_2pt_conversions are the same
+# story for add_qb_rushing_share_feature -- its own raw numerator, not an
+# engineered ROLLING_SOURCE_COLUMNS output.
 HISTORY_SEED_COLUMNS = list(dict.fromkeys(
-    ["player_id", "position", "team", "season", "week", "offense_pct", "custom_points"]
+    ["player_id", "position", "team", "season", "week", "offense_pct", "custom_points",
+     "rushing_yards", "rushing_tds", "rushing_2pt_conversions"]
     + list(ROLLING_SOURCE_COLUMNS)
 ))  # offense_pct is ALSO part of ROLLING_SOURCE_COLUMNS (SNAP_OUTPUT_COLUMNS) --
    # dict.fromkeys dedupes while preserving order, since a duplicate column
