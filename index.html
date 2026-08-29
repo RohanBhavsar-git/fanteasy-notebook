@@ -3440,6 +3440,17 @@
     const positive = r.fp_over_expected > 0;
     const sign = positive ? '+' : '';
     const color = positive ? 'var(--success)' : 'var(--danger)';
+    // QB's fp_over_expected strips out meaningfully less luck than RB/WR/TE's
+    // does (split-half reliability check: QB residual correlation 0.37 vs.
+    // 0.19 for RB/WR/TE -- see PROJECT_CONTEXT.md's QB xFP findings) -- a
+    // real passer's own accuracy/decision-making persists across weeks more
+    // than a receiver's catch variance does, so a chunk of a QB's number
+    // here is real, repeatable skill, not just bounce. Said inline, not
+    // buried, so a big QB number doesn't read with the same confidence as
+    // the same number for a receiver.
+    const qbCaveat = player.position === 'QB'
+      ? `<div class="kpi-sub" style="color: var(--text-muted);">QB: partly real accuracy, not purely luck</div>`
+      : '';
     return `
       <div class="kpi-card" data-player-id="${r.playerId}" style="cursor: pointer;">
         <div class="kpi-icon ${positive ? 'trend' : 'target'}">🎲</div>
@@ -3447,6 +3458,7 @@
           <div class="kpi-label">${player.name} <span class="pos-badge ${player.position}" style="font-size: 9px; padding: 1px 4px;">${player.position}</span></div>
           <div class="kpi-value" style="color: ${color};">${sign}${r.fp_over_expected.toFixed(1)} pts</div>
           <div class="kpi-sub">${r.season_actual.toFixed(1)} actual vs. ${r.season_xfp.toFixed(1)} expected</div>
+          ${qbCaveat}
         </div>
       </div>
     `;
@@ -3495,7 +3507,7 @@
       <div class="panel">
         <div class="panel-header">
           <div class="panel-title">xFP Regression</div>
-          <div class="panel-note">Luck indicator, not a prediction</div>
+          <div class="panel-note">Luck indicator, not a prediction · weaker signal for QB</div>
         </div>
         ${body}
       </div>
@@ -6183,8 +6195,8 @@
     const xfpSeasonMismatch = xfpSeason != null && season != null && Number(xfpSeason) !== Number(season);
     const fpOverExpLabel = xfpSeasonMismatch ? `FP Over Exp (${xfpSeason})` : 'FP Over Exp';
     const fpOverExpTooltip = xfpSeasonMismatch
-      ? `${xfpSeason} season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection. Showing ${xfpSeason} because ${season} has no games played yet.`
-      : `Season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection.`;
+      ? `${xfpSeason} season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection. Showing ${xfpSeason} because ${season} has no games played yet. Weaker luck signal for QB than for RB/WR/TE (hover a QB's own value for why).`
+      : `Season points scored above what this player's opportunities alone implied (xFP) — a luck indicator, not a projection. Weaker luck signal for QB than for RB/WR/TE (hover a QB's own value for why).`;
 
     const teamOptions = ['ALL', ...NFL_TEAMS].sort();
     const totalRostered = state.players.filter(p => p.ownerRosterId).length;
@@ -6315,8 +6327,18 @@
               const trendCell = p.trendDirection
                 ? `<span style="color: ${p.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${p.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[p.trendFeature]}</span>`
                 : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+              // QB's fp_over_expected strips out meaningfully less luck than
+              // RB/WR/TE's does (split-half check: 0.37 vs. 0.19 residual
+              // correlation -- see PROJECT_CONTEXT.md's QB xFP findings), so
+              // a QB cell gets its own title rather than sharing the column
+              // header's tooltip -- a big QB number shouldn't read with the
+              // same "this is mostly luck" confidence as the same number
+              // for a receiver.
+              const fpOverExpCellTitle = p.position === 'QB'
+                ? 'For QB, this reflects real accuracy/decision-making more than luck -- a large number here is less certainly luck than the same number for RB/WR/TE.'
+                : '';
               const fpOverExpCell = p.fpOverExp != null
-                ? `<span style="font-weight: 700; color: ${p.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};">${p.fpOverExp > 0 ? '+' : ''}${p.fpOverExp.toFixed(1)}</span>`
+                ? `<span style="font-weight: 700; color: ${p.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};"${fpOverExpCellTitle ? ` title="${fpOverExpCellTitle}"` : ''}>${p.fpOverExp > 0 ? '+' : ''}${p.fpOverExp.toFixed(1)}</span>`
                 : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
               const volatilityCell = p.volatility != null
                 ? `<span style="font-weight: 700;">${p.volatility.toFixed(1)}</span>`
@@ -7729,7 +7751,7 @@
             <tr>
               <th data-sort="name" class="${f.sortBy === 'name' ? 'sorted' : ''}">Player ${sortArrow('name')}</th>
               <th class="right" data-sort="seasonPts" title="Real total fantasy points scored in the ${season} season, and games played -- grounding context for every column here.">Season Pts ${sortArrow('seasonPts')}</th>
-              <th class="right" data-sort="fpOverExp" title="${season} points scored above what this player's opportunity (targets/carries/field position for RB/WR/TE, dropbacks/designed rushes for QB) implied. Positive = scored more than their usage predicted — a fade candidate. Negative = scored less — a buy-low candidate. A luck indicator, not a rating.">FP Over Exp ${sortArrow('fpOverExp')}</th>
+              <th class="right" data-sort="fpOverExp" title="${season} points scored above what this player's opportunity (targets/carries/field position for RB/WR/TE, dropbacks/designed rushes for QB) implied. Positive = scored more than their usage predicted — a fade candidate. Negative = scored less — a buy-low candidate. A luck indicator, not a rating. Weaker luck signal for QB than for RB/WR/TE (hover a QB's own value for why).">FP Over Exp ${sortArrow('fpOverExp')}</th>
               <th class="right" data-sort="volatility" title="Week-to-week swing in this player's expected points (xFP) during the ${season} season, in points. Lower = steadier floor player; higher = boom-or-bust ceiling player.">Volatility ${sortArrow('volatility')}</th>
               <th class="right" data-sort="volumePct" title="Percentile rank among startable players at this position for the ${season} season's volume metric (Pass/Touch/Target Volume, by position — see the label under each value). A rank, not a rating.">Volume ${sortArrow('volumePct')}</th>
               <th class="right" data-sort="efficiencyPct" title="Percentile rank among startable players at this position for the ${season} season's efficiency metric (EPA/Dropback, Yards/Carry, or YAC/Reception, by position — see the label under each value). A rank, not a rating.">Efficiency ${sortArrow('efficiencyPct')}</th>
@@ -7738,8 +7760,16 @@
           </thead>
           <tbody>
             ${rows.slice(0, 100).map(r => {
+              // Same QB caveat as the Players table's identical cell -- QB's
+              // fp_over_expected strips out meaningfully less luck (0.37 vs.
+              // 0.19 residual correlation, see PROJECT_CONTEXT.md's QB xFP
+              // findings), so it gets its own title rather than sharing the
+              // column header's single tooltip.
+              const fpCellTitle = r.position === 'QB'
+                ? 'For QB, this reflects real accuracy/decision-making more than luck -- a large number here is less certainly luck than the same number for RB/WR/TE.'
+                : '';
               const fpCell = r.fpOverExp != null
-                ? `<span style="font-weight: 700; color: ${r.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};">${r.fpOverExp > 0 ? '+' : ''}${r.fpOverExp.toFixed(1)}</span>`
+                ? `<span style="font-weight: 700; color: ${r.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};"${fpCellTitle ? ` title="${fpCellTitle}"` : ''}>${r.fpOverExp > 0 ? '+' : ''}${r.fpOverExp.toFixed(1)}</span>`
                 : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
               const volCell = r.volatility != null
                 ? `<span style="font-weight: 700;">${r.volatility.toFixed(1)}</span>`
