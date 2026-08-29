@@ -927,21 +927,35 @@ def _team_tendency_row_to_dict(row) -> dict:
             "sample_targets": target_sample,
             "sparse": target_sample is not None and target_sample < TEAM_TENDENCY_SPARSE_PLAYS,
         },
+        "points_allowed": {
+            "air": _team_tendency_metric_block(
+                row, "xfp_allowed_air_ewm3", "xfp_allowed_air_s2d", None, decimals=1
+            ),
+            "ground": _team_tendency_metric_block(
+                row, "xfp_allowed_ground_ewm3", "xfp_allowed_ground_s2d", None, decimals=1
+            ),
+        },
     }
 
 
 def build_team_tendencies(
-    combined_features: pd.DataFrame, pbp: pd.DataFrame, target_season: int, target_week: int
+    combined_features: pd.DataFrame, pbp: pd.DataFrame, schedule: pd.DataFrame,
+    scoring_settings: dict, target_season: int, target_week: int,
 ) -> dict:
     """
     Every team's CURRENT (as of target_week -- real games strictly before
-    target_week only) offense-level identity: PROE, pace, red-zone
-    play-calling split, target distribution by position. Powers the
+    target_week only) offense-level identity -- PROE, pace, red-zone
+    play-calling split, target distribution by position -- plus one
+    DEFENSIVE complement: real fantasy points allowed to RB/WR/TE, split
+    by air vs. ground (build_defense_air_ground_split). Powers the
     dashboard's Team Tendencies tab. Not a ranked list (unlike
     build_defense_rankings) -- there's no single good/bad direction for
     pace or PROE the way there is for "xFP allowed," so this returns a
     plain {team: {...}} dict, the same per-entity-dict shape radar/heatmap
-    already use.
+    already use; points_allowed rides along in that same per-team dict
+    rather than becoming a second ranked list, since the question it
+    answers ("which of my players does this matchup favor") is read
+    per-team, on the same page as this team's own offensive identity.
 
     A team missing from the returned dict simply has no prior in-season
     game yet (week 1 of a season, or an early-season target week) -- not
@@ -959,15 +973,21 @@ def build_team_tendencies(
         return {}
 
     from src.team_tendencies import build_team_tendency_table
+    from src.usage import build_defense_air_ground_split
 
     table = build_team_tendency_table(combined_features, pbp)
+    air_ground = build_defense_air_ground_split(combined_features, pbp, schedule, scoring_settings)
+    table = table.merge(air_ground, on=["team", "season", "week"], how="left")
     week_rows = table[(table["season"] == target_season) & (table["week"] == target_week)]
     week_rows = week_rows[week_rows["proe_ewm3"].notna()]
 
     return {row["team"]: _team_tendency_row_to_dict(row) for _, row in week_rows.iterrows()}
 
 
-def build_season_team_tendencies(historical_features: pd.DataFrame, pbp: pd.DataFrame, season: int) -> dict:
+def build_season_team_tendencies(
+    historical_features: pd.DataFrame, pbp: pd.DataFrame, schedule: pd.DataFrame,
+    scoring_settings: dict, season: int,
+) -> dict:
     """
     Season-ARCHIVE counterpart to build_team_tendencies -- a full completed
     season's real team identity, unshifted (same "nothing left to leak,
@@ -976,12 +996,15 @@ def build_season_team_tendencies(historical_features: pd.DataFrame, pbp: pd.Data
     identical here (both just the real season-long weighted average) --
     kept as two separate keys anyway so index.html's rendering needs no
     archive-specific branch, the exact convention build_season_defense_
-    rankings already established.
+    rankings already established. Same story for points_allowed's air/
+    ground split, added alongside the rest of this dict.
 
     Weighted by each week's own real sample size (a 70-play week counts
     more than a 40-play week), not a plain mean of weekly rates.
     """
+    from src.features import compute_custom_score
     from src.team_tendencies import _team_week_pace, _team_week_play_rates, _team_week_target_distribution
+    from src.usage import OPP_STRENGTH_POSITIONS, _carry_play_frame, _target_play_frame, _team_week_opponent
 
     weekly_scored = historical_features[historical_features["season"] == season]
     pbp_season = pbp[pbp["season"] == season]
@@ -990,6 +1013,49 @@ def build_season_team_tendencies(historical_features: pd.DataFrame, pbp: pd.Data
     pace = _team_week_pace(pbp_season)
     position_lookup = weekly_scored[["player_id", "position", "season"]].drop_duplicates(subset=["player_id", "season"])
     targets = _team_week_target_distribution(pbp_season, position_lookup)
+
+    # Air/ground split of real fantasy points allowed to RB/WR/TE -- same
+    # "nothing left to leak, this is a retrospective" reasoning as the rest
+    # of this function, so the bucket rate is a plain WHOLE-SEASON mean
+    # (not the point-in-time expanding window build_defense_air_ground_
+    # split uses for the live path), applied back to that same season's
+    # own plays. _target_play_frame/_carry_play_frame's bucket strings
+    # never collide (see build_defense_air_ground_split's own docstring),
+    # so target-derived and carry-derived plays never share a rate.
+    target_plays = _target_play_frame(pbp_season)
+    target_plays["points"] = compute_custom_score(target_plays, scoring_settings, warn=False)
+    carry_plays = _carry_play_frame(pbp_season)
+    carry_plays["points"] = compute_custom_score(carry_plays, scoring_settings, warn=False)
+
+    def _whole_season_xfp(plays: pd.DataFrame, out_col: str) -> pd.DataFrame:
+        rate_table = plays.groupby("bucket")["points"].mean()
+        tmp = plays[["player_id", "season", "week"]].copy()
+        tmp["rate"] = plays["bucket"].map(rate_table)
+        return (
+            tmp.groupby(["player_id", "season", "week"])["rate"].sum(min_count=1)
+            .reset_index(name=out_col)
+        )
+
+    air_xfp = _whole_season_xfp(target_plays, "xfp_air")
+    ground_xfp = _whole_season_xfp(carry_plays, "xfp_ground")
+
+    pos_players = weekly_scored[weekly_scored["position"].isin(OPP_STRENGTH_POSITIONS)][
+        ["player_id", "team", "season", "week"]
+    ].drop_duplicates()
+    pos_players = pos_players.merge(air_xfp, on=["player_id", "season", "week"], how="left")
+    pos_players = pos_players.merge(ground_xfp, on=["player_id", "season", "week"], how="left")
+    pos_players["xfp_air"] = pos_players["xfp_air"].fillna(0)
+    pos_players["xfp_ground"] = pos_players["xfp_ground"].fillna(0)
+
+    generated_weekly_ag = (
+        pos_players.groupby(["team", "week"])[["xfp_air", "xfp_ground"]].sum(min_count=1).reset_index()
+    )
+    team_week_opp_ag = _team_week_opponent(schedule[schedule["season"] == season])
+    allowed_weekly_ag = generated_weekly_ag.merge(
+        team_week_opp_ag, on=["team", "week"], how="left"
+    ).dropna(subset=["opponent"])
+    air_allowed = allowed_weekly_ag.groupby("opponent")["xfp_air"].mean()
+    ground_allowed = allowed_weekly_ag.groupby("opponent")["xfp_ground"].mean()
 
     def _weighted(df: pd.DataFrame, value_col: str, weight_col: str) -> pd.Series:
         w = df[weight_col].fillna(0)
@@ -1026,6 +1092,8 @@ def build_season_team_tendencies(historical_features: pd.DataFrame, pbp: pd.Data
             "neutral_plays_s2d_n": neutral_n.get(team), "pace_gaps_s2d_n": pace_n.get(team),
             "rz20_plays_s2d_n": rz20_n.get(team), "rz10_plays_s2d_n": rz10_n.get(team),
             "team_targets_s2d_n": target_n.get(team),
+            "xfp_allowed_air_ewm3": air_allowed.get(team), "xfp_allowed_air_s2d": air_allowed.get(team),
+            "xfp_allowed_ground_ewm3": ground_allowed.get(team), "xfp_allowed_ground_s2d": ground_allowed.get(team),
         })
         if pd.isna(row["proe_ewm3"]):
             continue

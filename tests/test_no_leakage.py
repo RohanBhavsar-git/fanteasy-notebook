@@ -62,7 +62,9 @@ from src.usage import (  # noqa: E402
     add_trend_features,
     add_volume_features,
     add_xfp_features,
+    build_defense_air_ground_split,
     build_defense_strength_table,
+    DEFENSE_AIR_GROUND_OUTPUT_COLUMNS,
     _bucket_rate_table,
     _dropback_play_frame,
     _qb_player_ids,
@@ -653,6 +655,48 @@ def test_defense_strength_table_opponent_adjustment_direction(featured_df, sched
     assert len(below_average_schedule) > 0
     assert (above_average_schedule["allowed_adj_ewm3"] < above_average_schedule["allowed_ewm3"]).all()
     assert (below_average_schedule["allowed_adj_ewm3"] > below_average_schedule["allowed_ewm3"]).all()
+
+
+@pytest.mark.parametrize("season,boundary_week", BOUNDARIES)
+def test_defense_air_ground_split_no_future_leakage(
+    featured_df, pbp, schedule, scoring_settings, season, boundary_week
+):
+    """
+    Same black-box truncate-and-compare pattern as every other family in
+    this file: a defense's real air/ground allowed value at week N must
+    be unchanged when weeks strictly after N are removed from the
+    source pbp -- proves the air/ground split doesn't leak the very
+    games it's trying to describe. `cutoffs` inside the function is
+    derived from featured_df's own (season, week) pairs, not from pbp,
+    so truncating pbp changes what's AVAILABLE to compute from without
+    changing which (team, week) rows are asked for -- the same "scaffold
+    from df, not from the upstream source" reasoning
+    build_team_tendency_table's own docstring documents.
+    """
+    pbp_truncated = _truncate_after(pbp, season, boundary_week)
+
+    full = build_defense_air_ground_split(featured_df, pbp, schedule, scoring_settings)
+    truncated = build_defense_air_ground_split(featured_df, pbp_truncated, schedule, scoring_settings)
+
+    mask = (full["season"] == season) & (full["week"] <= boundary_week)
+    cols = ["team", "season", "week"] + DEFENSE_AIR_GROUND_OUTPUT_COLUMNS
+    left = full.loc[mask, cols].sort_values(["team", "week"]).reset_index(drop=True)
+    right = truncated.loc[mask, cols].sort_values(["team", "week"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(left, right)
+
+
+def test_defense_air_ground_split_produces_real_values(featured_df, pbp, schedule, scoring_settings):
+    """Sanity check on the plumbing, not the model: once a season has a
+    real handful of games, real teams should have a non-null air/ground
+    allowed value -- an all-null result would mean the opponent-mapping
+    or rolling step silently dropped every row. Air and ground allowed
+    should also be non-negative (they're sums of bucket-rate xfp over
+    real plays, never a subtracted or adjusted quantity here)."""
+    table = build_defense_air_ground_split(featured_df, pbp, schedule, scoring_settings)
+    real = table.dropna(subset=DEFENSE_AIR_GROUND_OUTPUT_COLUMNS)
+    assert len(real) > 100
+    assert (real["xfp_allowed_air_s2d"] >= 0).all()
+    assert (real["xfp_allowed_ground_s2d"] >= 0).all()
 
 
 def test_rolling_features_shift_excludes_own_week(featured_df):

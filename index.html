@@ -8543,13 +8543,39 @@
     return `https://a.espncdn.com/i/teamlogos/nfl/500/${(team || '').toLowerCase()}.png`;
   }
 
+  // Plain-language definitions for every Team Tendencies metric -- none of
+  // these are self-explanatory on sight, and hover is the same place every
+  // other caveat on this dashboard already lives (see tendencySparseBadge's
+  // own tooltip just above). PACE and PLAYS_PER_GAME each note the other by
+  // name since they're related but answer different questions -- see
+  // tendencyQuadrant's own comment for the full reasoning.
+  const TENDENCY_METRIC_TOOLTIPS = {
+    proe: "Pass rate over expected: how much more (or less) this team passes than a league-average offense would in the same situations (score, down, distance, time remaining). Positive = more pass-heavy than expected; negative = more run-heavy.",
+    pace: "Average real time between snaps in neutral game situations -- lower means a faster tempo. Related to Plays Per Game but not the same thing: a fast team that stalls and punts can still run FEWER total plays than a slower team that sustains long drives.",
+    plays: "Real offensive plays run per game -- the pool of opportunities (targets + carries) every player on this offense splits. This is what actually drives fantasy volume, more directly than tempo (Pace) alone.",
+    rz20: "Share of real plays inside the opponent's 20-yard line called as a pass rather than a run. Higher means this offense keeps throwing even in scoring range, where many teams shift run-heavy.",
+    rz10: "Same idea as RZ Pass% (≤20), restricted to inside the 10 -- the closest, most goal-line-specific plays, where an offense's real identity often shows up most clearly.",
+    targetDist: "Share of this team's real targets going to running backs, wide receivers, and tight ends -- shows which position group this offense actually funnels its passing volume to.",
+    airAllowed: "Share of this defense's real fantasy points allowed to RB/WR/TE that came through the air (receptions) rather than on the ground (carries). More useful than one blended points-allowed number -- two defenses can allow the same total while favoring completely different fantasy players.",
+  };
+
   const TENDENCY_SORT_ACCESSORS = {
     proe: t => t.proe.s2d,
     pace: t => t.pace_seconds_per_play.s2d,
     plays: t => t.plays_per_game.s2d,
     rz20: t => t.red_zone.inside_20_pass_rate.s2d,
     rz10: t => t.red_zone.inside_10_pass_rate.s2d,
+    airAllowed: t => tendencyAirShare(t.points_allowed),
   };
+
+  // Air share of real fantasy points allowed to RB/WR/TE -- air / (air +
+  // ground). Shared by the sortable table column and its cell renderer so
+  // "sorted by X" and "the number shown in X's column" can never disagree.
+  function tendencyAirShare(pointsAllowed) {
+    const air = pointsAllowed?.air?.s2d, ground = pointsAllowed?.ground?.s2d;
+    if (air == null || ground == null || (air + ground) <= 0) return null;
+    return air / (air + ground);
+  }
 
   function sortedTendencyEntries(all) {
     const accessor = TENDENCY_SORT_ACCESSORS[state.tendenciesSortMetric] || TENDENCY_SORT_ACCESSORS.proe;
@@ -8560,32 +8586,42 @@
 
   // Quadrant split: PROE against 0 (the league's own natural center by
   // construction -- nflfastR's xpass model is fit so the league-wide mean
-  // of pass_oe sits near zero), pace against the league's OWN median this
-  // season (there's no natural "zero" for seconds/play the way there is
-  // for a rate-over-expected).
-  function tendencyQuadrant(proe, secPerPlay, paceMedian) {
-    const fast = secPerPlay < paceMedian;
+  // of pass_oe sits near zero), volume against the league's OWN median
+  // plays/game this season (there's no natural "zero" for a play count the
+  // way there is for a rate-over-expected).
+  //
+  // Plays per game, not seconds per play: plays/game IS the pool of
+  // opportunities (targets + carries) the whole offense divides, which is
+  // what actually matters for fantasy volume. Pace (tempo) drives that pool
+  // but isn't the same thing -- a fast team that goes three-and-out often
+  // can run FEWER real plays than a slower team that sustains long drives.
+  // Pace stays on the Team Detail page (see tendencyRangeCardHtml's own
+  // "Pace" card) since it still explains WHY a team's volume is what it is,
+  // just isn't the right axis for "which offense gives my player the most
+  // opportunities" at a glance.
+  function tendencyQuadrant(proe, playsPerGame, playsMedian) {
+    const highVolume = playsPerGame > playsMedian;
     const passHeavy = proe > 0;
-    if (fast && passHeavy) return { color: '#0891b2', label: 'Fast & pass-heavy' };
-    if (fast && !passHeavy) return { color: '#f59e0b', label: 'Fast & run-heavy' };
-    if (!fast && passHeavy) return { color: '#8b5cf6', label: 'Slow & pass-heavy' };
-    return { color: '#ef4444', label: 'Slow & run-heavy' };
+    if (highVolume && passHeavy) return { color: '#0891b2', label: 'High-volume & pass-heavy' };
+    if (highVolume && !passHeavy) return { color: '#f59e0b', label: 'High-volume & run-heavy' };
+    if (!highVolume && passHeavy) return { color: '#8b5cf6', label: 'Low-volume & pass-heavy' };
+    return { color: '#ef4444', label: 'Low-volume & run-heavy' };
   }
 
   function renderTendenciesScatterChart(all) {
     const canvas = document.getElementById('tendencies-scatter');
     if (!canvas) return;
     const entries = Object.entries(all).filter(
-      ([, t]) => t.proe.s2d != null && t.pace_seconds_per_play.s2d != null
+      ([, t]) => t.proe.s2d != null && t.plays_per_game.s2d != null
     );
     if (entries.length === 0) return;
 
-    const paceValues = entries.map(([, t]) => t.pace_seconds_per_play.s2d).sort((a, b) => a - b);
-    const paceMedian = paceValues[Math.floor(paceValues.length / 2)];
+    const playsValues = entries.map(([, t]) => t.plays_per_game.s2d).sort((a, b) => a - b);
+    const playsMedian = playsValues[Math.floor(playsValues.length / 2)];
 
     const points = entries.map(([team, t]) => {
-      const q = tendencyQuadrant(t.proe.s2d, t.pace_seconds_per_play.s2d, paceMedian);
-      return { x: t.proe.s2d, y: t.pace_seconds_per_play.s2d, team, color: q.color };
+      const q = tendencyQuadrant(t.proe.s2d, t.plays_per_game.s2d, playsMedian);
+      return { x: t.proe.s2d, y: t.plays_per_game.s2d, team, color: q.color };
     });
 
     chartInstances.tendenciesScatter = new Chart(canvas.getContext('2d'), {
@@ -8609,8 +8645,7 @@
             grid: { color: 'rgba(128,128,128,0.15)' },
           },
           y: {
-            reverse: true, // up = faster tempo, reads intuitively
-            title: { display: true, text: 'Seconds / play -- slower ↓   ↑ faster' },
+            title: { display: true, text: 'Plays per game -- fewer ↓   ↑ more' },
             grid: { color: 'rgba(128,128,128,0.15)' },
           },
         },
@@ -8620,7 +8655,7 @@
             callbacks: {
               label: (ctx) => {
                 const p = ctx.raw;
-                return `${p.team}: PROE ${p.x >= 0 ? '+' : ''}${p.x.toFixed(1)}, ${p.y.toFixed(1)} sec/play`;
+                return `${p.team}: PROE ${p.x >= 0 ? '+' : ''}${p.x.toFixed(1)}, ${p.y.toFixed(1)} plays/gm`;
               },
             },
           },
@@ -8656,6 +8691,12 @@
     `;
   }
 
+  function tendencyAirShareCellHtml(pointsAllowed) {
+    const share = tendencyAirShare(pointsAllowed);
+    if (share == null) return '<td class="right" style="color: var(--text-muted);">—</td>';
+    return `<td class="right">${(share * 100).toFixed(0)}%</td>`;
+  }
+
   function tendencyTableRowHtml(team, t) {
     return `
       <tr data-team="${team}">
@@ -8666,6 +8707,7 @@
         ${tendencyMetricCellHtml(t.red_zone.inside_20_pass_rate, 0, '%', 100)}
         ${tendencyMetricCellHtml(t.red_zone.inside_10_pass_rate, 0, '%', 100)}
         <td>${targetDistBarHtml(t.target_distribution)}</td>
+        ${tendencyAirShareCellHtml(t.points_allowed)}
       </tr>
     `;
   }
@@ -8713,7 +8755,7 @@
 
     const all = getAllTeamTendencies();
     const teams = Object.keys(all);
-    const sortLabel = { proe: 'PROE', pace: 'Pace', plays: 'Plays/Gm', rz20: 'RZ Pass% (≤20)', rz10: 'RZ Pass% (≤10)' };
+    const sortLabel = { proe: 'PROE', pace: 'Pace', plays: 'Plays/Gm', rz20: 'RZ Pass% (≤20)', rz10: 'RZ Pass% (≤10)', airAllowed: 'Air Allowed %' };
 
     main.innerHTML = `
       <div class="page-header-row">
@@ -8726,16 +8768,16 @@
         <div class="panel" style="margin-bottom: 16px;">
           <div class="panel-header">
             <div class="panel-title">League Landscape</div>
-            <div class="panel-note">Pass rate over expected vs. pace -- click a point, or use the table below</div>
+            <div class="panel-note">Pass rate over expected vs. real offensive volume -- click a point, or use the table below</div>
           </div>
           <div class="tendencies-scatter-wrap">
             <canvas id="tendencies-scatter"></canvas>
           </div>
           <div class="tendencies-quadrant-legend">
-            <span><i class="tendencies-quadrant-dot" style="background:#0891b2"></i>Fast &amp; pass-heavy</span>
-            <span><i class="tendencies-quadrant-dot" style="background:#f59e0b"></i>Fast &amp; run-heavy</span>
-            <span><i class="tendencies-quadrant-dot" style="background:#8b5cf6"></i>Slow &amp; pass-heavy</span>
-            <span><i class="tendencies-quadrant-dot" style="background:#ef4444"></i>Slow &amp; run-heavy</span>
+            <span><i class="tendencies-quadrant-dot" style="background:#0891b2"></i>High-volume &amp; pass-heavy</span>
+            <span><i class="tendencies-quadrant-dot" style="background:#f59e0b"></i>High-volume &amp; run-heavy</span>
+            <span><i class="tendencies-quadrant-dot" style="background:#8b5cf6"></i>Low-volume &amp; pass-heavy</span>
+            <span><i class="tendencies-quadrant-dot" style="background:#ef4444"></i>Low-volume &amp; run-heavy</span>
           </div>
         </div>
         <div class="panel">
@@ -8747,12 +8789,13 @@
             <table class="players-table tendencies-table">
               <thead><tr>
                 <th>Team</th>
-                <th class="right" data-tendency-sort="proe">PROE</th>
-                <th class="right" data-tendency-sort="pace">Pace (sec/play)</th>
-                <th class="right" data-tendency-sort="plays">Plays/Gm</th>
-                <th class="right" data-tendency-sort="rz20">RZ Pass% (≤20)</th>
-                <th class="right" data-tendency-sort="rz10">RZ Pass% (≤10)</th>
-                <th>Target Distribution</th>
+                <th class="right" data-tendency-sort="proe" title="${TENDENCY_METRIC_TOOLTIPS.proe}">PROE</th>
+                <th class="right" data-tendency-sort="pace" title="${TENDENCY_METRIC_TOOLTIPS.pace}">Pace (sec/play)</th>
+                <th class="right" data-tendency-sort="plays" title="${TENDENCY_METRIC_TOOLTIPS.plays}">Plays/Gm</th>
+                <th class="right" data-tendency-sort="rz20" title="${TENDENCY_METRIC_TOOLTIPS.rz20}">RZ Pass% (≤20)</th>
+                <th class="right" data-tendency-sort="rz10" title="${TENDENCY_METRIC_TOOLTIPS.rz10}">RZ Pass% (≤10)</th>
+                <th title="${TENDENCY_METRIC_TOOLTIPS.targetDist}">Target Distribution</th>
+                <th class="right" data-tendency-sort="airAllowed" title="${TENDENCY_METRIC_TOOLTIPS.airAllowed}">Air Allowed %</th>
               </tr></thead>
               <tbody>
                 ${sortedTendencyEntries(all).map(([team, t]) => tendencyTableRowHtml(team, t)).join('')}
@@ -8777,11 +8820,11 @@
     }
   }
 
-  function tendencyRangeCardHtml(label, block, decimals, suffix, allValues) {
+  function tendencyRangeCardHtml(label, block, decimals, suffix, allValues, tooltip) {
     if (!block || block.s2d == null || allValues.length === 0) {
       return `
         <div class="tendency-metric-card">
-          <div class="tendency-metric-label">${label}</div>
+          <div class="tendency-metric-label"${tooltip ? ` title="${tooltip}"` : ''}>${label}</div>
           <div class="tendency-metric-values"><span class="tmv-main" style="color: var(--text-muted);">—</span></div>
         </div>
       `;
@@ -8792,7 +8835,7 @@
     const recent = block.ewm3;
     return `
       <div class="tendency-metric-card">
-        <div class="tendency-metric-label">${label}${tendencySparseBadge(block)}</div>
+        <div class="tendency-metric-label"${tooltip ? ` title="${tooltip}"` : ''}>${label}${tendencySparseBadge(block)}</div>
         <div class="tendency-metric-values">
           <span class="tmv-main">${val.toFixed(decimals)}${suffix || ''}</span>
           ${recent != null ? `<span class="tmv-sub">recent (3wk): ${recent.toFixed(decimals)}${suffix || ''}</span>` : ''}
@@ -8801,6 +8844,53 @@
           <div class="tendency-range-marker" style="left: calc(${pct}% - 1px);"></div>
         </div>
         <div class="tendency-range-labels"><span>${min.toFixed(decimals)}${suffix || ''} low</span><span>${max.toFixed(decimals)}${suffix || ''} high</span></div>
+      </div>
+    `;
+  }
+
+  // Fantasy points allowed to RB/WR/TE, split by air vs. ground -- the
+  // same per-position xFP-allowed data build_defense_rankings already
+  // uses (Family 5B), sliced differently: how much of what THIS defense
+  // concedes comes through the air vs. on the ground, pooled across
+  // RB/WR/TE into one team-level read. More actionable than a single
+  // points-allowed number for "which of my players does this matchup
+  // favor" -- a defense can allow the same total while being a run funnel
+  // for one kind of player and a pass sieve for another.
+  function renderPointsAllowedPanelHtml(pointsAllowed) {
+    const air = pointsAllowed?.air?.s2d;
+    const ground = pointsAllowed?.ground?.s2d;
+    if (air == null || ground == null) {
+      return `
+        <div class="panel" style="margin-bottom: 16px;">
+          <div class="panel-header">
+            <div class="panel-title">Fantasy Points Allowed: Air vs. Ground</div>
+            <div class="panel-note">Real xFP conceded to RB/WR/TE this season, split by how</div>
+          </div>
+          <div class="pd-placeholder">
+            <div class="pd-placeholder-icon">🏈</div>
+            <div class="pd-placeholder-title">Not enough plays yet</div>
+            <div class="pd-placeholder-text">This team doesn't have enough real defensive snaps this season yet for an honest air/ground split.</div>
+          </div>
+        </div>
+      `;
+    }
+    const share = tendencyAirShare(pointsAllowed);
+    return `
+      <div class="panel" style="margin-bottom: 16px;">
+        <div class="panel-header">
+          <div class="panel-title">Fantasy Points Allowed: Air vs. Ground</div>
+          <div class="panel-note" title="${TENDENCY_METRIC_TOOLTIPS.airAllowed}">Real xFP conceded to RB/WR/TE this season, split by how</div>
+        </div>
+        <div class="tendency-donuts-row">
+          <div class="tendency-donut-wrap">
+            <div class="tendency-donut-canvas-wrap"><canvas id="tendency-air-ground-donut"></canvas></div>
+            <div class="tendency-donut-caption" title="${TENDENCY_METRIC_TOOLTIPS.airAllowed}">${share != null ? (share * 100).toFixed(0) + '% via air' : 'Air vs. Ground'}</div>
+          </div>
+          <div class="tendency-metric-values" style="align-self: center;">
+            <span class="tmv-main">${air.toFixed(1)} <span style="font-size: 12px; color: var(--text-muted);">air xFP/gm</span></span>
+            <span class="tmv-sub">${ground.toFixed(1)} ground xFP/gm</span>
+          </div>
+        </div>
       </div>
     `;
   }
@@ -8833,6 +8923,25 @@
         options: {
           responsive: true, maintainAspectRatio: false, cutout: '65%',
           plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `${c.label}: ${(c.raw * 100).toFixed(0)}%` } } },
+        },
+      });
+    }
+
+    const pa = t.points_allowed;
+    const airGroundEl = document.getElementById('tendency-air-ground-donut');
+    if (pa && airGroundEl && pa.air.s2d != null && pa.ground.s2d != null) {
+      chartInstances.tendencyAirGround = new Chart(airGroundEl.getContext('2d'), {
+        type: 'doughnut',
+        data: {
+          labels: ['Air', 'Ground'],
+          datasets: [{ data: [pa.air.s2d, pa.ground.s2d], backgroundColor: ['#0891b2', '#f59e0b'], borderWidth: 0 }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, cutout: '65%',
+          plugins: {
+            legend: { display: false },
+            tooltip: { callbacks: { label: (c) => `${c.label}: ${c.raw.toFixed(1)} xFP/gm` } },
+          },
         },
       });
     }
@@ -8878,9 +8987,9 @@
       </div>
 
       <div class="tendency-metric-grid">
-        ${tendencyRangeCardHtml('Pass Rate Over Expected', t.proe, 1, ' pts', proeValues)}
-        ${tendencyRangeCardHtml('Pace', t.pace_seconds_per_play, 1, ' sec/play', paceValues)}
-        ${tendencyRangeCardHtml('Plays Per Game', t.plays_per_game, 1, '', playsValues)}
+        ${tendencyRangeCardHtml('Pass Rate Over Expected', t.proe, 1, ' pts', proeValues, TENDENCY_METRIC_TOOLTIPS.proe)}
+        ${tendencyRangeCardHtml('Pace', t.pace_seconds_per_play, 1, ' sec/play', paceValues, TENDENCY_METRIC_TOOLTIPS.pace)}
+        ${tendencyRangeCardHtml('Plays Per Game', t.plays_per_game, 1, '', playsValues, TENDENCY_METRIC_TOOLTIPS.plays)}
       </div>
 
       <div class="panel" style="margin-bottom: 16px;">
@@ -8891,18 +9000,20 @@
         <div class="tendency-donuts-row">
           <div class="tendency-donut-wrap">
             <div class="tendency-donut-canvas-wrap"><canvas id="tendency-rz20-donut"></canvas></div>
-            <div class="tendency-donut-caption">Inside the 20${tendencySparseBadge(t.red_zone.inside_20_pass_rate)}</div>
+            <div class="tendency-donut-caption" title="${TENDENCY_METRIC_TOOLTIPS.rz20}">Inside the 20${tendencySparseBadge(t.red_zone.inside_20_pass_rate)}</div>
           </div>
           <div class="tendency-donut-wrap">
             <div class="tendency-donut-canvas-wrap"><canvas id="tendency-rz10-donut"></canvas></div>
-            <div class="tendency-donut-caption">Inside the 10${tendencySparseBadge(t.red_zone.inside_10_pass_rate)}</div>
+            <div class="tendency-donut-caption" title="${TENDENCY_METRIC_TOOLTIPS.rz10}">Inside the 10${tendencySparseBadge(t.red_zone.inside_10_pass_rate)}</div>
           </div>
           <div class="tendency-donut-wrap">
             <div class="tendency-donut-canvas-wrap"><canvas id="tendency-target-donut"></canvas></div>
-            <div class="tendency-donut-caption">Target Distribution${tendencySparseBadge(t.target_distribution)}</div>
+            <div class="tendency-donut-caption" title="${TENDENCY_METRIC_TOOLTIPS.targetDist}">Target Distribution${tendencySparseBadge(t.target_distribution)}</div>
           </div>
         </div>
       </div>
+
+      ${renderPointsAllowedPanelHtml(t.points_allowed)}
 
       <div class="pd-placeholder-text" style="text-align: left; max-width: none;">
         ${teamTendencyCaveatText()}

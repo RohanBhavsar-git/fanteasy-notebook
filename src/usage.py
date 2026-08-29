@@ -1535,6 +1535,114 @@ def build_defense_strength_table(df: pd.DataFrame, schedule: pd.DataFrame) -> pd
                 "allowed_adj_ewm3", "allowed_adj_s2d"]]
 
 
+DEFENSE_AIR_GROUND_OUTPUT_COLUMNS = [
+    "xfp_allowed_air_ewm3", "xfp_allowed_air_s2d",
+    "xfp_allowed_ground_ewm3", "xfp_allowed_ground_s2d",
+]
+
+
+def build_defense_air_ground_split(
+    df: pd.DataFrame, pbp: pd.DataFrame, schedule: pd.DataFrame, scoring_settings: dict
+) -> pd.DataFrame:
+    """
+    Per (team, season, week): this team's DEFENSIVE xFP allowed to
+    RB/WR/TE, split by how it was conceded -- through the air (targets)
+    or on the ground (carries). The SAME data and bucket-rate mechanism
+    as build_defense_strength_table's own allowed_ewm3/allowed_s2d --
+    the only difference is summing target-derived and carry-derived
+    per-player-week xfp SEPARATELY instead of pooled. A single blended
+    "xFP allowed" hides WHY a defense allows what it allows: a
+    run-funneling defense and a pass-funneling defense can post the
+    identical total while favoring completely different fantasy
+    players. _target_play_frame/_carry_play_frame's bucket strings never
+    collide (air_yards|field_pos vs. a bare field_pos label), so the
+    league-average bucket RATE each side draws on is already exactly
+    what it would be in the pooled computation -- this doesn't refit
+    anything, it just keeps the two sums apart instead of adding them
+    together before this function ever sees them.
+
+    Deliberately NOT opponent-adjusted (unlike allowed_adj_* above) and
+    NOT split by position (unlike the rest of this table) -- this
+    describes one thing about a defense as a whole (where its real
+    fantasy-point damage comes from), the same single-number-per-team
+    framing PROE/pace/red-zone-split/target-distribution already use in
+    src/team_tendencies.py, not a second per-position ranking next to
+    build_defense_rankings' existing one.
+
+    Args:
+        df: player-week frame with player_id, position, team, season,
+            week (weekly_scored or later is fine).
+        pbp: from get_pbp().
+        schedule: from get_schedule().
+        scoring_settings: this league's real scoring rules, from
+            get_sleeper_league()["scoring_settings"].
+
+    Returns:
+        team, season, week, xfp_allowed_air_ewm3, xfp_allowed_air_s2d,
+        xfp_allowed_ground_ewm3, xfp_allowed_ground_s2d. Null wherever
+        the team has fewer than the required prior in-season games,
+        same convention as build_defense_strength_table.
+    """
+    required = ["player_id", "position", "team", "season", "week"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"build_defense_air_ground_split: df is missing columns {missing}")
+
+    cutoffs = sorted(set(zip(df["season"], df["week"])))
+
+    targets = _target_play_frame(pbp)
+    targets["points"] = compute_custom_score(targets, scoring_settings, warn=False)
+    carries = _carry_play_frame(pbp)
+    carries["points"] = compute_custom_score(carries, scoring_settings, warn=False)
+
+    play_cols = ["player_id", "season", "week", "bucket", "points"]
+    air_xfp = _xfp_table_for_universe(targets[play_cols], cutoffs).rename(columns={"xfp": "xfp_air"})
+    ground_xfp = _xfp_table_for_universe(carries[play_cols], cutoffs).rename(columns={"xfp": "xfp_ground"})
+
+    pos_df = (
+        df[df["position"].isin(OPP_STRENGTH_POSITIONS)][["player_id", "team", "season", "week"]]
+        .drop_duplicates()
+        .merge(air_xfp, on=["player_id", "season", "week"], how="left")
+        .merge(ground_xfp, on=["player_id", "season", "week"], how="left")
+    )
+    pos_df["xfp_air"] = pos_df["xfp_air"].fillna(0)
+    pos_df["xfp_ground"] = pos_df["xfp_ground"].fillna(0)
+
+    generated = (
+        pos_df.groupby(["team", "season", "week"])[["xfp_air", "xfp_ground"]]
+        .sum(min_count=1)
+        .reset_index()
+    )
+    # No position axis here (see docstring) -- _rolling_team_position still
+    # needs a `position` column to group by, so a constant fills that slot
+    # without changing what the groupby actually partitions on.
+    generated["position"] = "ALL"
+
+    team_week_opp = _team_week_opponent(schedule)
+    allowed_raw = generated.merge(
+        team_week_opp, on=["team", "season", "week"], how="left"
+    )[["opponent", "position", "season", "week", "xfp_air", "xfp_ground"]].rename(
+        columns={"opponent": "team"}
+    )
+    allowed_raw = allowed_raw.dropna(subset=["team"])
+
+    allowed_air = _rolling_team_position(
+        allowed_raw[["team", "position", "season", "week", "xfp_air"]], "xfp_air"
+    )
+    allowed_ground = _rolling_team_position(
+        allowed_raw[["team", "position", "season", "week", "xfp_ground"]], "xfp_ground"
+    )
+
+    out = allowed_air[["team", "position", "season", "week", "xfp_air_ewm3", "xfp_air_s2d"]].merge(
+        allowed_ground[["team", "position", "season", "week", "xfp_ground_ewm3", "xfp_ground_s2d"]],
+        on=["team", "position", "season", "week"],
+    )
+    return out.rename(columns={
+        "xfp_air_ewm3": "xfp_allowed_air_ewm3", "xfp_air_s2d": "xfp_allowed_air_s2d",
+        "xfp_ground_ewm3": "xfp_allowed_ground_ewm3", "xfp_ground_s2d": "xfp_allowed_ground_s2d",
+    })[["team", "season", "week"] + DEFENSE_AIR_GROUND_OUTPUT_COLUMNS]
+
+
 def add_opponent_strength_features(df: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
     """
     Add OPPONENT_STRENGTH_OUTPUT_COLUMNS: how strong THIS WEEK's opponent's

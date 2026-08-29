@@ -189,7 +189,9 @@ def main() -> None:
     # Same "full real season, unshifted, nothing left to leak" reasoning as
     # build_season_defense_rankings just above -- reuses pbp_season fetched
     # for the heatmap above.
-    team_tendencies = build_season_team_tendencies(weekly_features, pbp_season, season)
+    team_tendencies = build_season_team_tendencies(
+        weekly_features, pbp_season, schedule_season, league["scoring_settings"], season
+    )
     print(f"    team tendencies: {len(team_tendencies)}/32 teams")
 
     # K and DEF are out of scope for the projection model (see CLAUDE.md's

@@ -395,7 +395,9 @@ def main() -> None:
     # every season, no cross-season lookback needed, same reasoning
     # add_opponent_strength_features's own docstring already gives for a
     # single-season call being sufficient).
-    team_tendencies = build_team_tendencies(combined_features, pbp_current, current_season, target_week)
+    team_tendencies = build_team_tendencies(
+        combined_features, pbp_current, schedule_current, league["scoring_settings"], current_season, target_week
+    )
     print(f"    team tendencies: {len(team_tendencies)}/32 teams have enough prior games this season")
 
     # Per-player Monte Carlo: boom/bust + threshold probabilities, plus the
