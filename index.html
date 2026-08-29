@@ -6116,6 +6116,8 @@
         ${standings.map((t, i) => {
           const rankClass = i < 3 ? 'top' : (i >= standings.length - 2 ? 'bottom' : '');
           const recordStr = t.ties > 0 ? `${t.wins}-${t.losses}-${t.ties}` : `${t.wins}-${t.losses}`;
+          const gamesPlayed = t.wins + t.losses + t.ties;
+          const avgStr = gamesPlayed > 0 ? (t.pf / gamesPlayed).toFixed(1) : '—';
           return `
             <div class="team-card-large" data-team-id="${t.rosterId}">
               <div class="tc-header">
@@ -6128,7 +6130,7 @@
               <div class="tc-stats">
                 <div class="tc-stat"><div class="tc-stat-value">${recordStr}</div><div class="tc-stat-label">Record</div></div>
                 <div class="tc-stat"><div class="tc-stat-value">${t.pf.toFixed(0)}</div><div class="tc-stat-label">PF</div></div>
-                <div class="tc-stat"><div class="tc-stat-value">${(t.pf / (t.wins + t.losses + t.ties)).toFixed(1)}</div><div class="tc-stat-label">Avg</div></div>
+                <div class="tc-stat"><div class="tc-stat-value">${avgStr}</div><div class="tc-stat-label">Avg</div></div>
               </div>
               <div class="tc-streak">
                 <span class="tc-streak-label">Current Streak</span>
@@ -6165,7 +6167,7 @@
     });
 
     const games = team.wins + team.losses + team.ties;
-    const avgPts = team.pf / games;
+    const avgPts = games > 0 ? team.pf / games : null;
     const bestWeek = [...weeklyData].sort((a, b) => b.points - a.points)[0];
     const worstWeek = [...weeklyData].sort((a, b) => a.points - b.points)[0];
 
@@ -6198,12 +6200,12 @@
           <div class="td-stat">
             <div class="td-stat-label">Points For</div>
             <div class="td-stat-value">${team.pf.toFixed(1)}</div>
-            <div class="td-stat-sub">${avgPts.toFixed(1)} avg</div>
+            <div class="td-stat-sub">${avgPts != null ? avgPts.toFixed(1) + ' avg' : 'No games yet'}</div>
           </div>
           <div class="td-stat">
             <div class="td-stat-label">Points Against</div>
             <div class="td-stat-value">${team.pa.toFixed(1)}</div>
-            <div class="td-stat-sub">${(team.pa / games).toFixed(1)} avg</div>
+            <div class="td-stat-sub">${games > 0 ? (team.pa / games).toFixed(1) + ' avg' : 'No games yet'}</div>
           </div>
           <div class="td-stat">
             <div class="td-stat-label">Best Week</div>
