@@ -4602,7 +4602,23 @@
         return { games: [], weekInfo };
       }
 
-      // Detect deep offseason — fall back to most recent completed season
+      // Detect deep offseason / preseason-only / far-future. This used to
+      // walk back and silently substitute the most recently COMPLETED
+      // season's playoffs here -- correct before the season selector
+      // existed (there was only ever "today," so showing something was
+      // better than nothing). Now that a specific live season can be
+      // explicitly selected, silently showing a DIFFERENT year's games
+      // under this season's header is exactly the mixed-season
+      // incoherence the selector exists to prevent (real bug: with 2026
+      // selected pre-draft, this used to show "2025 Super Bowl"). Say so
+      // plainly instead -- renderSidebar()'s own noRegularSeasonYet branch
+      // shows an honest placeholder, the same pattern already used for an
+      // archived season. Preseason games are real (verified live: real
+      // NFL preseason games are actually being played the week this was
+      // fixed) but deliberately excluded, not just unavailable -- unsettled
+      // rosters and backups playing significant snaps make preseason
+      // results not fantasy-relevant, the same reasoning this project
+      // already applies to K/DST.
       const isPreseasonOnly = espn.season?.type === 1;
       const hasEvents = espn.events && espn.events.length > 0;
       const firstEvent = hasEvents ? new Date(espn.events[0].date) : null;
@@ -4610,33 +4626,12 @@
       const isFarFuture = daysUntilFirst > 30;
 
       if (!hasEvents || isPreseasonOnly || isFarFuture) {
-        const now = new Date();
-        const currentSeasonYear = now.getMonth() >= 8 ? now.getFullYear() : now.getFullYear() - 1;
-        const lastCompletedSeason = currentSeasonYear - (now.getMonth() < 2 ? 1 : 0);
-
-        const candidates = [
-          { seasontype: 3, week: 5, year: lastCompletedSeason, label: `${lastCompletedSeason} Super Bowl` },
-          { seasontype: 3, week: 4, year: lastCompletedSeason, label: `${lastCompletedSeason} Conference Championship` },
-          { seasontype: 3, week: 3, year: lastCompletedSeason, label: `${lastCompletedSeason} Divisional Round` },
-          { seasontype: 3, week: 2, year: lastCompletedSeason, label: `${lastCompletedSeason} Wild Card Round` },
-          { seasontype: 2, week: 18, year: lastCompletedSeason, label: `${lastCompletedSeason} Week 18` }
-        ];
-
-        for (const c of candidates) {
-          try {
-            const url = `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=${c.seasontype}&week=${c.week}&year=${c.year}`;
-            const altResp = await fetchJSON(url);
-            if (altResp.events && altResp.events.length > 0) {
-              espn = altResp;
-              weekInfo.label = c.label;
-              weekInfo.year = c.year;
-              weekInfo.seasontype = c.seasontype;
-              weekInfo.week = c.week;
-              weekInfo.isHistorical = true;
-              break;
-            }
-          } catch (e) { /* try next */ }
-        }
+        weekInfo.year = espn.season?.year || null;
+        weekInfo.seasontype = espn.season?.type || null;
+        weekInfo.week = espn.week?.number || null;
+        weekInfo.label = "Regular season hasn't started";
+        weekInfo.noRegularSeasonYet = true;
+        return { games: [], weekInfo };
       } else {
         // Live current scoreboard — pull info from ESPN's metadata
         weekInfo.year = espn.season?.year || null;
@@ -5203,6 +5198,27 @@
       return;
     }
 
+    // Live season, but its regular season hasn't started yet (still
+    // preseason, or a real gap with no scheduled games at all) --
+    // fetchNFLGames() used to silently substitute the most recently
+    // COMPLETED season's playoffs here, which the season selector's own
+    // header would then contradict (a real bug: "2026" header showing
+    // "2025 Super Bowl"). Say so plainly instead, the same pattern as the
+    // archived-season branch just above.
+    if (state.nflWeekInfo?.noRegularSeasonYet) {
+      if (weekTag) weekTag.textContent = 'Preseason';
+      const weekSel = document.getElementById('nfl-week-selector');
+      if (weekSel) { weekSel.innerHTML = '<option>Not available</option>'; weekSel.disabled = true; }
+      container.innerHTML = `
+        <div class="sidebar-placeholder" style="padding: 20px 12px; text-align: center;">
+          <div style="font-size: 24px; margin-bottom: 6px;">🏈</div>
+          <div style="font-weight: 600; color: var(--text-secondary); margin-bottom: 4px;">${state.selectedSeason} regular season hasn't started</div>
+          <div style="font-size: 11px; color: var(--text-muted);">Preseason games aren't shown here — check back once real regular-season games kick off.</div>
+        </div>
+      `;
+      return;
+    }
+
     if (weekTag) {
       const label = state.nflWeekInfo?.label || `Wk ${getCurrentWeek()}`;
       weekTag.textContent = label;
@@ -5210,16 +5226,24 @@
 
     // ----- Build the NFL week-filter dropdown -----
     // Anchored on the year ESPN reported back for the games we just loaded
-    // (state.nflWeekInfo.year). If we don't have one yet, fall back to the
-    // most recent completed NFL season.
+    // (state.nflWeekInfo.year). If we don't have one yet (a total fetch
+    // failure, not the noRegularSeasonYet case above -- that returns
+    // early), fall back to the currently SELECTED season -- not an
+    // independently-recomputed "most recent completed season," which
+    // would silently reintroduce the same mixed-season problem the
+    // selector exists to prevent.
     const sel = document.getElementById('nfl-week-selector');
     if (sel) {
       const wi = state.nflWeekInfo || {};
       let year = wi.year;
       if (!year) {
-        const now = new Date();
-        const seasonYear = now.getMonth() >= 8 ? now.getFullYear() : now.getFullYear() - 1;
-        year = seasonYear - (now.getMonth() < 2 ? 1 : 0);
+        if (state.selectedSeason) {
+          year = state.selectedSeason;
+        } else {
+          const now = new Date();
+          const seasonYear = now.getMonth() >= 8 ? now.getFullYear() : now.getFullYear() - 1;
+          year = seasonYear - (now.getMonth() < 2 ? 1 : 0);
+        }
       }
       // Regular season (weeks 1–18) + four postseason rounds.
       // ESPN postseason weeks: 1=WC, 2=Div, 3=Conf, 5=SB (week 4 is unused).
