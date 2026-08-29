@@ -301,6 +301,22 @@ beyond this project.
   have been visible in the resulting numbers on its own; only reasoning about
   the experiment's design would surface them.
 
+- **Overlapping features can flip an ablation's sign, not just shrink it.**
+  Two candidate features for a position's model (an opponent-strength
+  signal and that position's own opportunity-based expected-points
+  signal) each looked like a small, single-direction effect when added
+  alone to the current feature set. Crossed with a third, already-shipped
+  feature measuring a related thing (team-level offensive identity) in a
+  full three-way factorial, each one's effect *reversed sign* depending
+  on which of the other two were already present — a messier interaction
+  than an earlier redundancy case in this same project, where overlapping
+  features' effects only ever shrank toward each other and never changed
+  direction. *Caught by*: running the full factorial instead of stopping
+  at one-at-a-time ablations — a one-at-a-time test would have reported a
+  clean win or loss for either candidate depending only on which one
+  happened to get tested first, an artifact of test order, not a real
+  property of the feature.
+
 - **The Sleeper-projection false alarm.** A real, reasonable worry going in:
   does Sleeper's *projections* endpoint use the same stat-name vocabulary as
   the league's own scoring rules, the way the raw play-by-play data needs an

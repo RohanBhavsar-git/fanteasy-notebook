@@ -1175,6 +1175,85 @@ no conflict.
 
 ---
 
+## QB xFP as a Model Feature findings (Aug 2026)
+
+Read-only measurement (no `src/` changes) closing the two items the QB
+xFP work left open: does QB xFP help as a model feature, and does
+extending Family 5B (opponent strength) to QB help. Both column groups
+(`xfp_ewm3`/`xfp_vol`/`xfp_s2d`/`fp_over_expected_ewm3`/`_vol`/`_s2d` via
+the shared `ROLLING_OUTPUT_COLUMNS`; `opp_def_xfp_allowed_*` via the
+shared `OPPONENT_STRENGTH_OUTPUT_COLUMNS`) were ALREADY structurally
+present as column names in `FEATURE_COLUMNS_BY_POSITION["QB"]` — always
+null for QB until now (xfp itself was null; `OPP_STRENGTH_POSITIONS`
+excludes QB), so testing this needed no `FEATURE_COLUMNS_BY_POSITION`
+edit at all, just a feature table where those columns are populated.
+
+**Extending Family 5B to QB is a one-line patch, not new code** —
+`build_defense_strength_table`/`add_opponent_strength_features` are
+already fully generic over `position` (grouped by `(team, position,
+season, week)` throughout); adding QB to `OPP_STRENGTH_POSITIONS`
+computes a real "expected fantasy points allowed to QBs" defense metric
+from the exact same dropback/designed-rush buckets, no separate function
+needed. Verified this is purely additive before trusting the comparison:
+patching `OPP_STRENGTH_POSITIONS` to `(RB, WR, TE, QB)` and rebuilding
+left every RB/WR/TE `opp_def_xfp_allowed_*` value byte-identical to the
+unpatched build — confirmed directly, not assumed, since
+`build_defense_strength_table`'s internals (`generated`, `league_avg`,
+`avg_opponent_strength`) are all grouped by position already.
+
+**Full 2x2x2 factorial** (Team Tendencies x QB-xFP-rolled x QB-opponent-
+strength, same clean production path — `build_feature_table` +
+`DEFAULT_LEAGUE_ID` — the WR false positive two rounds ago was
+specifically caused by using a notebook-cached table instead):
+
+| TT | xFP | oppQB | MAE |
+|---|---|---|---|
+| 0 | 0 | 0 | 6.3369 |
+| 0 | 0 | 1 | 6.3114 |
+| 0 | 1 | 0 | 6.3836 |
+| 0 | 1 | 1 | 6.2254 |
+| **1** | **0** | **0** | **6.1791 (the real current baseline — TT is already committed)** |
+| 1 | 0 | 1 | 6.2570 |
+| 1 | 1 | 0 | 6.1795 |
+| 1 | 1 | 1 | 6.1973 |
+
+**Neither candidate helps against the baseline that actually matters —
+the one with Team Tendencies already present, since that's what's
+really committed.** Adding QB-xFP-rolled alone: 6.1791 -> 6.1795
+(+0.0004, noise). Adding QB-opponent-strength alone: 6.1791 -> 6.2570
+(+0.0779, a real degradation). Adding both together: 6.1791 -> 6.1973
+(+0.0182, still a mild degradation, not a rescue via synergy).
+
+**All three factors show real but sign-flipping interactions with each
+other, confirming they substantially overlap** — but not in the simple
+"redundant means roughly zero" shape the Vegas/Team-Tendencies factorial
+showed. Marginal effects reverse sign depending on what else is present:
+QB-xFP alone (no TT, no oppQB) is +0.0467 (slightly worse) but QB-xFP
+WITH oppQB present (no TT) is -0.0860 (real improvement) — the two are
+complementary in that one combination and not in others. QB-opponent-
+strength is a real degradation with TT present (+0.0778) but a real
+improvement without TT (-0.0255 alone, -0.1582 with xFP). Team
+Tendencies' own marginal effect ranges from -0.0281 to -0.2041 depending
+on what else is present. This is messier than plain redundancy (which
+would predict a consistently-shrinking, same-signed effect) — the three
+signals (a QB's own recent performance, this week's opponent's pass
+defense, and the team's own pace/PROE identity) clearly describe
+overlapping parts of the same "offensive environment," but combine
+non-additively rather than simply cannibalizing each other's value.
+Reassuringly, the FULL combination (all three, 6.1973) lands almost
+exactly where a naive fully-additive model would predict from the three
+solo effects (6.2003) — the interaction is real in the partial states but
+doesn't blow up the full combination.
+
+**Not applied** — `FEATURE_COLUMNS_BY_POSITION` is unchanged;
+`OPP_STRENGTH_POSITIONS` was restored to `("RB", "WR", "TE")`
+immediately after the patched build, never committed. Both candidates
+are measured and rejected for now, not silently deferred: QB-xFP is
+noise, QB-opponent-strength is a real net negative, and combining them
+doesn't recover the loss.
+
+---
+
 ## Family 5B findings — opponent defensive strength (Aug 2026)
 
 The original Family 5 spec named this and deferred it to "step 4" (which
@@ -3085,8 +3164,8 @@ assumptions as facts.
 - **Season archives beyond 2023-2025** — 2023, 2024, and 2025 are archived and in the selector; 2021 and 2022 were deliberately skipped (roster turnover makes them less useful for draft prep, not a technical limitation). `src/ingest.py::SEASON_LEAGUE_IDS` already has both their real league_ids, and `get_archive_candidates()` was verified against all 5 seasons before scoping down (see Phase 9 findings). Adding either later is `python scripts/archive_season.py <year>` plus one new entry in `index.html`'s `SEASON_OPTIONS` — no code changes needed, just a decision to do it.
 - **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
 - ~~The committed exports don't have Family 5B's `matchup`/`defense_rankings` keys yet.~~ **Done** — `scripts/weekly_update.py` and `scripts/archive_season.py 2025/2024/2023` were all re-run for real; the live export and all 3 archives now carry real `matchup`/`defense_rankings`/`weekly_matchup` data (the live export's is honestly empty since 2026 has zero games played yet). See **Family 5B findings**.
-- **QB xFP is not yet a model feature.** `add_xfp_features` now populates real `xfp`/`fp_over_expected` (and their rolled variants) for QB, but `FEATURE_COLUMNS_BY_POSITION` is untouched (deliberately read-only for this pass) — whether adding it helps the QB point/floor/ceiling model is a separate, unmeasured question. See **QB xFP findings**.
-- **Family 5B (opponent strength) still doesn't cover QB**, even though the QB xfp it would need to reuse now exists — extending it needs its own defense-side aggregation of QB xfp allowed, not attempted yet. See **QB xFP findings**.
+- ~~QB xFP is not yet a model feature.~~ **Measured (not applied) — doesn't help under the real current baseline.** QB-xFP-rolled added alone to the committed QB feature list: +0.0004 MAE (noise). See **QB xFP as a Model Feature findings**.
+- ~~Family 5B (opponent strength) still doesn't cover QB.~~ **Built (as a one-line `OPP_STRENGTH_POSITIONS` patch, not committed) and measured — a real degradation under the real current baseline.** Added alone: +0.078 MAE (worse). See **QB xFP as a Model Feature findings** for the full factorial and why both candidates substantially overlap with Team Tendencies and with each other.
 - ~~A pre-existing imprecision in RB/WR/TE's own xFP, found while building the QB version: `_carry_play_frame`'s mask isn't QB-gated, so a scrambling QB's carries have always been pooled into the RB/WR/TE carry bucket RATE TABLE too.~~ **Measured, not fixed — confirmed negligible.** Bucket rates move a real 1.8-9.5% with scrambles excluded, but the downstream effect on actual RB/WR/TE `fp_over_expected` is negligible (mean abs diff 0.0555 pts across 40,331 player-weeks; split-half correlation moves by only 0.0016). Left as-is deliberately, per the measured result — see **QB xFP findings**.
 - **The committed model artifact (`models/fanteasy_model.joblib`) predates Family 5B** — it was trained before `FEATURE_COLUMNS` grew the four opponent-strength columns, so `weekly_update.py`'s actual point/floor/ceiling predictions are NOT yet using this feature as a model input (the artifact is self-describing and uses its own saved `feature_columns`, by design — see `predict_target_week_from_artifact`'s docstring). The `matchup`/`defense_rankings` export keys themselves are unaffected (built independently of the model artifact) and ARE real. `retrain.yml`'s next run will train against the new feature set automatically, no code change needed — not triggered this session (a real retrain wasn't requested).
 
