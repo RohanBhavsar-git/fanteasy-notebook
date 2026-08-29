@@ -4465,8 +4465,14 @@
       // Filter to skill positions only
       if (!['QB','RB','WR','TE','K','DEF'].includes(p.position)) return;
       const ownerRosterId = ownership[p.player_id] || null;
-      // For free-agent flooding control: only include rostered players + active free agents
-      if (!ownerRosterId && p.status !== 'Active') return;
+      // For free-agent flooding control: only include rostered players +
+      // active free agents. Team defenses never carry a `status` (Sleeper
+      // has no injury-style status for a team unit -- verified directly:
+      // all 32 real DEF entries have status: null, active: true) -- so
+      // `active === true` counts as the same "usable free agent" signal
+      // `status === 'Active'` is for real players, rather than silently
+      // dropping every DEF entry pre-draft when nothing is rostered yet.
+      if (!ownerRosterId && p.status !== 'Active' && p.active !== true) return;
 
       result.push({
         player_id: p.player_id,
