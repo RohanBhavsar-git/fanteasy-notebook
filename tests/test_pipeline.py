@@ -2,6 +2,9 @@
 Tests for src/pipeline.py -- Phase 8's shared feature-building orchestration.
 """
 
+import inspect
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -13,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.pipeline import (  # noqa: E402
-    HISTORY_SEED_COLUMNS, _is_unpublished_season_error, build_raw_features,
+    HISTORY_SEED_COLUMNS, _is_unpublished_season_error, build_feature_table, build_raw_features,
 )
 from src.usage import ROLLING_SOURCE_COLUMNS  # noqa: E402
 
@@ -79,3 +82,54 @@ def test_build_raw_features_returns_empty_for_empty_input_without_fetching():
     """
     result = build_raw_features(pd.DataFrame(), seasons=[2099])
     assert result.empty
+
+
+_FEATURE_FUNCTION_CALL_PATTERN = re.compile(r"\b(add_\w+_features)\s*\(")
+
+
+def _feature_function_calls(source: str) -> set[str]:
+    return set(_FEATURE_FUNCTION_CALL_PATTERN.findall(source))
+
+
+def test_notebook_03_feature_chain_matches_build_feature_table():
+    """
+    notebooks/03_usage_features.ipynb is documented (its own §2 markdown,
+    CLAUDE.md, PROJECT_CONTEXT.md) as the exploratory reference that mirrors
+    build_feature_table's real production feature chain -- and it silently
+    drifted out of sync once already: add_team_tendency_features was added
+    to build_raw_features but never backported to this notebook's own
+    pipeline cell. data/processed/weekly_features.parquet is gitignored, so
+    nothing else catches a stale notebook producing an incomplete table
+    (see PROJECT_CONTEXT.md's Context Columns findings for how that gap was
+    actually found).
+
+    Statically compares which `add_*_features` functions each side calls,
+    by regex over source text -- not a full notebook execution, so this
+    stays fast and has no network/data dependency. Fails loudly if a future
+    feature family is added to build_raw_features/build_feature_table and
+    not backported here, instead of silently producing a stale
+    weekly_features.parquet that only surfaces as a confusing downstream
+    KeyError or a model trained on fewer columns than the notebook implies.
+    """
+    production_calls = _feature_function_calls(
+        inspect.getsource(build_raw_features) + inspect.getsource(build_feature_table)
+    )
+    assert production_calls, (
+        "regex found zero add_*_features calls in build_raw_features/build_feature_table -- "
+        "the pattern is broken, not the code; fix the regex before trusting this test."
+    )
+
+    notebook_path = PROJECT_ROOT / "notebooks" / "03_usage_features.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    notebook_source = "\n".join(
+        "".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"
+    )
+    notebook_calls = _feature_function_calls(notebook_source)
+
+    missing = production_calls - notebook_calls
+    assert not missing, (
+        f"notebooks/03_usage_features.ipynb is missing {sorted(missing)} -- it no longer "
+        "matches src/pipeline.py's real feature-building chain. Add the missing call(s) to "
+        "the notebook's pipeline cell (and its imports), then re-run it end to end so "
+        "data/processed/weekly_features.parquet stays correct."
+    )
